@@ -1,0 +1,60 @@
+# Synthetic machine for the uart-gpio fixture.
+# Copy this file and pass --firmware for an image you are authorized to analyze.
+name: uart-gpio
+description: >
+  Thumb-2 program that posts 'A' to a UART, sets a GPIO latch,
+  reads SysTick, and stops on BKPT.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x00000000
+
+memory:
+  - name: flash
+    base: 0x00000000
+    size: 0x1000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x4000
+    perms: rw
+  - name: uart0
+    base: 0x40000000
+    size: 0x100
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x00
+      status_offset: 0x04
+      tx_empty_mask: 0x80
+      rx_ready_mask: 0x01
+  - name: gpioa
+    base: 0x40001000
+    size: 0x100
+    perms: rw
+    peripheral: gpio
+    config:
+      odr_offset: 0x00
+      idr_offset: 0x04
+      idr: 0x00
+  - name: systick
+    base: 0xE000E010
+    size: 0x10
+    perms: rw
+    peripheral: systick
+
+boot:
+  mode: vector
+  vector_base: 0x00000000
+
+run:
+  timeout_ms: 1000
+  max_instructions: 10000
+  halt_on_bkpt: true
+  trace_limit: 256
+
+unmapped:
+  action: fault
+  read_default: 0
+  log: true

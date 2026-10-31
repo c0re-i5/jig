@@ -1,0 +1,47 @@
+# Synthetic machine whose RAM window is the fuzz input.
+name: fuzz-echo
+description: >
+  Loads the word at 0x20000100 (filled by the fuzz harness) and writes the
+  low byte to UART.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x00000000
+
+memory:
+  - name: flash
+    base: 0x00000000
+    size: 0x1000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x1000
+    perms: rw
+  - name: uart0
+    base: 0x40000000
+    size: 0x100
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x00
+      status_offset: 0x04
+
+boot:
+  mode: vector
+  vector_base: 0x00000000
+
+run:
+  timeout_ms: 1000
+  max_instructions: 10000
+  halt_on_bkpt: true
+
+unmapped:
+  action: fault
+  read_default: 0
+
+fuzz:
+  mode: buffer
+  buffer:
+    address: 0x20000100
+    max_size: 64
