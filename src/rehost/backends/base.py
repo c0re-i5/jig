@@ -111,6 +111,14 @@ class CpuBackend(ABC):
     def hook_unmapped(self, callback) -> None:
         """Call ``callback(access) -> bool``. True asks the engine to retry."""
 
+    def hook_prot(self, callback) -> None:
+        """Call ``callback(access) -> bool`` on a permission fault.
+
+        True asks the engine to retry. The default installs nothing, and
+        ``start`` then reports the engine's own error.
+        """
+        return None
+
     def inject_irq(self, irq: int) -> None:
         """Pend an external interrupt.
 

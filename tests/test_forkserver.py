@@ -97,6 +97,9 @@ def test_forkserver_stops_for_a_clean_input_and_signals_the_crash(tmp_path):
         crashes = list((out / "crashes").iterdir())
         assert len(crashes) == 1
         assert crashes[0].read_bytes() == _MAGIC
+        reports = list((out / "reports").glob("*.md"))
+        assert len(reports) == 1
+        assert "unmapped_fetch" in reports[0].read_text(encoding="utf-8")
     finally:
         os.close(ctl_write)
         os.close(status_read)

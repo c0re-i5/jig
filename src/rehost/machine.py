@@ -21,6 +21,7 @@ from rehost.backends import (
     MemAccess,
     create_backend,
 )
+from rehost.coverage import MAP_SIZE, edge_location
 from rehost.config import MachineConfig, load_config
 from rehost.errors import BackendError, ConfigError, MachineError
 from rehost.memory import PERM_READ, PERM_WRITE, MemoryMap, access_mask, pages_touched
@@ -38,6 +39,11 @@ from rehost.result import (
 from rehost.snapshot import SNAPSHOT_VERSION, Snapshot
 
 logger = logging.getLogger(__name__)
+
+# Retired-instruction tail kept for crash bucketing. The edge update matches
+# CoverageMap.on_instruction for a 65536-byte map, including when no bitmap
+# is attached, so a fuzz run and a later replay hash the same tail.
+_RECENT_LIMIT = 8
 
 
 class Machine:
@@ -86,6 +92,9 @@ class Machine:
         self._trace_total = 0
         self._coverage: set[int] = set()
         self._coverage_map = None
+        self._recent_pcs: deque[int] = deque(maxlen=_RECENT_LIMIT)
+        self._recent_edges: deque[int] = deque(maxlen=_RECENT_LIMIT)
+        self._edge_prev = 0
         self._halt_addresses = set(config.run.halt_addresses)
 
     @classmethod
@@ -195,6 +204,9 @@ class Machine:
         self._trace.clear()
         self._trace_total = 0
         self._coverage.clear()
+        self._recent_pcs.clear()
+        self._recent_edges.clear()
+        self._edge_prev = 0
         if self._coverage_map is not None:
             self._coverage_map.begin_run()
         self.backend.prepare_run()
@@ -357,6 +369,7 @@ class Machine:
         self.backend.hook_code(self._on_code)
         self.backend.hook_interrupt(self._on_interrupt)
         self.backend.hook_unmapped(self._on_unmapped)
+        self.backend.hook_prot(self._on_prot)
         page = self.backend.page_size
         for start in sorted(self._hook_pages):
             end = start + page - 1
@@ -398,6 +411,7 @@ class Machine:
         if effect == REDIRECT:
             return
         self._instructions += 1
+        self._note_retired(address)
         if self.config.run.collect_coverage:
             self._coverage.add(address)
         coverage_map = self._coverage_map
@@ -454,6 +468,30 @@ class Machine:
         masked = value & access_mask(size)
         region.peripheral.write(address - region.base, size, masked)
         self._record("write", address, size, masked)
+
+    def _on_prot(self, access: MemAccess) -> bool:
+        label = {
+            "read_prot": "read",
+            "write_prot": "write",
+            "fetch_prot": "fetch",
+        }.get(access.kind, access.kind)
+        self._reason = STATUS_FAULT
+        self._detail = f"prot {label} at {access.address:#x} size {access.size}"
+        self._record(f"prot_{label}", access.address, access.size, access.value)
+        return False
+
+    def _note_retired(self, address: int) -> None:
+        """Remember one retired instruction for the crash fingerprint.
+
+        ``cur`` and ``prev`` follow ``CoverageMap.on_instruction``. Keeping
+        the tail here, and not only in the bitmap, means a run with no
+        coverage map still buckets the same way as a fuzz iteration.
+        """
+        self._recent_pcs.append(address)
+        cur = edge_location(address, MAP_SIZE - 1)
+        index = cur ^ self._edge_prev
+        self._edge_prev = cur >> 1
+        self._recent_edges.append(index)
 
     def _on_unmapped(self, access: MemAccess) -> bool:
         if access.kind == "fetch_unmapped":
@@ -519,4 +557,6 @@ class Machine:
             trace=tuple(self._trace),
             trace_total=self._trace_total,
             coverage=coverage,
+            recent_pcs=tuple(self._recent_pcs),
+            recent_edges=tuple(self._recent_edges),
         )

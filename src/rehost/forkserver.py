@@ -18,6 +18,8 @@ a finished execution and keeps the child. A guest fault, or a PC listed in
 ``fuzz.crash_addresses``, raises ``SIGSEGV`` so the status is ``WIFSIGNALED``.
 The testcase is left in the fuzz shared memory for afl-fuzz to copy, and is
 also written under ``--out/crashes`` when that directory was requested.
+The same crash is classified and merged into ``--out/buckets`` and
+``--out/reports`` before the process is killed.
 
 ``FS_NEW_OPT_FUTEX`` is not advertised. Current AFL++ falls back to this
 SIGSTOP path when the target does not offer the child-sync word. CmpLog,
@@ -43,6 +45,7 @@ from pathlib import Path
 from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError, RehostError
 from rehost.fuzz import PersistentHarness, is_fuzz_crash, read_afl_shmem
+from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 # include/config.h
 FORKSRV_FD = 198
@@ -97,6 +100,7 @@ def serve(
     out: Path | None,
     persistent_iters: int,
     input_path: str | None,
+    replay: ReplayTarget | None = None,
 ) -> int:
     """Speak the forkserver protocol. ``load_machine`` runs in the child only."""
     if persistent_iters < 1:
@@ -141,6 +145,7 @@ def serve(
                         out=out,
                         persistent_iters=persistent_iters,
                         input_path=input_path,
+                        replay=replay,
                     )
                     os._exit(0)
             if not _write_u32(status_fd, child_pid & 0xFFFFFFFF):
@@ -189,6 +194,7 @@ def _child_main(
     out: Path | None,
     persistent_iters: int,
     input_path: str | None,
+    replay: ReplayTarget | None,
 ) -> None:
     try:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -198,6 +204,7 @@ def _child_main(
             out=out,
             persistent_iters=persistent_iters,
             input_path=input_path,
+            replay=replay,
         )
     except RehostError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -218,6 +225,7 @@ def _persistent_loop(
     out: Path | None,
     persistent_iters: int,
     input_path: str | None,
+    replay: ReplayTarget | None,
 ) -> None:
     machine = load_machine()
     coverage = _map_afl_coverage()
@@ -225,6 +233,7 @@ def _persistent_loop(
     harness = PersistentHarness(machine)
     # Checkpoint at boot, before any fuzzer bytes, including NVIC state.
     harness.checkpoint()
+    triage = TriageStore(out, replay=replay) if out is not None else None
     remaining = persistent_iters
     first = True
     while remaining > 0:
@@ -235,7 +244,12 @@ def _persistent_loop(
         data = _read_iteration(input_path)
         result = harness.exec_one(data)
         if is_fuzz_crash(result, machine.config.fuzz):
-            _preserve_crash(out, data, result)
+            path = _preserve_crash(out, data, result)
+            if triage is not None:
+                try:
+                    note_crash(triage, machine, data, result, crash_path=path)
+                except Exception:
+                    traceback.print_exc()
             _die_as_crash()
     os._exit(0)
 
@@ -294,7 +308,7 @@ def _map_afl_coverage() -> CoverageMap:
     return CoverageMap(buf)
 
 
-def _preserve_crash(out: Path | None, data: bytes, result) -> None:
+def _preserve_crash(out: Path | None, data: bytes, result) -> Path | None:
     """Write the crashing bytes before the process is killed.
 
     afl-fuzz copies the fuzz shared memory when it sees the signal. This file
@@ -302,7 +316,7 @@ def _preserve_crash(out: Path | None, data: bytes, result) -> None:
     directory was requested.
     """
     if out is None:
-        return
+        return None
     directory = out / "crashes"
     directory.mkdir(parents=True, exist_ok=True)
     name = f"id:000000,pid:{os.getpid()},sig:11,pc:{result.pc & ~1:08x}"
@@ -311,6 +325,7 @@ def _preserve_crash(out: Path | None, data: bytes, result) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+    return path
 
 
 def _die_as_crash() -> None:

@@ -13,6 +13,7 @@ from unicorn import (
     UC_ARCH_ARM,
     UC_HOOK_CODE,
     UC_HOOK_INTR,
+    UC_HOOK_MEM_PROT,
     UC_HOOK_MEM_READ,
     UC_HOOK_MEM_UNMAPPED,
     UC_HOOK_MEM_WRITE,
@@ -52,8 +53,11 @@ from unicorn.arm_const import (
     UC_ARM_REG_XPSR,
 )
 from unicorn.unicorn_const import (
+    UC_MEM_FETCH_PROT,
     UC_MEM_FETCH_UNMAPPED,
+    UC_MEM_READ_PROT,
     UC_MEM_READ_UNMAPPED,
+    UC_MEM_WRITE_PROT,
     UC_MEM_WRITE_UNMAPPED,
 )
 
@@ -102,6 +106,11 @@ _UNMAPPED = {
     UC_MEM_READ_UNMAPPED: "read_unmapped",
     UC_MEM_WRITE_UNMAPPED: "write_unmapped",
     UC_MEM_FETCH_UNMAPPED: "fetch_unmapped",
+}
+_PROT = {
+    UC_MEM_READ_PROT: "read_prot",
+    UC_MEM_WRITE_PROT: "write_prot",
+    UC_MEM_FETCH_PROT: "fetch_prot",
 }
 
 
@@ -221,6 +230,14 @@ class UnicornCortexM(CpuBackend):
             return bool(callback(event))
 
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, inner)
+
+    def hook_prot(self, callback) -> None:
+        def inner(_uc, access, address, size, value, _user) -> bool:
+            kind = _PROT.get(access, f"prot_{access}")
+            event = MemAccess(kind=kind, address=address, size=size, value=value & 0xFFFFFFFF)
+            return bool(callback(event))
+
+        self.uc.hook_add(UC_HOOK_MEM_PROT, inner)
 
     def inject_irq(self, irq: int) -> None:
         self._check_irq(irq)
