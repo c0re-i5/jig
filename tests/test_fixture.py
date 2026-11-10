@@ -49,7 +49,14 @@ def test_examples_match_packaged_fixtures():
     root = Path(__file__).resolve().parents[1]
     packaged = root / "src" / "rehost" / "fixtures" / "data"
     examples = root / "examples"
-    for name in ("uart_gpio.s", "uart_gpio.yaml", "fuzz_echo.s", "fuzz_echo.yaml"):
+    for name in (
+        "uart_gpio.s",
+        "uart_gpio.yaml",
+        "fuzz_echo.s",
+        "fuzz_echo.yaml",
+        "fuzz_crash.s",
+        "fuzz_crash.yaml",
+    ):
         assert (examples / name).read_text(encoding="utf-8") == (
             packaged / name
         ).read_text(encoding="utf-8")

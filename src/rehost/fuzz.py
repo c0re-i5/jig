@@ -10,9 +10,10 @@ Input can come from a file, stdin, or an AFL++ shared-memory fuzz region
 (``__AFL_SHM_FUZZ_ID`` / ``__AFL_SHM_FUZZ_FD``). The region layout matches
 AFL++: a little-endian ``u32`` length followed by the testcase bytes.
 
-``PersistentHarness.exec_one`` is the in-process loop a libAFL executor or an
-AFL++ persistent harness would call. This module does not embed a fuzzer and
-does not implement the AFL forkserver.
+``PersistentHarness.exec_one`` restores a boot checkpoint, applies one
+testcase, and runs. ``jig-emu fuzz`` drives that hook from an in-process
+campaign (``rehost.campaign``) or, when spawned by afl-fuzz, from an AFL++
+persistent-mode forkserver (``rehost.forkserver``).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import BinaryIO
 
 from rehost.errors import ConfigError, FuzzInputError
 from rehost.memory import access_mask
+from rehost.result import RunResult
 
 logger = logging.getLogger(__name__)
 
@@ -173,12 +175,31 @@ class FuzzHarness:
             self.machine.write_u32(window.length_address, len(data))
 
 
+def is_fuzz_crash(result: RunResult, fuzz) -> bool:
+    """True when the fuzzer should keep this input and signal a crash.
+
+    A fault is always a crash. A halt whose PC is listed in
+    ``fuzz.crash_addresses`` is a crash too (the low bit of both addresses is
+    ignored). Timeouts and the instruction limit are hangs, not crashes: AFL++
+    has its own timeout, and a clean ``BKPT`` is a normal exit unless the
+    machine file says that PC is the bug.
+    """
+    if result.faulted:
+        return True
+    if fuzz is None:
+        return False
+    pc = result.pc & ~1
+    return any((address & ~1) == pc for address in fuzz.crash_addresses)
+
+
 class PersistentHarness:
     """Snapshot, apply one input, run, and restore on the next call.
 
     Take the checkpoint at boot, before any fuzzer bytes are applied, so each
-    ``exec_one`` starts from the same CPU, RAM, and peripheral state. A libAFL
-    in-process executor would call ``exec_one`` and inspect ``RunResult``.
+    ``exec_one`` starts from the same CPU, RAM, peripheral, and NVIC state.
+    The in-tree campaign and the AFL++ forkserver both call ``exec_one``.
+    When a coverage map is attached to the machine, ``run`` clears it for
+    this execution only.
     """
 
     def __init__(self, machine) -> None:

@@ -26,6 +26,11 @@ FIXTURES: dict[str, dict[str, str]] = {
         "config": "fuzz_echo.yaml",
         "summary": "Loads the word at SRAM 0x20000100 and writes its low byte to UART.",
     },
+    "fuzz-crash": {
+        "asm": "fuzz_crash.s",
+        "config": "fuzz_crash.yaml",
+        "summary": "Halts on BKPT unless the fuzz buffer starts with the bytes JIG!, which fault.",
+    },
 }
 
 

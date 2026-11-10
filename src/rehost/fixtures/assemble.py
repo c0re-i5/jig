@@ -2,9 +2,10 @@
 """A tiny Thumb/Thumb-2 assembler for in-repo fixtures.
 
 It encodes the instructions the synthetic programs use (``movw``/``movt``,
-``mov`` / ``movs``, ``ldr``/``str`` immediate, ``adds``, ``add rd, sp``,
-``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``, ``wfi`` / ``wfe``,
-``bkpt``, ``nop``, and short ``b``) plus ``.word`` / ``.thumb_word``. It is
+``mov`` / ``movs``, ``ldr``/``str`` immediate, ``ldrb``, ``cmp``, ``adds``,
+``add rd, sp``, ``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``,
+``wfi`` / ``wfe``, ``bkpt``, ``nop``, short ``b``, and ``beq`` / ``bne``) plus
+``.word`` / ``.thumb_word``. It is
 not a general assembler. CI never needs a cross toolchain, and the bytes it
 emits are executed by the Unicorn backend.
 """
@@ -48,6 +49,10 @@ _WIDTHS = {
     "nop": 2,
     "b": 2,
     "b.n": 2,
+    "beq": 2,
+    "bne": 2,
+    "cmp": 2,
+    "ldrb": 2,
     "wfi": 2,
     "wfe": 2,
     "cpsid": 2,
@@ -103,6 +108,16 @@ _ADD_SP = re.compile(
     re.IGNORECASE,
 )
 _BX = re.compile(r"^bx\s+(?P<rm>r\d+|sp|lr|pc)$", re.IGNORECASE)
+_CMP = re.compile(
+    r"^cmp\s+(?P<rn>r\d+)\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_LDRB = re.compile(
+    r"^ldrb\s+(?P<rt>r\d+)\s*,\s*\[\s*(?P<rn>r\d+)\s*"
+    r"(?:,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+)))?\s*\]$",
+    re.IGNORECASE,
+)
+_COND_BRANCH = re.compile(r"^(?P<op>beq|bne)\s+([A-Za-z_.][\w.]*)$", re.IGNORECASE)
 _SVC = re.compile(r"^svc\s+#(?P<imm>0x[0-9a-fA-F]+|\d+)$", re.IGNORECASE)
 _CPS = re.compile(r"^cps(?P<effect>id|ie)\s+i$", re.IGNORECASE)
 _HINT = re.compile(r"^(?P<op>wfi|wfe)$", re.IGNORECASE)
@@ -316,6 +331,34 @@ def _encode_insn(text: str, address: int, labels: dict[str, int], line_no: int) 
         sysm = _sysm(match.group("sysm"), line_no)
         return struct.pack("<HH", 0xF380 | rn, 0x8800 | sysm)
 
+    match = _CMP.fullmatch(text)
+    if match:
+        rn = _register(match.group("rn"), line_no, low_only=True)
+        imm = int(match.group("imm"), 0)
+        if not 0 <= imm <= 0xFF:
+            raise AssembleError(f"line {line_no}: cmp immediate must fit in 8 bits")
+        # CMP (immediate) T1: 00101 Rn imm8.
+        return struct.pack("<H", 0x2800 | (rn << 8) | imm)
+
+    match = _LDRB.fullmatch(text)
+    if match:
+        rt = _register(match.group("rt"), line_no, low_only=True)
+        rn = _register(match.group("rn"), line_no, low_only=True)
+        imm_text = match.group("imm")
+        imm = 0 if imm_text is None else int(imm_text, 0)
+        if not 0 <= imm <= 31:
+            raise AssembleError(f"line {line_no}: ldrb offset must be from 0 to 31")
+        # LDRB (immediate) T1: 01111 imm5 Rn Rt.
+        return struct.pack("<H", 0x7800 | (imm << 6) | (rn << 3) | rt)
+
+    match = _COND_BRANCH.fullmatch(text)
+    if match:
+        label = match.group(2)
+        if label not in labels:
+            raise AssembleError(f"line {line_no}: unknown branch target {label}")
+        cond = 0x0 if match.group("op").lower() == "beq" else 0x1
+        return _cond_branch(address, labels[label], cond, line_no)
+
     match = _BRANCH.fullmatch(text)
     if match:
         label = match.group(1)
@@ -336,6 +379,17 @@ def _mov_wide(op: str, reg: int, imm16: int) -> bytes:
     hw1 = prefix | (bit << 10) | imm4
     hw2 = (imm3 << 12) | (reg << 8) | imm8
     return struct.pack("<HH", hw1, hw2)
+
+
+def _cond_branch(address: int, target: int, cond: int, line_no: int) -> bytes:
+    # Thumb B encoding T1: offset is from PC+4, imm8 is a signed halfword count.
+    offset = target - (address + 4)
+    if offset % 2 != 0 or not -256 <= offset <= 254:
+        raise AssembleError(
+            f"line {line_no}: conditional branch from {address:#x} to {target:#x} is out of range"
+        )
+    imm8 = (offset >> 1) & 0xFF
+    return struct.pack("<H", 0xD000 | (cond << 8) | imm8)
 
 
 def _branch(address: int, target: int, line_no: int) -> bytes:

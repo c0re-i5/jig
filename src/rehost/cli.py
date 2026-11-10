@@ -34,28 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="Execute an image until halt, fault, or timeout")
-    run.add_argument(
-        "-c",
-        "--config",
-        help="Machine YAML or TOML. Required with --firmware. Defaults to the fixture's machine file.",
-    )
-    source = run.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "-f",
-        "--firmware",
-        help="Path to a firmware image you are authorized to analyze",
-    )
-    source.add_argument(
-        "--fixture",
-        choices=list_fixtures(),
-        help="Built-in synthetic Cortex-M program (no external firmware)",
-    )
+    _add_machine_source(run)
     run.add_argument(
         "--input",
         help="Fuzz input file applied before execution. Use - to read stdin.",
     )
-    run.add_argument("--timeout-ms", type=int, help="Override run.timeout_ms")
-    run.add_argument("--max-instructions", type=int, help="Override run.max_instructions")
     run.add_argument("--snapshot-out", help="Write a JSON snapshot after the run")
     run.add_argument(
         "--dump",
@@ -65,6 +48,45 @@ def main(argv: list[str] | None = None) -> int:
         help="Hex-dump guest memory after the run. Repeatable.",
     )
     run.add_argument("-v", "--verbose", action="store_true", help="Print registers and the MMIO trace")
+
+    fuzz = sub.add_parser(
+        "fuzz",
+        help="Coverage-guided fuzzing, in-process or under an AFL++ forkserver",
+    )
+    _add_machine_source(fuzz)
+    fuzz.add_argument(
+        "--out",
+        help="Directory for the corpus, crashes, and hangs. Required unless afl-fuzz is attached.",
+    )
+    fuzz.add_argument(
+        "--input",
+        help="One seed file, or - for stdin. Under afl-fuzz without shared-memory "
+        "testcases this path is re-read every iteration (pass @@).",
+    )
+    fuzz.add_argument("--seeds", help="Directory of seed files. Names are tried in sorted order.")
+    fuzz.add_argument(
+        "--max-execs",
+        type=int,
+        default=1_000_000,
+        help="Stop the in-process campaign after this many executions (default: 1000000).",
+    )
+    fuzz.add_argument(
+        "--rng-seed",
+        type=int,
+        help="Seed the havoc RNG. Printed in the summary when omitted.",
+    )
+    fuzz.add_argument(
+        "--stop-on-crash",
+        action="store_true",
+        help="Return after the first crash. The crashing input is still written to --out.",
+    )
+    fuzz.add_argument(
+        "--persistent-iters",
+        type=int,
+        default=10_000,
+        help="Under afl-fuzz, restart the persistent child after this many cases (default: 10000).",
+    )
+    fuzz.add_argument("-v", "--verbose", action="store_true")
 
     plugins = sub.add_parser("plugins", help="List MMIO plugins and CPU backends")
     plugins.add_argument("-v", "--verbose", action="store_true")
@@ -79,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
             return _plugins()
         if args.cmd == "fixtures":
             return _fixtures()
+        if args.cmd == "fuzz":
+            return _fuzz(args)
         return _run(args)
     except RehostError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -118,7 +142,28 @@ def _fixtures() -> int:
     return 0
 
 
-def _run(args: argparse.Namespace) -> int:
+def _add_machine_source(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-c",
+        "--config",
+        help="Machine YAML or TOML. Required with --firmware. Defaults to the fixture's machine file.",
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "-f",
+        "--firmware",
+        help="Path to a firmware image you are authorized to analyze",
+    )
+    source.add_argument(
+        "--fixture",
+        choices=list_fixtures(),
+        help="Built-in synthetic Cortex-M program (no external firmware)",
+    )
+    parser.add_argument("--timeout-ms", type=int, help="Override run.timeout_ms")
+    parser.add_argument("--max-instructions", type=int, help="Override run.max_instructions")
+
+
+def _machine_from_args(args: argparse.Namespace) -> Machine:
     if args.firmware and not args.config:
         raise RehostError("--firmware requires --config (the tool does not guess a memory map)")
     if args.fixture and not args.config:
@@ -144,6 +189,61 @@ def _run(args: argparse.Namespace) -> int:
         machine.config.run.max_instructions = args.max_instructions
     if machine.config.run.timeout_ms == 0 and machine.config.run.max_instructions == 0:
         raise RehostError("set a timeout or an instruction limit so the run cannot hang")
+    return machine
+
+
+def _fuzz(args: argparse.Namespace) -> int:
+    from rehost.campaign import Campaign
+    from rehost.forkserver import forkserver_fd, serve
+
+    if args.max_execs < 1:
+        raise RehostError("--max-execs must be >= 1")
+    if args.persistent_iters < 1:
+        raise RehostError("--persistent-iters must be >= 1")
+    if args.rng_seed is not None and args.rng_seed < 0:
+        raise RehostError("--rng-seed must be >= 0")
+    ctl = forkserver_fd()
+    if ctl is not None:
+        out = Path(args.out) if args.out else None
+        return serve(
+            lambda: _machine_from_args(args),
+            ctl_fd=ctl,
+            out=out,
+            persistent_iters=args.persistent_iters,
+            input_path=None if args.input in (None, "-") else args.input,
+        )
+    if not args.out:
+        raise RehostError("jig-emu fuzz requires --out (or an AFL++ forkserver on fd 198)")
+    machine = _machine_from_args(args)
+    seed_files: list[Path] = []
+    if args.seeds:
+        directory = Path(args.seeds)
+        if not directory.is_dir():
+            raise RehostError(f"seed directory not found: {directory}")
+        seed_files = [path for path in sorted(directory.iterdir()) if path.is_file()]
+    extra: list[bytes] = []
+    if args.input == "-":
+        extra.append(sys.stdin.buffer.read())
+    elif args.input:
+        path = Path(args.input)
+        if not path.is_file():
+            raise RehostError(f"fuzz input not found: {path}")
+        extra.append(path.read_bytes())
+    campaign = Campaign(
+        machine,
+        out=Path(args.out),
+        seed_files=seed_files,
+        extra_inputs=extra,
+        max_execs=args.max_execs,
+        rng_seed=args.rng_seed,
+        stop_on_crash=args.stop_on_crash,
+    )
+    print(campaign.run().format())
+    return 0
+
+
+def _run(args: argparse.Namespace) -> int:
+    machine = _machine_from_args(args)
     data = _read_run_input(args, machine)
     if data is not None:
         FuzzHarness(machine).apply(data)

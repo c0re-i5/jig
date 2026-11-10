@@ -68,6 +68,53 @@ def test_movw_movt_builds_a_peripheral_address():
     assert result.registers["r0"] == 0x40001000
 
 
+def test_cmp_ldrb_and_conditional_branch_execute():
+    assert assemble("cmp r1, #0x4A") == bytes.fromhex("4a29")
+    assert assemble("ldrb r1, [r0, #0]") == bytes.fromhex("0178")
+    assert assemble("ldrb r1, [r0, #1]") == bytes.fromhex("4178")
+    taken = machine_from_asm(
+        """
+        movs r0, #0
+        cmp r0, #1
+        bne skip
+        movs r1, #1
+        b done
+        skip:
+            movs r1, #2
+        done:
+            bkpt #0
+        """
+    )
+    result = taken.run()
+    assert result.status == "halted"
+    assert result.registers["r1"] == 2
+    not_taken = machine_from_asm(
+        """
+        movs r0, #1
+        cmp r0, #1
+        bne skip
+        movs r1, #1
+        b done
+        skip:
+            movs r1, #2
+        done:
+            bkpt #0
+        """
+    )
+    result = not_taken.run()
+    assert result.registers["r1"] == 1
+    machine = machine_from_asm(
+        """
+        movw r0, #0
+        movt r0, #0x2000
+        ldrb r1, [r0, #1]
+        bkpt #0
+        """
+    )
+    machine.write_memory(0x20000000, b"\x11\x22\x33\x44")
+    assert machine.run().registers["r1"] == 0x22
+
+
 def test_unknown_instruction_and_far_branch_fail():
     with pytest.raises(AssembleError, match="unknown instruction"):
         assemble("udf #0")

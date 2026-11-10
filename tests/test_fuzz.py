@@ -98,6 +98,35 @@ def test_afl_region_parser_and_sysv_shm(monkeypatch):
         shmctl(shm_id, 0, None)
 
 
+def test_exec_one_drops_an_irq_pended_after_the_checkpoint():
+    machine = Machine.from_fixture("fuzz-echo")
+    harness = PersistentHarness(machine)
+    harness.exec_one(b"A")
+    machine.backend.inject_irq(3)
+    assert 3 in machine.backend.pending_irqs
+    harness.exec_one(b"B")
+    assert machine.backend.pending_irqs == []
+    assert machine.backend.nvic.external_pending[3] is False
+
+
+def test_crash_address_is_a_halt_the_fuzzer_keeps():
+    from rehost.fuzz import is_fuzz_crash
+
+    machine = machine_from_asm(
+        "bkpt #0",
+        fuzz={
+            "mode": "buffer",
+            "buffer": {"address": 0x20000100, "max_size": 4},
+            "crash_addresses": [0],
+        },
+    )
+    result = PersistentHarness(machine).exec_one(b"")
+    assert result.status == "halted"
+    assert is_fuzz_crash(result, machine.config.fuzz)
+    machine.config.fuzz.crash_addresses = ()
+    assert is_fuzz_crash(result, machine.config.fuzz) is False
+
+
 def test_read_input_file_and_stdin(tmp_path, monkeypatch):
     monkeypatch.delenv("__AFL_SHM_FUZZ_ID", raising=False)
     monkeypatch.delenv("__AFL_SHM_FUZZ_FD", raising=False)

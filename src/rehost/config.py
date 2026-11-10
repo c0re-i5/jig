@@ -54,7 +54,7 @@ _RUN_KEYS = {
     "collect_coverage",
 }
 _UNMAPPED_KEYS = {"action", "read_default", "log"}
-_FUZZ_KEYS = {"mode", "buffer"}
+_FUZZ_KEYS = {"mode", "buffer", "crash_addresses"}
 _BUFFER_KEYS = {"address", "max_size", "length_address"}
 _LOAD_KEYS = {"base"}
 
@@ -134,6 +134,10 @@ class FuzzBufferConfig:
 class FuzzConfig:
     mode: str
     buffer: FuzzBufferConfig | None = None
+    # Halt PCs that the fuzzer should treat as crashes. A fault is always a
+    # crash; these addresses cover a clean BKPT (or other halt) that the
+    # program uses as a bug oracle. Compared with the low bit cleared.
+    crash_addresses: tuple[int, ...] = ()
 
 
 @dataclass
@@ -389,4 +393,8 @@ def _parse_fuzz(value: Any) -> FuzzConfig:
         if "length_address" in spec and spec["length_address"] is not None:
             length_address = parse_u32(spec["length_address"], what="fuzz.buffer.length_address")
         buffer = FuzzBufferConfig(address=address, max_size=max_size, length_address=length_address)
-    return FuzzConfig(mode=mode, buffer=buffer)
+    addresses = raw.get("crash_addresses", [])
+    if not isinstance(addresses, list):
+        raise ConfigError("fuzz.crash_addresses must be a list")
+    crash_addresses = tuple(parse_u32(item, what="fuzz.crash_addresses") for item in addresses)
+    return FuzzConfig(mode=mode, buffer=buffer, crash_addresses=crash_addresses)
