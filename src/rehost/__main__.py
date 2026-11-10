@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""``python -m rehost``."""
+"""``python -m rehost`` (the ``jig-emu`` command)."""
 
 from rehost.cli import cli
 

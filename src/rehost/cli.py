@@ -24,13 +24,13 @@ def cli() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="rehost",
+        prog="jig-emu",
         description=(
             "Rehost a firmware image you are authorized to analyze. "
-            "rehost does not download or bundle firmware."
+            "jig-emu does not download or bundle firmware."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"rehost {__version__}")
+    parser.add_argument("--version", action="version", version=f"jig-emu {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="Execute an image until halt, fault, or timeout")

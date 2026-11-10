@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: MIT
-"""Cortex-M SysTick stub at the standard offsets (CTRL, LOAD, VAL, CALIB).
+"""Cortex-M SysTick at the standard offsets (CTRL, LOAD, VAL, CALIB).
 
-This is a functional model for firmware that polls ``VAL``, not a cycle timer.
-While ``ENABLE`` is set, each read of ``VAL`` returns the current count and
-then decrements it. A read that observes 0 reloads from ``LOAD``, sets
-``COUNTFLAG``, and if ``TICKINT`` is set records ``irq_pending``. Nothing
-delivers that interrupt: NVIC injection is a separate extension point
-(``Machine.inject_irq`` only queues the request on the Unicorn backend).
+Two clocks share one counter step. A direct ``read`` of ``VAL`` (the original
+polling stub) returns the current count and then steps. When a ``Machine``
+owns the peripheral it sets ``cpu_clock`` and steps once per instruction
+instead, so a handler can run without firmware polling ``VAL``. ``CLKSOURCE``
+does not select a second clock; there is no external reference, and an enabled
+counter advances on the instruction stream either way.
+
+A step that observes 0 reloads from ``LOAD``, sets ``COUNTFLAG``, and, when
+``TICKINT`` is set, reports an interrupt edge. The machine pends exception 15
+for that edge. ``irq_pending`` stays set after the first such edge so existing
+polling tests can observe it. Delivery itself lives in the NVIC pending bit,
+which is cleared when the exception is taken.
 
 A write to ``VAL`` clears it, matching the architecture. ``CALIB`` is read-only.
 """
@@ -44,6 +50,7 @@ class SysTick(Peripheral):
         self.val = 0
         self.countflag = False
         self.irq_pending = False
+        self.cpu_clock = False
 
     def read(self, offset: int, size: int) -> int:
         word = self._word_for(offset)
@@ -60,14 +67,8 @@ class SysTick(Peripheral):
             return extract_field(self.load, offset, size, LOAD)
         if word == VAL:
             current = self.val
-            if self.ctrl & ENABLE:
-                if self.val == 0:
-                    self.countflag = True
-                    self.val = self.load & 0xFFFFFF
-                    if self.ctrl & TICKINT:
-                        self.irq_pending = True
-                else:
-                    self.val = (self.val - 1) & 0xFFFFFF
+            if (self.ctrl & ENABLE) and not self.cpu_clock:
+                self._step()
             return extract_field(current, offset, size, VAL)
         return extract_field(self.calib, offset, size, CALIB)
 
@@ -89,6 +90,26 @@ class SysTick(Peripheral):
             return
         # CALIB is read-only.
         return
+
+    def consume_cpu_tick(self) -> bool:
+        """Step once if ``Machine`` is clocking this counter.
+
+        Returns True on the edge that should pend the SysTick exception.
+        """
+        if not self.cpu_clock or not (self.ctrl & ENABLE):
+            return False
+        return self._step()
+
+    def _step(self) -> bool:
+        if self.val == 0:
+            self.val = self.load & 0xFFFFFF
+            self.countflag = True
+            if self.ctrl & TICKINT:
+                self.irq_pending = True
+                return True
+            return False
+        self.val = (self.val - 1) & 0xFFFFFF
+        return False
 
     def snapshot_state(self) -> dict[str, Any]:
         return {

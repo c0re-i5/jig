@@ -1,6 +1,6 @@
-# rehost
+# Jig
 
-rehost runs a firmware image you already have on a modeled microcontroller so you can trace it, snapshot it, and feed it fuzz input. The first CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. QEMU and Renode can sit behind the same backend interface later; this tree does not implement them yet.
+Jig runs a firmware image you already have on a modeled microcontroller so you can trace it, snapshot it, and feed it fuzz input. The command is `jig-emu`. The Python package is `rehost`. The first CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. QEMU and Renode can sit behind the same backend interface later; this tree does not implement them yet.
 
 The tool does not download firmware. Tests and the built-in fixtures are synthetic programs assembled from source in this repository. Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before you point it at a real image.
 
@@ -11,7 +11,7 @@ Python 3.11 or newer.
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest
-python3 -m rehost run --fixture uart-gpio
+jig-emu run --fixture uart-gpio
 ```
 
 `pip install -e .` is enough to run the CLI. The `[dev]` extra adds pytest.
@@ -61,12 +61,15 @@ flowchart TD
   unmapped["Unmapped policy: fault, or log and return a default"]
   inst["Instrumentation: instruction count, BKPT, faults, optional PC set"]
   fuzz["Fuzz harness: RAM buffer or MMIO write script"]
-  snap["Snapshot of registers, RAM, and plugin state"]
+  nvic["NVIC: priority, entry, and return"]
+  snap["Snapshot of registers, RAM, plugins, and NVIC"]
   triage["Report: status, registers, peripheral logs"]
 
   ingest --> cpu
   cpu --> uni
   cpu -.-> later
+  uni --> nvic
+  nvic --> uni
   uni --> mmio
   mmio --> plugs
   mmio --> unmapped
@@ -77,16 +80,16 @@ flowchart TD
   snap -.-> uni
 ```
 
-`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. Snapshots are plain data (register names, region bytes, plugin dicts), so a future backend can restore them without Unicorn context objects.
+`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. The Unicorn backend models the NVIC and exception entry in front of each instruction. Snapshots are plain data (register names, region bytes, plugin dicts, and the NVIC image), so a future backend can restore them without Unicorn context objects.
 
 ## Run your own image
 
 ```bash
-python3 -m rehost run --config examples/uart_gpio.yaml --firmware /path/to/image.bin
-python3 -m rehost run --fixture uart-gpio -v
-python3 -m rehost run --fixture fuzz-echo --input case.bin --snapshot-out after.json
-python3 -m rehost plugins
-python3 -m rehost fixtures
+jig-emu run --config examples/uart_gpio.yaml --firmware /path/to/image.bin
+jig-emu run --fixture uart-gpio -v
+jig-emu run --fixture fuzz-echo --input case.bin --snapshot-out after.json
+jig-emu plugins
+jig-emu fixtures
 ```
 
 `--firmware` is a file you supply. `--config` is required with it, because the tool will not guess a memory map. `--fixture` selects one of the synthetic programs and, if you omit `--config`, its packaged machine file.
@@ -95,7 +98,7 @@ python3 -m rehost fixtures
 
 ## Machine file
 
-`examples/uart_gpio.yaml` is a complete example. Addresses may be integers or `0x` strings. TOML works the same way (`python3 -m rehost run -c machine.toml --firmware image.bin`).
+`examples/uart_gpio.yaml` is a complete example. Addresses may be integers or `0x` strings. TOML works the same way (`jig-emu run -c machine.toml --firmware image.bin`).
 
 ```yaml
 name: uart-gpio
@@ -158,7 +161,7 @@ Regions must not overlap. The backend maps whole pages; two regions may share a 
 | --- | --- |
 | `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Other offsets are logged. |
 | `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. |
-| `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each read of VAL returns the current count and then decrements it. A read that sees 0 reloads from LOAD and sets COUNTFLAG. TICKINT records `irq_pending` on the plugin. The interrupt is not delivered. |
+| `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
 | `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable}`. Unlisted offsets log and return `read_default`. |
 | `unimplemented` | Every access is logged once at INFO and reads return `read_default`. `mmio: true` selects this plugin when `peripheral` is omitted. |
 
@@ -202,7 +205,7 @@ class LedBank(Peripheral):
 
 `read` and `write` see offsets from the region base. Sizes are 1, 2, or 4. `snapshot_state` must return JSON-friendly values (`int`, `str`, `bool`, `list`, `dict`) or `bytes` (stored as hex in the snapshot file). The machine calls it for every fuzz iteration that uses `PersistentHarness`.
 
-`python3 -m rehost plugins` lists whatever has been registered by the installed package. Your class appears after the process imports your module.
+`jig-emu plugins` lists whatever has been registered by the installed package. Your class appears after the process imports your module.
 
 ## Add a CPU backend
 
@@ -219,7 +222,7 @@ class QemuCortexM(CpuBackend):
 
 `arch: qemu-cortex-m`, `renode`, and `riscv` are recognized as planned names and fail with that explanation. They are not wired up.
 
-`inject_irq` on the Unicorn backend appends to `backend.pending_irqs` and does not enter the NVIC. A backend that can deliver interrupts should override it.
+`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending.
 
 ## Snapshots
 
@@ -234,7 +237,7 @@ machine.restore(snap)
 snap.write_json("state.json")
 ```
 
-The snapshot includes general-purpose registers, `sp`, `lr`, `pc`, `xpsr`, the Cortex-M banked stack and mask registers Unicorn exposes, every writable non-peripheral region, and each plugin's `snapshot_state`. Flash is not saved; reload the image, then restore. `Machine.restore` checks that the region set matches.
+The snapshot includes general-purpose registers, `sp`, `lr`, `pc`, `xpsr`, the Cortex-M banked stack and mask registers Unicorn exposes, every writable non-peripheral region, each plugin's `snapshot_state`, and the NVIC/SCB image (`cpu` in the JSON: enable, pending, active, priority, VTOR, priority grouping). Flash is not saved; reload the image, then restore. `Machine.restore` checks that the region set matches. A checkpoint taken for fuzzing therefore restores interrupt state with the RAM and the plugins.
 
 ## Fuzz harness
 
@@ -274,7 +277,7 @@ Input sources, in order:
 3. `REHOST_INPUT_FILE`
 4. stdin, when the machine file has a `fuzz:` section and stdin is not a terminal
 
-`examples/fuzz_echo.s` loads the word at `0x20000100` and writes the low byte to the UART. `python3 -m rehost run --fixture fuzz-echo --input case.bin` is the command to try.
+`examples/fuzz_echo.s` loads the word at `0x20000100` and writes the low byte to the UART. `jig-emu run --fixture fuzz-echo --input case.bin` is the command to try.
 
 ## Fixtures
 
@@ -293,7 +296,19 @@ To study a real RTOS image, build it yourself (a Zephyr sample or a FreeRTOS dem
 - On Unicorn 2.1 the memory-read hook runs before the load retires. The dispatcher writes the plugin's value into guest memory inside that hook, and the instruction observes it.
 - Unicorn's `uc_emu_start` timeout is microseconds. The machine file's `timeout_ms` is converted at the backend boundary. The Python binding's docstring that says milliseconds does not match Unicorn 2.1.
 - A page is mapped writable so the image can be copied, then `run` applies the permissions from the config.
-- SysTick advances when firmware reads VAL. It is a polling stub, not a cycle timer.
+- While a `Machine` owns SysTick, the counter steps once per instruction fetched for execution while ENABLE is set. It is not a cycle-accurate clock. `CLKSOURCE` is stored and does not select a separate reference.
+
+## Interrupts
+
+The Unicorn backend delivers ARMv7-M exceptions before each instruction. SysTick is exception 15. External IRQ `n` is exception `16 + n`. The vector address is `VTOR + exception * 4`, and bit 0 of that word must be set. `boot.mode: vector` initializes VTOR from `vector_base`.
+
+On entry the model stacks `r0`, `r1`, `r2`, `r3`, `r12`, `lr`, the return PC, and `xPSR` on MSP or PSP (PSP only from Thread mode with `CONTROL.SPSEL`). `CCR.STKALIGN` (set at reset) forces 8-byte alignment and records the adjustment in stacked `xPSR` bit 9. `lr` becomes `0xFFFFFFF1` (back to Handler mode on MSP), `0xFFFFFFF9` (Thread mode, MSP), or `0xFFFFFFFD` (Thread mode, PSP). The handler runs on MSP with IPSR set to the exception number. Return is recognized on `BX`/`BLX`, `MOV PC`, and 16-bit or Thumb-2 `POP`/`LDM` that load an `EXC_RETURN` value; the frame is unstacked and `FAULTMASK` is cleared except on the way out of NMI.
+
+A pending exception runs when it is enabled, not already active, and its group priority is strictly more urgent than the execution priority. All eight priority bits are implemented. `AIRCR.PRIGROUP` splits group priority from subpriority. PRIMASK boosts execution priority to 0, FAULTMASK to -1, and BASEPRI masks on the group field (a zero group field disables BASEPRI). NMI is fixed at -2 and HardFault at -1. `inject_irq`, `ISPR`/`STIR`, and `ICSR` (`PENDSVSET`, `PENDSTSET`, `NMIPENDSET`) latch pending bits. Taking the exception clears the pending bit. `SVC` enters SVCall, or HardFault if the current priority or a mask blocks it.
+
+`WFI` and `WFE` do not suspend the emulator. If an exception can be taken, the stacked return PC is the instruction after the hint. Otherwise the hint retires in one instruction, including when PRIMASK or BASEPRI is holding a pending interrupt off, so `timeout_ms` and `max_instructions` still stop a wait loop.
+
+Not modeled: tail-chaining and late arrival (a new exception after a return is unstacked and stacked again), lazy floating-point frames (`EXC_RETURN` bit 4 clear stops the run), v8-M stack limits and security extensions, and `SLEEPONEXIT` / `SLEEPDEEP` (the bits are stored and do not change control). `AIRCR.SYSRESETREQ` stops the run as a fault instead of resetting the core.
 
 ## Roadmap
 
@@ -302,7 +317,6 @@ Not in this version:
 - RTOS and BSP shims for VxWorks, QNX, and ThreadX, including HAL-call replacement
 - A RISC-V backend
 - QEMU and Renode adapters on `CpuBackend`
-- NVIC delivery for the IRQs `inject_irq` already queues
 - Printer, ICS, and other device-specific peripheral models
 - An AFL++ forkserver or a libAFL executor in-tree (the `exec_one` hook is the place those would call)
 - A new CPU emulator. Decode and execute stay in Unicorn, or in QEMU/Renode when those adapters exist.

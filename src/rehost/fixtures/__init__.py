@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Synthetic Cortex-M fixtures assembled in-repo.
 
-These are hand-written Thumb programs used by tests and ``rehost run
+These are hand-written Thumb programs used by tests and ``jig-emu run
 --fixture``. They are not third-party firmware, and this package does not
 download any.
 """

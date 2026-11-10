@@ -106,12 +106,24 @@ def test_coverage_includes_the_entry_and_unknown_backend_is_named():
         )
 
 
-def test_inject_irq_is_queued_not_delivered():
-    machine = machine_from_asm("bkpt #0")
-    machine.inject_irq(15)
+def test_wfi_loop_still_hits_the_instruction_limit():
+    machine = machine_from_asm(
+        "loop:\n    wfi\n    b loop",
+        run={"max_instructions": 20, "timeout_ms": 1000},
+    )
     result = machine.run()
-    assert result.status == "halted"
-    assert machine.backend.pending_irqs == [15]
+    assert result.status == "instruction_limit"
+    assert result.instructions == 20
+
+
+def test_wfi_loop_still_times_out():
+    machine = machine_from_asm(
+        "loop:\n    wfi\n    b loop",
+        run={"timeout_ms": 50, "max_instructions": 0},
+    )
+    result = machine.run()
+    assert result.status == "timeout"
+    assert result.instructions > 0
 
 
 def parse_config_arch(arch: str):

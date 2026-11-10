@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from rehost.config import parse_config
-from rehost.fixtures.assemble import assemble
+from rehost.fixtures.assemble import assemble_image
 from rehost.machine import Machine
 
 
@@ -39,5 +39,7 @@ def machine_from_asm(
     if fuzz is not None:
         config["fuzz"] = fuzz
     machine = Machine(parse_config(config))
-    machine.load_image(assemble(source))
+    image, labels = assemble_image(source)
+    machine.load_image(image)
+    machine.labels = labels
     return machine
