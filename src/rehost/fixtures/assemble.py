@@ -2,9 +2,11 @@
 """A tiny Thumb/Thumb-2 assembler for in-repo fixtures.
 
 It encodes the instructions the synthetic programs use (``movw``/``movt``,
-``movs``, ``ldr``/``str`` immediate, ``bkpt``, ``nop``, and short ``b``) plus
-``.word`` / ``.thumb_word``. It is not a general assembler. CI never needs a
-cross toolchain, and the bytes it emits are executed by the Unicorn backend.
+``mov`` / ``movs``, ``ldr``/``str`` immediate, ``adds``, ``add rd, sp``,
+``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``, ``wfi`` / ``wfe``,
+``bkpt``, ``nop``, and short ``b``) plus ``.word`` / ``.thumb_word``. It is
+not a general assembler. CI never needs a cross toolchain, and the bytes it
+emits are executed by the Unicorn backend.
 """
 
 from __future__ import annotations
@@ -35,13 +37,42 @@ _IGNORED_PREFIXES = (
 _WIDTHS = {
     "movw": 4,
     "movt": 4,
+    "mov": 2,
     "movs": 2,
     "str": 2,
     "ldr": 2,
+    "adds": 2,
+    "add": 2,
+    "bx": 2,
     "bkpt": 2,
     "nop": 2,
     "b": 2,
     "b.n": 2,
+    "wfi": 2,
+    "wfe": 2,
+    "cpsid": 2,
+    "cpsie": 2,
+    "svc": 2,
+    "mrs": 4,
+    "msr": 4,
+}
+
+# SYSm values from the ARMv7-M MRS/MSR encodings.
+_SYSM = {
+    "apsr": 0,
+    "iapsr": 1,
+    "eapsr": 2,
+    "xpsr": 3,
+    "ipsr": 5,
+    "epsr": 6,
+    "iepsr": 7,
+    "msp": 8,
+    "psp": 9,
+    "primask": 16,
+    "basepri": 17,
+    "basepri_max": 18,
+    "faultmask": 19,
+    "control": 20,
 }
 
 _NUMBER = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
@@ -59,6 +90,30 @@ _MEM = re.compile(
 _BKPT = re.compile(r"^bkpt(?:\s+#(?P<imm>0x[0-9a-fA-F]+|\d+))?$", re.IGNORECASE)
 _NOP = re.compile(r"^nop(?:\.n)?$", re.IGNORECASE)
 _BRANCH = re.compile(r"^b(?:\.n)?\s+([A-Za-z_.][\w.]*)$", re.IGNORECASE)
+_MOV_REG = re.compile(
+    r"^mov\s+(?P<rd>r\d+|sp|lr|pc)\s*,\s*(?P<rm>r\d+|sp|lr|pc)$",
+    re.IGNORECASE,
+)
+_ADDS = re.compile(
+    r"^adds\s+(?P<rd>r\d+)\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_ADD_SP = re.compile(
+    r"^add\s+(?P<rd>r\d+)\s*,\s*sp\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_BX = re.compile(r"^bx\s+(?P<rm>r\d+|sp|lr|pc)$", re.IGNORECASE)
+_SVC = re.compile(r"^svc\s+#(?P<imm>0x[0-9a-fA-F]+|\d+)$", re.IGNORECASE)
+_CPS = re.compile(r"^cps(?P<effect>id|ie)\s+i$", re.IGNORECASE)
+_HINT = re.compile(r"^(?P<op>wfi|wfe)$", re.IGNORECASE)
+_MRS = re.compile(
+    r"^mrs\s+(?P<rd>r\d+|sp|lr|pc)\s*,\s*(?P<sysm>[A-Za-z_][A-Za-z0-9_]*)$",
+    re.IGNORECASE,
+)
+_MSR = re.compile(
+    r"^msr\s+(?P<sysm>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*(?P<rn>r\d+|sp|lr|pc)$",
+    re.IGNORECASE,
+)
 
 
 def assemble(source: str, *, base: int = 0) -> bytes:
@@ -204,6 +259,63 @@ def _encode_insn(text: str, address: int, labels: dict[str, int], line_no: int) 
     if _NOP.fullmatch(text):
         return struct.pack("<H", 0xBF00)
 
+    match = _HINT.fullmatch(text)
+    if match:
+        return struct.pack("<H", 0xBF30 if match.group("op").lower() == "wfi" else 0xBF20)
+
+    match = _CPS.fullmatch(text)
+    if match:
+        return struct.pack("<H", 0xB672 if match.group("effect").lower() == "id" else 0xB662)
+
+    match = _BX.fullmatch(text)
+    if match:
+        rm = _register(match.group("rm"), line_no, low_only=False)
+        return struct.pack("<H", 0x4700 | (rm << 3))
+
+    match = _SVC.fullmatch(text)
+    if match:
+        imm = int(match.group("imm"), 0)
+        if not 0 <= imm <= 0xFF:
+            raise AssembleError(f"line {line_no}: svc immediate must fit in 8 bits")
+        return struct.pack("<H", 0xDF00 | imm)
+
+    match = _ADDS.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        imm = int(match.group("imm"), 0)
+        if not 0 <= imm <= 0xFF:
+            raise AssembleError(f"line {line_no}: adds immediate must fit in 8 bits")
+        return struct.pack("<H", 0x3000 | (rd << 8) | imm)
+
+    match = _ADD_SP.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        imm = int(match.group("imm"), 0)
+        if imm < 0 or imm > 1020 or imm % 4 != 0:
+            raise AssembleError(
+                f"line {line_no}: add rd, sp immediate must be a multiple of 4 from 0 to 1020"
+            )
+        return struct.pack("<H", 0xA800 | (rd << 8) | (imm >> 2))
+
+    match = _MOV_REG.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=False)
+        rm = _register(match.group("rm"), line_no, low_only=False)
+        encoded = 0x4600 | (((rd >> 3) & 1) << 7) | (rm << 3) | (rd & 7)
+        return struct.pack("<H", encoded)
+
+    match = _MRS.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=False)
+        sysm = _sysm(match.group("sysm"), line_no)
+        return struct.pack("<HH", 0xF3EF, 0x8000 | (rd << 8) | sysm)
+
+    match = _MSR.fullmatch(text)
+    if match:
+        rn = _register(match.group("rn"), line_no, low_only=False)
+        sysm = _sysm(match.group("sysm"), line_no)
+        return struct.pack("<HH", 0xF380 | rn, 0x8800 | sysm)
+
     match = _BRANCH.fullmatch(text)
     if match:
         label = match.group(1)
@@ -235,6 +347,14 @@ def _branch(address: int, target: int, line_no: int) -> bytes:
         )
     imm11 = (offset >> 1) & 0x7FF
     return struct.pack("<H", 0xE000 | imm11)
+
+
+def _sysm(token: str, line_no: int) -> int:
+    try:
+        return _SYSM[token.lower()]
+    except KeyError as exc:
+        known = ", ".join(sorted(_SYSM))
+        raise AssembleError(f"line {line_no}: unknown special register {token}; known: {known}") from exc
 
 
 def _register(token: str, line_no: int, *, low_only: bool) -> int:

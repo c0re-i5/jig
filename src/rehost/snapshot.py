@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Portable CPU + RAM + peripheral snapshots.
 
-The blob is plain data (registers, region bytes, plugin state) so a later
-QEMU or Renode backend can restore it without Unicorn context objects.
+The blob is plain data (registers, region bytes, plugin state, and the
+NVIC/SCB image) so a later QEMU or Renode backend can restore it without
+Unicorn context objects.
 Flash and other non-saved regions stay as loaded on the machine; copy the
 image separately.
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,7 @@ class Snapshot:
     memory_base: dict[str, int]
     peripherals: dict[str, dict[str, Any]]
     version: int = SNAPSHOT_VERSION
+    cpu: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,7 @@ class Snapshot:
                 for name, blob in self.memory.items()
             },
             "peripherals": _jsonable_state(self.peripherals),
+            "cpu": _jsonable_state(self.cpu),
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -118,6 +121,9 @@ class Snapshot:
         peripherals = _from_jsonable_state(data.get("peripherals", {}))
         if not isinstance(peripherals, dict):
             raise MachineError("snapshot peripherals must be an object")
+        cpu = _from_jsonable_state(data.get("cpu", {}))
+        if not isinstance(cpu, dict):
+            raise MachineError("snapshot cpu state must be an object")
         return cls(
             arch=arch,
             registers=registers,
@@ -125,6 +131,7 @@ class Snapshot:
             memory_base=memory_base,
             peripherals=peripherals,
             version=version,
+            cpu=cpu,
         )
 
     @classmethod

@@ -31,8 +31,8 @@ class CpuBackend(ABC):
     """Operations ``Machine`` needs from any CPU engine.
 
     Planned adapters (not implemented): ``qemu-cortex-m``, ``renode``, and a
-    RISC-V engine. ``inject_irq`` is part of the contract even when the engine
-    cannot deliver the interrupt yet.
+    RISC-V engine. ``inject_irq`` pends an external IRQ. The Unicorn backend
+    delivers it through the NVIC; other backends may only record it.
     """
 
     arch: str
@@ -40,6 +40,7 @@ class CpuBackend(ABC):
 
     def __init__(self) -> None:
         self.pending_irqs: list[int] = []
+        self.cpu_fault: str | None = None
 
     @abstractmethod
     def map_memory(self, address: int, size: int, perms: int) -> None:
@@ -111,11 +112,56 @@ class CpuBackend(ABC):
         """Call ``callback(access) -> bool``. True asks the engine to retry."""
 
     def inject_irq(self, irq: int) -> None:
-        """Queue an interrupt request.
+        """Pend an external interrupt.
 
-        The Unicorn Cortex-M backend records the request and does not deliver
-        it through NVIC. A future backend can override this and take the IRQ.
+        ``irq`` is the NVIC external number (exception ``16 + irq``), not the
+        architectural exception number. The default implementation only records
+        the request. The Unicorn backend delivers it through the NVIC.
         """
+        self._check_irq(irq)
+        self.pending_irqs.append(irq)
+
+    def pend_exception(self, number: int) -> None:
+        """Pend an architectural exception. The default records nothing."""
+        return None
+
+    def service_interrupts(self, address: int, size: int) -> str:
+        """Give the backend a chance to take an interrupt before ``address``.
+
+        Returns ``retire``, ``skip``, ``redirect``, or ``stop``.
+        """
+        return "retire"
+
+    def take_svc(self) -> None:
+        """Enter SVCall after the engine reports a supervisor call."""
+        return None
+
+    def prepare_run(self) -> None:
+        """Clear sticky fault state from a previous run."""
+        self.cpu_fault = None
+
+    def reset_cpu_state(self) -> None:
+        """Restore architectural interrupt state to reset values."""
+        self.pending_irqs.clear()
+        self.cpu_fault = None
+
+    def set_vector_table(self, address: int) -> None:
+        """Set VTOR. Backends without an NVIC ignore this."""
+        return None
+
+    def ensure_system_control(self) -> None:
+        """Map the system control space when this CPU has one."""
+        return None
+
+    def snapshot_cpu_state(self) -> dict:
+        """Extra CPU state that is not part of ``read_registers``."""
+        return {}
+
+    def restore_cpu_state(self, state: dict) -> None:
+        """Restore the object returned by ``snapshot_cpu_state``."""
+        return None
+
+    def _check_irq(self, irq: int) -> int:
         if not isinstance(irq, int) or isinstance(irq, bool) or not 0 <= irq <= 255:
             raise ValueError(f"irq must be an integer from 0 to 255, not {irq!r}")
-        self.pending_irqs.append(irq)
+        return irq

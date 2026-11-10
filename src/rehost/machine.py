@@ -13,11 +13,20 @@ import logging
 from collections import deque
 from pathlib import Path
 
-from rehost.backends import BKPT_VECTOR, UNTIL_NEVER, CpuBackend, MemAccess, create_backend
+from rehost.backends import (
+    BKPT_VECTOR,
+    SVC_VECTOR,
+    UNTIL_NEVER,
+    CpuBackend,
+    MemAccess,
+    create_backend,
+)
 from rehost.config import MachineConfig, load_config
 from rehost.errors import BackendError, ConfigError, MachineError
 from rehost.memory import PERM_READ, PERM_WRITE, MemoryMap, access_mask, pages_touched
+from rehost.nvic import EXC_SYSTICK, REDIRECT, STOP
 from rehost.peripherals import create_peripheral
+from rehost.peripherals.systick import SysTick
 from rehost.result import (
     STATUS_FAULT,
     STATUS_HALTED,
@@ -58,10 +67,15 @@ class Machine:
         self._peripheral_init = copy.deepcopy(
             {plugin.name: plugin.snapshot_state() for plugin in self._peripherals}
         )
+        for plugin in self._peripherals:
+            if isinstance(plugin, SysTick):
+                # Instruction hooks are the clock. VAL reads must not also step.
+                plugin.cpu_clock = True
         self._final_perms: dict[int, int] = {}
         self._hook_pages: set[int] = set()
         self._map_pages()
         self._install_hooks()
+        self.backend.ensure_system_control()
         self._image_loaded = False
         self._booted = False
         self._protected = False
@@ -136,7 +150,7 @@ class Machine:
         if reset:
             for plugin in self._peripherals:
                 plugin.restore_state(copy.deepcopy(self._peripheral_init[plugin.name]))
-            self.backend.pending_irqs.clear()
+            self.backend.reset_cpu_state()
         boot = self.config.boot
         if boot.mode == "vector":
             sp = self.read_u32(boot.vector_base)
@@ -152,6 +166,8 @@ class Machine:
         # EPSR.T. ``start`` also forces the Thumb bit on the entry address.
         self.backend.write_register("xpsr", 1 << 24)
         self.backend.write_register("pc", entry & ~1)
+        if boot.mode == "vector":
+            self.backend.set_vector_table(boot.vector_base)
         self._booted = True
 
     def run(self) -> RunResult:
@@ -167,6 +183,7 @@ class Machine:
         self._trace.clear()
         self._trace_total = 0
         self._coverage.clear()
+        self.backend.prepare_run()
         pc = self.backend.read_register("pc")
         timeout_us = self.config.run.timeout_ms * 1000
         timed_out = False
@@ -181,6 +198,9 @@ class Machine:
             if self._reason is None:
                 self._reason = STATUS_FAULT
                 self._detail = str(exc)
+        if self._reason is None and self.backend.cpu_fault:
+            self._reason = STATUS_FAULT
+            self._detail = self.backend.cpu_fault
         if self._reason is None:
             if timed_out:
                 self._reason = STATUS_TIMEOUT
@@ -212,6 +232,7 @@ class Machine:
             memory=memory,
             memory_base=bases,
             peripherals=peripherals,
+            cpu=self.backend.snapshot_cpu_state(),
         )
 
     def restore(self, snap: Snapshot) -> None:
@@ -250,10 +271,11 @@ class Machine:
         for plugin in self._peripherals:
             plugin.restore_state(copy.deepcopy(snap.peripherals[plugin.name]))
         self.backend.write_registers(snap.registers)
+        self.backend.restore_cpu_state(snap.cpu)
         self._booted = True
 
     def inject_irq(self, irq: int) -> None:
-        """Queue an IRQ on the backend. Delivery depends on the backend."""
+        """Pend external IRQ ``irq``. Enable, priority, and masks still apply."""
         self.backend.inject_irq(irq)
 
     def read_memory(self, address: int, size: int) -> bytes:
@@ -340,7 +362,7 @@ class Machine:
             effective = perms | PERM_WRITE if writable else perms
             self.backend.protect_memory(start, page, effective)
 
-    def _on_code(self, address: int, _size: int) -> None:
+    def _on_code(self, address: int, size: int) -> None:
         if address in self._halt_addresses:
             self._reason = STATUS_HALTED
             self._detail = f"halt address {address:#x}"
@@ -352,15 +374,38 @@ class Machine:
             self._detail = f"stopped after {self._instructions} instructions"
             self.backend.stop()
             return
+        self._clock_systick()
+        effect = self.backend.service_interrupts(address, size)
+        if effect == STOP or self.backend.cpu_fault:
+            self._reason = STATUS_FAULT
+            self._detail = self.backend.cpu_fault or "cpu fault"
+            self.backend.stop()
+            return
+        if effect == REDIRECT:
+            return
         self._instructions += 1
         if self.config.run.collect_coverage:
             self._coverage.add(address)
+
+    def _clock_systick(self) -> None:
+        for plugin in self._peripherals:
+            if not isinstance(plugin, SysTick):
+                continue
+            if plugin.consume_cpu_tick():
+                self.backend.pend_exception(EXC_SYSTICK)
 
     def _on_interrupt(self, vector: int) -> None:
         if vector == BKPT_VECTOR and self.config.run.halt_on_bkpt:
             self._reason = STATUS_HALTED
             self._detail = "bkpt"
             self.backend.stop()
+            return
+        if vector == SVC_VECTOR:
+            self.backend.take_svc()
+            if self.backend.cpu_fault:
+                self._reason = STATUS_FAULT
+                self._detail = self.backend.cpu_fault
+                self.backend.stop()
             return
         self._reason = STATUS_FAULT
         self._detail = f"exception {vector}"

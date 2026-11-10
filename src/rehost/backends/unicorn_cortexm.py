@@ -61,11 +61,15 @@ from rehost.backends.base import CpuBackend, MemAccess
 from rehost.backends.registry import register_backend
 from rehost.errors import BackendError
 from rehost.memory import PERM_EXEC, PERM_READ, PERM_WRITE
+from rehost.nvic import EXC_SVCALL, Nvic
 
 logger = logging.getLogger(__name__)
 
-# QEMU's EXCP_BKPT, surfaced by Unicorn as the interrupt-hook vector.
+# QEMU exception numbers, surfaced by Unicorn as the interrupt-hook vector.
 BKPT_VECTOR = 7
+SVC_VECTOR = 2
+
+_SCS_PAGE = 0xE000E000
 
 _REGISTERS: tuple[tuple[str, int], ...] = (
     ("r0", UC_ARM_REG_R0),
@@ -112,6 +116,8 @@ class UnicornCortexM(CpuBackend):
         # The C API times out in microseconds. The Python docstring that says
         # milliseconds does not match Unicorn 2.1 (uc_emu_start).
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS | UC_MODE_LITTLE_ENDIAN)
+        self.nvic = Nvic(_UnicornCore(self))
+        self._scs_ready = False
 
     def map_memory(self, address: int, size: int, perms: int) -> None:
         self._check_pages(address, size)
@@ -217,11 +223,82 @@ class UnicornCortexM(CpuBackend):
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, inner)
 
     def inject_irq(self, irq: int) -> None:
-        super().inject_irq(irq)
-        logger.info(
-            "IRQ %d queued; Unicorn Cortex-M does not deliver NVIC interrupts yet",
-            irq,
-        )
+        self._check_irq(irq)
+        self.nvic.pend_external(irq)
+        self._sync_pending_irqs()
+
+    def pend_exception(self, number: int) -> None:
+        self.nvic.pend(number)
+        self._sync_pending_irqs()
+
+    def service_interrupts(self, address: int, size: int) -> str:
+        effect = self.nvic.service(address, size)
+        self._sync_pending_irqs()
+        if self.nvic.fault:
+            self.cpu_fault = self.nvic.fault
+        return effect
+
+    def take_svc(self) -> None:
+        # Unicorn has already moved PC past the SVC instruction.
+        self.nvic.request_exception(EXC_SVCALL, self.read_register("pc") & ~1)
+        self._sync_pending_irqs()
+        if self.nvic.fault:
+            self.cpu_fault = self.nvic.fault
+
+    def prepare_run(self) -> None:
+        super().prepare_run()
+        self.nvic.fault = None
+
+    def reset_cpu_state(self) -> None:
+        self.nvic.reset()
+        self._sync_pending_irqs()
+        self.cpu_fault = None
+
+    def set_vector_table(self, address: int) -> None:
+        self.nvic.vtor = address & 0xFFFFFF80
+
+    def ensure_system_control(self) -> None:
+        """Map the SCS page and answer NVIC/SCB accesses from the model."""
+        if self._scs_ready:
+            return
+        try:
+            self.uc.mem_map(_SCS_PAGE, 0x1000, UC_PROT_READ | UC_PROT_WRITE)
+        except UcError:
+            try:
+                self.uc.mem_read(_SCS_PAGE, 1)
+            except UcError as exc:
+                raise BackendError(f"cannot map system control space: {exc}") from exc
+        self.hook_memory_read(self._on_scs_read, _SCS_PAGE, _SCS_PAGE + 0xFFF)
+        self.hook_memory_write(self._on_scs_write, _SCS_PAGE, _SCS_PAGE + 0xFFF)
+        self._scs_ready = True
+
+    def snapshot_cpu_state(self) -> dict:
+        return self.nvic.snapshot_state()
+
+    def restore_cpu_state(self, state: dict) -> None:
+        self.nvic.restore_state(state or {})
+        self._sync_pending_irqs()
+        self.cpu_fault = None
+
+    def _on_scs_read(self, address: int, size: int, _value: int) -> None:
+        data = self.nvic.io_read(address, size, ipsr=self.read_register("xpsr") & 0x1FF)
+        if data is None:
+            return
+        width = 8 * size
+        self.write_memory(address, (data & ((1 << width) - 1)).to_bytes(size, "little"))
+
+    def _on_scs_write(self, address: int, size: int, value: int) -> None:
+        if not self.nvic.io_write(address, size, value):
+            return
+        self._sync_pending_irqs()
+        if self.nvic.fault:
+            self.cpu_fault = self.nvic.fault
+            self.stop()
+
+    def _sync_pending_irqs(self) -> None:
+        self.pending_irqs = [
+            irq for irq, pending in enumerate(self.nvic.external_pending) if pending
+        ]
 
     def _ident(self, name: str) -> int:
         try:
@@ -259,3 +336,22 @@ class UnicornCortexM(CpuBackend):
     @staticmethod
     def _u32(value: int) -> int:
         return value & 0xFFFFFFFF
+
+
+class _UnicornCore:
+    """Register and memory view the NVIC uses to stack and unstack."""
+
+    def __init__(self, backend: UnicornCortexM) -> None:
+        self._backend = backend
+
+    def read_reg(self, name: str) -> int:
+        return self._backend.read_register(name)
+
+    def write_reg(self, name: str, value: int) -> None:
+        self._backend.write_register(name, value & 0xFFFFFFFF)
+
+    def read_mem(self, address: int, size: int) -> bytes:
+        return self._backend.read_memory(address, size)
+
+    def write_mem(self, address: int, data: bytes) -> None:
+        self._backend.write_memory(address, data)

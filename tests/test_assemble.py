@@ -18,6 +18,17 @@ def test_movw_movt_and_memory_encodings():
     assert assemble("ldr r1, [r0, #4]") == bytes.fromhex("4168")
     assert assemble("bkpt #0") == bytes.fromhex("00be")
     assert assemble("nop") == bytes.fromhex("00bf")
+    assert assemble("wfi") == bytes.fromhex("30bf")
+    assert assemble("wfe") == bytes.fromhex("20bf")
+    assert assemble("cpsid i") == bytes.fromhex("72b6")
+    assert assemble("cpsie i") == bytes.fromhex("62b6")
+    assert assemble("bx lr") == bytes.fromhex("7047")
+    assert assemble("adds r1, #1") == bytes.fromhex("0131")
+    assert assemble("mov r0, lr") == bytes.fromhex("7046")
+    assert assemble("add r0, sp, #0") == bytes.fromhex("00a8")
+    assert assemble("svc #0") == bytes.fromhex("00df")
+    assert assemble("mrs r0, ipsr") == bytes.fromhex("eff30580")
+    assert assemble("msr basepri, r1") == bytes.fromhex("81f31188")
     # `b .` is the well-known Thumb encoding fe e7.
     assert assemble("self:\n    b self") == bytes.fromhex("fee7")
 
@@ -59,7 +70,7 @@ def test_movw_movt_builds_a_peripheral_address():
 
 def test_unknown_instruction_and_far_branch_fail():
     with pytest.raises(AssembleError, match="unknown instruction"):
-        assemble("svc #0")
+        assemble("udf #0")
     padding = "\n".join(".word 0" for _ in range(600))
     with pytest.raises(AssembleError, match="out of range"):
         assemble(f"b far\n{padding}\nfar:\n    bkpt #0\n")
