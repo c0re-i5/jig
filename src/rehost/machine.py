@@ -85,6 +85,7 @@ class Machine:
         self._trace: deque[TraceEntry] = deque(maxlen=config.run.trace_limit)
         self._trace_total = 0
         self._coverage: set[int] = set()
+        self._coverage_map = None
         self._halt_addresses = set(config.run.halt_addresses)
 
     @classmethod
@@ -170,6 +171,17 @@ class Machine:
             self.backend.set_vector_table(boot.vector_base)
         self._booted = True
 
+    def attach_coverage(self, coverage) -> None:
+        """Record AFL-style edges into ``coverage`` on later runs.
+
+        ``coverage`` is a ``CoverageMap``, or None to stop recording. The map
+        is not guest state: ``run`` clears it after a snapshot restore and
+        before the first instruction, so one execution cannot leak hits into
+        the next. ``run.collect_coverage`` still records the PC set when that
+        flag is on; the bitmap is separate and only updated when attached.
+        """
+        self._coverage_map = coverage
+
     def run(self) -> RunResult:
         """Execute until BKPT, a halt address, a fault, a timeout, or the instruction cap."""
         if not self._image_loaded:
@@ -183,6 +195,8 @@ class Machine:
         self._trace.clear()
         self._trace_total = 0
         self._coverage.clear()
+        if self._coverage_map is not None:
+            self._coverage_map.begin_run()
         self.backend.prepare_run()
         pc = self.backend.read_register("pc")
         timeout_us = self.config.run.timeout_ms * 1000
@@ -386,6 +400,9 @@ class Machine:
         self._instructions += 1
         if self.config.run.collect_coverage:
             self._coverage.add(address)
+        coverage_map = self._coverage_map
+        if coverage_map is not None:
+            coverage_map.on_instruction(address)
 
     def _clock_systick(self) -> None:
         for plugin in self._peripherals:

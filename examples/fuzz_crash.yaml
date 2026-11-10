@@ -1,0 +1,39 @@
+# Synthetic machine that faults when the fuzz buffer starts with "JIG!".
+name: fuzz-crash
+description: >
+  Compares the first four bytes at 0x20000100 with JIG!. Any other input
+  executes BKPT. That sequence fetches an unmapped address and faults.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x00000000
+
+memory:
+  - name: flash
+    base: 0x00000000
+    size: 0x1000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x1000
+    perms: rw
+
+boot:
+  mode: vector
+  vector_base: 0x00000000
+
+run:
+  timeout_ms: 200
+  max_instructions: 1000
+  halt_on_bkpt: true
+
+unmapped:
+  action: fault
+  read_default: 0
+
+fuzz:
+  mode: buffer
+  buffer:
+    address: 0x20000100
+    max_size: 16
