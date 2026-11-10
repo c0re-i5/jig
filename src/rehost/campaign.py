@@ -23,6 +23,7 @@ from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError
 from rehost.fuzz import PersistentHarness, is_fuzz_crash
 from rehost.result import STATUS_LIMIT, STATUS_TIMEOUT
+from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 # Byte-walk inputs longer than this only in havoc. The planted fixture's
 # interesting prefix is 4 bytes, and the walk is what makes that demo finish
@@ -43,17 +44,22 @@ class CampaignResult:
     hangs: int
     rng_seed: int
     crash_paths: list[Path] = field(default_factory=list)
+    buckets: int = 0
+    report_paths: list[Path] = field(default_factory=list)
 
     def format(self) -> str:
         lines = [
             f"execs: {self.execs}",
             f"corpus: {self.corpus}",
             f"crashes: {self.crashes}",
+            f"buckets: {self.buckets}",
             f"hangs: {self.hangs}",
             f"rng-seed: {self.rng_seed}",
         ]
         if self.crash_paths:
             lines.append(f"crash: {self.crash_paths[0]}")
+        if self.report_paths:
+            lines.append(f"report: {self.report_paths[0]}")
         return "\n".join(lines)
 
 
@@ -76,6 +82,7 @@ class Campaign:
         max_execs: int = 1_000_000,
         rng_seed: int | None = None,
         stop_on_crash: bool = False,
+        replay: ReplayTarget | None = None,
     ) -> None:
         if max_execs < 1:
             raise ValueError("max_execs must be >= 1")
@@ -102,6 +109,7 @@ class Campaign:
         self.hang_count = 0
         self.crash_paths: list[Path] = []
         self._stopped = False
+        self.triage = TriageStore(out, replay=replay)
 
     def run(self) -> CampaignResult:
         self.out.mkdir(parents=True, exist_ok=True)
@@ -132,6 +140,8 @@ class Campaign:
             hangs=self.hang_count,
             rng_seed=self.rng_seed,
             crash_paths=list(self.crash_paths),
+            buckets=self.triage.bucket_count(),
+            report_paths=self.triage.report_paths(),
         )
 
     def _initial_seeds(self) -> list[bytes]:
@@ -230,12 +240,15 @@ class Campaign:
 
     def _save_crash(self, data: bytes, result) -> None:
         self.crash_count += 1
-        if len(self.crash_paths) >= _CRASH_CAP:
-            return
-        name = f"id:{self.crash_count - 1:06d},sig:11,pc:{result.pc & ~1:08x}"
-        path = self._write(self.out / "crashes", name, data)
-        self.crash_paths.append(path)
-        print(f"crash: {path}", file=sys.stderr)
+        path = None
+        if len(self.crash_paths) < _CRASH_CAP:
+            name = f"id:{self.crash_count - 1:06d},sig:11,pc:{result.pc & ~1:08x}"
+            path = self._write(self.out / "crashes", name, data)
+            self.crash_paths.append(path)
+            print(f"crash: {path}", file=sys.stderr)
+        note = note_crash(self.triage, self.machine, data, result, crash_path=path)
+        if note.created or note.replaced:
+            print(f"report: {note.report_path}", file=sys.stderr)
 
     def _save_hang(self, data: bytes, result) -> None:
         self.hang_count += 1

@@ -12,10 +12,11 @@ from rehost import __version__
 from rehost.backends import available_backends
 from rehost.errors import RehostError
 from rehost.fixtures import fixture_summary, list_fixtures
-from rehost.fuzz import FuzzHarness, read_input
+from rehost.fuzz import FuzzHarness, is_fuzz_crash, read_input
 from rehost.machine import Machine
 from rehost.peripherals import available_plugins
 from rehost.result import EXIT_USAGE, format_report
+from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 
 def cli() -> None:
@@ -88,6 +89,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     fuzz.add_argument("-v", "--verbose", action="store_true")
 
+    triage = sub.add_parser(
+        "triage",
+        help="Classify crash inputs under --out and rewrite bucket reports",
+    )
+    _add_machine_source(triage)
+    triage.add_argument(
+        "--out",
+        required=True,
+        help="Campaign directory that contains crashes/.",
+    )
+    triage.add_argument("-v", "--verbose", action="store_true")
+
     plugins = sub.add_parser("plugins", help="List MMIO plugins and CPU backends")
     plugins.add_argument("-v", "--verbose", action="store_true")
 
@@ -103,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
             return _fixtures()
         if args.cmd == "fuzz":
             return _fuzz(args)
+        if args.cmd == "triage":
+            return _triage(args)
         return _run(args)
     except RehostError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -202,6 +217,7 @@ def _fuzz(args: argparse.Namespace) -> int:
         raise RehostError("--persistent-iters must be >= 1")
     if args.rng_seed is not None and args.rng_seed < 0:
         raise RehostError("--rng-seed must be >= 0")
+    replay = _replay_target(args)
     ctl = forkserver_fd()
     if ctl is not None:
         out = Path(args.out) if args.out else None
@@ -211,6 +227,7 @@ def _fuzz(args: argparse.Namespace) -> int:
             out=out,
             persistent_iters=args.persistent_iters,
             input_path=None if args.input in (None, "-") else args.input,
+            replay=replay,
         )
     if not args.out:
         raise RehostError("jig-emu fuzz requires --out (or an AFL++ forkserver on fd 198)")
@@ -237,9 +254,55 @@ def _fuzz(args: argparse.Namespace) -> int:
         max_execs=args.max_execs,
         rng_seed=args.rng_seed,
         stop_on_crash=args.stop_on_crash,
+        replay=replay,
     )
     print(campaign.run().format())
     return 0
+
+
+def _triage(args: argparse.Namespace) -> int:
+    from rehost.coverage import MAP_SIZE, CoverageMap
+    from rehost.fuzz import PersistentHarness
+
+    out = Path(args.out)
+    crashes = out / "crashes"
+    if not crashes.is_dir():
+        raise RehostError(f"no crashes directory at {crashes}")
+    machine = _machine_from_args(args)
+    machine.attach_coverage(CoverageMap(size=MAP_SIZE))
+    harness = PersistentHarness(machine)
+    store = TriageStore(out, replay=_replay_target(args))
+    store.reset()
+    files = sorted(path for path in crashes.iterdir() if path.is_file())
+    for path in files:
+        data = path.read_bytes()
+        try:
+            result = harness.exec_one(data)
+        except RehostError as exc:
+            print(f"skip {path.name}: {exc}", file=sys.stderr)
+            continue
+        if not is_fuzz_crash(result, machine.config.fuzz):
+            print(f"skip {path.name}: {result.status} {result.detail}", file=sys.stderr)
+            continue
+        note_crash(store, machine, data, result, crash_path=path)
+    print(store.summary())
+    return 0
+
+
+def _replay_target(args: argparse.Namespace) -> ReplayTarget:
+    """Flags that replay one input against the machine this command loaded."""
+    parts: list[str] = []
+    if args.config:
+        parts.extend(["--config", str(Path(args.config).resolve())])
+    if args.fixture:
+        parts.extend(["--fixture", args.fixture])
+    elif args.firmware:
+        parts.extend(["--firmware", str(Path(args.firmware).resolve())])
+    if getattr(args, "timeout_ms", None) is not None:
+        parts.extend(["--timeout-ms", str(args.timeout_ms)])
+    if getattr(args, "max_instructions", None) is not None:
+        parts.extend(["--max-instructions", str(args.max_instructions)])
+    return ReplayTarget(tuple(parts))
 
 
 def _run(args: argparse.Namespace) -> int:

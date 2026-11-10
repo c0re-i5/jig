@@ -46,6 +46,7 @@ src/rehost/
   coverage.py       AFL++ edge bitmap
   campaign.py       in-process coverage-guided campaign
   forkserver.py     AFL++ persistent-mode forkserver
+  triage.py         fault class, bucket id, crash report
   cli.py
 examples/           copies of the fixture sources, for reading and editing
 tests/
@@ -66,7 +67,7 @@ flowchart TD
   fuzz["Fuzz: buffer or MMIO sink, edge map, campaign or AFL++ forkserver"]
   nvic["NVIC: priority, entry, and return"]
   snap["Snapshot of registers, RAM, plugins, and NVIC"]
-  triage["Report: status, registers, peripheral logs"]
+  triage["Triage: fault class, bucket, replay report"]
 
   ingest --> cpu
   cpu --> uni
@@ -259,7 +260,7 @@ libAFL is not a dependency. Its Python bindings (`pylibafl`) are a PyO3 extensio
 jig-emu fuzz --fixture fuzz-crash --out ./fuzz-out --max-execs 3000 --stop-on-crash
 ```
 
-A successful run prints `crashes: 1` and writes the bytes `JIG!` under `fuzz-out/crashes/`. The exit status of `jig-emu fuzz` is 0 when the campaign finishes; the crash count is in the summary and in that directory. `queue/` holds inputs that grew the edge map. `hangs/` holds guest timeouts and instruction-limit stops, which are not crashes.
+A successful run prints `crashes: 1` and `buckets: 1`, writes the bytes `JIG!` under `fuzz-out/crashes/`, and writes one report under `fuzz-out/reports/`. The exit status of `jig-emu fuzz` is 0 when the campaign finishes; the crash count is in the summary and in that directory. `queue/` holds inputs that grew the edge map. `hangs/` holds guest timeouts and instruction-limit stops, which are not crashes. The report names the fault and gives the command that replays that one input. See [Crash triage](#crash-triage).
 
 ```text
 jig-emu fuzz --fixture fuzz-crash --out DIR [options]
@@ -362,6 +363,113 @@ Input sources, in order:
 
 `examples/fuzz_echo.s` loads the word at `0x20000100` and writes the low byte to the UART. `jig-emu run --fixture fuzz-echo --input case.bin` is the command to try.
 
+## Crash triage
+
+A crash used to be a file under `--out/crashes` and, under afl-fuzz, a `SIGSEGV`. `jig-emu fuzz` now classifies the live stop, hashes it into a bucket, and writes one report per bucket. A second input that hits the same bug increments `seen` instead of writing another report. The representative file is the shortest input; equal lengths keep the earliest.
+
+```text
+out/crashes/<afl-name>                         every saved crashing input, up to 64
+out/buckets/<id>/representative               shortest input for that bucket
+out/buckets/index.json                         bucket id, class, seen, paths
+out/reports/<id>.md                            the note you read
+out/reports/<id>.json                          the same fields, for tooling
+```
+
+The forkserver writes the same reports before it raises `SIGSEGV`. `jig-emu triage` deletes `buckets/` and `reports/` and rebuilds them from the files currently in `crashes/`, in sorted name order. Seen counts then match those files. A campaign that is still running keeps a seen count for every crashing execution, including crashes past the 64-file cap; the representative for a new bucket is still stored under `buckets/` when the `crashes/` copy is skipped.
+
+```bash
+jig-emu fuzz --fixture fuzz-crash --out ./fuzz-out --max-execs 3000 --stop-on-crash
+jig-emu triage --fixture fuzz-crash --out ./fuzz-out
+jig-emu run --fixture fuzz-crash --input ./fuzz-out/buckets/<id>/representative
+```
+
+The replay line is the `jig-emu run` command in the report. It repeats the flags that selected the machine (`--fixture`, or `--config` and `--firmware`, plus `--timeout-ms` and `--max-instructions` when you overrode them) and `--input` pointed at the representative. The report's path is absolute, so the command does not depend on the current directory.
+
+### Fault classes
+
+The class comes from the detail string `Machine.run` already records, plus the registers and the memory map. Unicorn does not implement an MPU and does not update CFSR, HFSR, MMFAR, or BFAR. Permission faults are observed with Unicorn's protection hook, the same way unmapped accesses already were, so the faulting address is part of the detail line.
+
+| Class | What the stop was |
+| --- | --- |
+| `null_deref` | The faulting fetch, read, or write address is below `0x100`. That is a null pointer or a small offset from one. A store through null into flash shows up here when flash is mapped read-only at address 0. |
+| `unmapped_fetch` | Instruction fetch outside the machine map. Unicorn stops in the unmapped-fetch hook. On a chip this is the situation a BusFault handler would see, or HardFault when BusFault is disabled. IPSR is left unchanged. |
+| `unmapped_read`, `unmapped_write` | Data access outside the machine map. Same hook, same limit: this is not entered as BusFault, and BFAR is not set. |
+| `prot_fetch`, `prot_read`, `prot_write` | The address is mapped, and the machine file's permissions reject the access. This is the rehost map, not an MPU MemManage fault. A write below `0x100` is `null_deref` instead. |
+| `stack_overflow` | Exception entry could not write the integer frame, SP still points into writable RAM, and the frame sits within 64 bytes below that region's base. That is a descending stack walking off the bottom of RAM. |
+| `bad_sp` | The stack pointer is not 4-byte aligned, or the frame is not the overflow case above (the pointer has left RAM, or exception return could not unstack). |
+| `hardfault` | Lockup (the original exception and HardFault both could not be taken), a HardFault vector that is missing or not Thumb, or an exception return that failed an integrity check. The model stops. It does not nest another fault. |
+| `memmanage` | The NVIC model was entering exception 4. Ordinary unmapped accesses are not this class. MMFSR is not implemented. |
+| `bus_fault` | The NVIC model was entering exception 5. An unmapped access is classified above, because the hook stops the run before a BusFault is taken. |
+| `usage_fault` | Unicorn rejected the instruction (`UC_ERR_INSN_INVALID`), stacked xPSR.T was clear on exception return (INVSTATE), or the model was entering exception 6. Unicorn does not enter UsageFault or HardFault for an undefined instruction. On a chip with UsageFault disabled, the reset default, that instruction escalates to HardFault. UFSR is not updated. |
+| `bkpt` | The guest executed `BKPT`. With `halt_on_bkpt` the status is `halted`, and the fuzzer keeps it when the PC is in `fuzz.crash_addresses`. With `halt_on_bkpt` off, the detail is `exception 7`. That 7 is Unicorn's breakpoint vector, not an IPSR number. |
+| `halt_crash` | The guest halted at a PC listed in `fuzz.crash_addresses`. The status stays `halted`. |
+| `other` | Anything else, including `AIRCR.SYSRESETREQ` and an Unicorn interrupt vector this classifier does not treat as a fault. The detail line is the raw record. |
+
+`exception 6` with no further text is Unicorn's interrupt hook, and it stays in `other`. `exception 6 vector ...` is the NVIC model entering UsageFault, and that is `usage_fault`.
+
+### Bucket id
+
+```text
+bucket_id = sha256(material).hexdigest()[:16]
+material  = fault_class|reason|fault_pc|lr_fp|preceding_pcs|handler_frame|edges
+```
+
+| Field | Encoding |
+| --- | --- |
+| `fault_class`, `reason` | The class and a short tag such as `fetch`, `lockup`, or `undef`. |
+| `fault_pc` | Faulting PC, Thumb bit cleared, 8 lowercase hex digits. |
+| `lr_fp` | `LR & ~1`, same encoding, when LR has the Thumb bit set, its top nibble is not `F` (so EXC_RETURN and the reset value `0xFFFFFFFF` are excluded), and the target falls in executable memory. Otherwise `-`. |
+| `preceding_pcs` | The last 4 retired PCs, Thumb bit cleared, comma-separated. A trailing PC equal to `fault_pc` is dropped first. `-` when none remain. The machine keeps the last 8. |
+| `handler_frame` | `stacked_pc,stacked_lr` when IPSR is non-zero, SP is aligned, and the 32-byte integer frame at SP can be read. Otherwise `-`. This is the frame the NVIC model stacked, not a walk of caller frames. |
+| `edges` | The last 4 coverage-edge indexes, decimal, comma-separated, or `-`. |
+
+The edge index is the same update as the AFL bitmap, for a 65536-byte map, recorded for every retired instruction whether or not a bitmap is attached:
+
+```text
+cur   = ((pc >> 1) ^ (pc >> 17)) & 65535
+index = cur ^ prev
+prev  = cur >> 1
+```
+
+The faulting data address is not in the hash. Two inputs that die at the same instruction with the same class, reason, and tail share a bucket even when the bad pointer differs. A null access is its own class, so it does not share a bucket with a wild pointer at the same instruction.
+
+The `fuzz-crash` magic input `JIG!` is an unmapped fetch at `0x60000000`. The material line from that run is:
+
+```text
+unmapped_fetch|fetch|60000000|-|00000026,00000028,0000002c,00000030|-|26,29,28,19
+```
+
+and the bucket id is `e14172fe0db2ca7e`. A longer input with the same prefix takes the same path, so it lands in that bucket. The report's site and input sections include:
+
+```text
+# unmapped_fetch `e14172fe0db2ca7e`
+
+Fault class: unmapped_fetch
+Reason: fetch
+Bucket: e14172fe0db2ca7e
+Seen: 1
+Machine: fuzz-crash
+Status: fault
+
+- pc: 0x60000000
+- lr: 0xffffffff
+- sp: 0x20001000
+- xpsr: 0x61000000
+- ipsr: 0
+- detail: unmapped fetch at 0x60000000
+- fault address: 0x60000000 (fetch)
+- hex: 4a494721
+- sha256: e592e1391c7b8db00b9105d5b07457243ab7f301c41b28758d8ceebc0884b5d6
+```
+
+`xPSR` is `0x61000000` here because the compares that matched `JIG!` left N and Z set, and the Thumb bit in EPSR is set. IPSR is still 0: the model did not enter a fault handler. The replay command printed in the report is:
+
+```text
+jig-emu run --fixture fuzz-crash --input <out>/buckets/e14172fe0db2ca7e/representative
+```
+
+Not in this triage: exploitability scoring, a symbolic root cause, Ghidra or any other decompiler, and a stack unwind past LR, the handler frame, and the retired-instruction tail.
+
 ## Fixtures
 
 | Name | Program |
@@ -399,9 +507,12 @@ Not modeled: tail-chaining and late arrival (a new exception after a return is u
 Done:
 
 - Coverage-guided fuzzing. `jig-emu fuzz` runs an in-process campaign, and the same command speaks the AFL++ persistent-mode forkserver when afl-fuzz attaches. See [Fuzzing](#fuzzing).
+- Crash triage. Each crash is classified, deduplicated into a bucket, and written up with the `jig-emu run` command that replays it. `jig-emu triage` rebuilds the reports from an existing `--out` directory. See [Crash triage](#crash-triage).
 
 Not in this version:
 
+- Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration
+- Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
 - CmpLog / RedQueen, parallel campaigns, and a corpus-minimization UI
 - RTOS and BSP shims for VxWorks, QNX, and ThreadX, including HAL-call replacement
 - A RISC-V backend

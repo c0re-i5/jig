@@ -41,6 +41,12 @@ class RunResult:
     trace: tuple[TraceEntry, ...]
     trace_total: int
     coverage: tuple[int, ...] | None = None
+    # Retired PCs and AFL edge-map indexes for this execution, oldest first.
+    # The edge index uses the same update as ``rehost.coverage`` (map size
+    # 65536). Both are capped at the last eight so a crash report can show
+    # the tail without storing the whole path.
+    recent_pcs: tuple[int, ...] = ()
+    recent_edges: tuple[int, ...] = ()
 
     @property
     def faulted(self) -> bool:
@@ -84,6 +90,9 @@ def format_report(
             shown = ", ".join(f"{pc:#x}" for pc in result.coverage[:32])
             extra = "" if len(result.coverage) <= 32 else f" (+{len(result.coverage) - 32})"
             lines.append(f"coverage: {shown}{extra}")
+        if result.recent_pcs:
+            shown = ", ".join(f"{pc:#x}" for pc in result.recent_pcs)
+            lines.append(f"recent pcs: {shown}")
         lines.append(f"trace: {result.trace_total} access(es), showing {len(result.trace)}")
         for entry in result.trace:
             lines.append(
