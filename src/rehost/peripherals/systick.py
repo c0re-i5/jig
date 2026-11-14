@@ -6,7 +6,9 @@ polling stub) returns the current count and then steps. When a ``Machine``
 owns the peripheral it sets ``cpu_clock`` and steps once per instruction
 instead, so a handler can run without firmware polling ``VAL``. ``CLKSOURCE``
 does not select a second clock; there is no external reference, and an enabled
-counter advances on the instruction stream either way.
+counter advances on the instruction stream either way. There is no
+``tick_every_n_instructions`` divider: firmware that never reads ``VAL``
+already observes COUNTFLAG and, with TICKINT, exception 15.
 
 A step that observes 0 reloads from ``LOAD``, sets ``COUNTFLAG``, and, when
 ``TICKINT`` is set, reports an interrupt edge. The machine pends exception 15

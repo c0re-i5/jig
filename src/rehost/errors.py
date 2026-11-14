@@ -24,6 +24,10 @@ class FuzzInputError(RehostError):
     """Fuzzer input does not match the sink configured for this machine."""
 
 
+class ModbusError(RehostError):
+    """A Modbus RTU frame could not be built, queued, or parsed."""
+
+
 class BackendError(RehostError):
     """The CPU backend rejected an operation or stopped with an engine error."""
 

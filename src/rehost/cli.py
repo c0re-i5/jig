@@ -49,6 +49,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Hex-dump guest memory after the run. Repeatable.",
     )
     run.add_argument("-v", "--verbose", action="store_true", help="Print registers and the MMIO trace")
+    modbus = run.add_mutually_exclusive_group()
+    modbus.add_argument(
+        "--modbus-read",
+        metavar="SLAVE:ADDRESS:COUNT",
+        help="Queue a Modbus RTU Read Holding Registers (0x03) request on the UART before running",
+    )
+    modbus.add_argument(
+        "--modbus-write",
+        metavar="SLAVE:ADDRESS:VALUE",
+        help="Queue a Modbus RTU Write Single Register (0x06) request on the UART before running",
+    )
+    run.add_argument(
+        "--modbus-uart",
+        help="UART peripheral for --modbus-read / --modbus-write (default: the only UART)",
+    )
 
     fuzz = sub.add_parser(
         "fuzz",
@@ -137,9 +152,9 @@ def configure_logging(verbose: bool) -> None:
 def _plugins() -> int:
     print("peripherals:")
     described = {
-        "uart": "TX byte log, RX queue, status flags",
+        "uart": "TX byte log, RX queue, status flags, optional RX IRQ",
         "gpio": "output latch and sampled input",
-        "systick": "polling model of CTRL/LOAD/VAL/CALIB",
+        "systick": "per-instruction CTRL/LOAD/VAL/CALIB",
         "register_block": "config-defined 32-bit registers",
         "unimplemented": "log the access and return read_default",
     }
@@ -310,6 +325,7 @@ def _run(args: argparse.Namespace) -> int:
     data = _read_run_input(args, machine)
     if data is not None:
         FuzzHarness(machine).apply(data)
+    _queue_modbus(args, machine)
     result = machine.run()
     dumps = [_dump_line(machine, spec) for spec in args.dump]
     print(
@@ -324,6 +340,31 @@ def _run(args: argparse.Namespace) -> int:
     if args.snapshot_out:
         machine.snapshot().write_json(args.snapshot_out)
     return result.exit_code()
+
+
+def _queue_modbus(args: argparse.Namespace, machine: Machine) -> None:
+    """Queue one RTU request when the run command asked for one."""
+    if not args.modbus_read and not args.modbus_write:
+        return
+    from rehost.modbus import deliver, read_holding_registers, write_single_register
+
+    if args.modbus_read:
+        slave, address, count = _modbus_triple(args.modbus_read, "SLAVE:ADDRESS:COUNT")
+        frame = read_holding_registers(slave, address, count)
+    else:
+        slave, address, value = _modbus_triple(args.modbus_write, "SLAVE:ADDRESS:VALUE")
+        frame = write_single_register(slave, address, value)
+    deliver(machine, frame, uart=args.modbus_uart)
+
+
+def _modbus_triple(text: str, shape: str) -> tuple[int, int, int]:
+    parts = text.split(":")
+    if len(parts) != 3 or not all(parts):
+        raise RehostError(f"Modbus request must be {shape}")
+    try:
+        return tuple(int(part, 0) for part in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise RehostError(f"Modbus request must be {shape}") from exc
 
 
 def _read_run_input(args: argparse.Namespace, machine: Machine) -> bytes | None:

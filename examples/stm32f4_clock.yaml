@@ -1,0 +1,140 @@
+# STM32F405/407-class map for getting past clock and flash init.
+#
+# This is a register_block template, not a model of RCC or FLASH. Ready bits
+# are stuck on (or, for FLASH_SR.BSY and RCC_CFGR.SWS, forced to a fixed
+# pattern) so a poll loop exits. It does not follow enable bits, it does not
+# implement clear-on-write-1, and it does not update SWS when firmware writes
+# SW. SWS always reads as PLL (0b10). A wait for SWS == HSI or HSE will not
+# pass. Unknown register fields are errors. Addresses this file does not
+# list follow unmapped.action (log and return 0 here).
+#
+# Layout follows RM0090: flash at 0x08000000, SRAM at 0x20000000, RCC at
+# 0x40023800, FLASH interface at 0x40023C00. The 0x00000000 flash alias is
+# not mapped, so a null fetch still faults. Resize flash and SRAM to the part.
+#
+# usart2 is the Jig byte UART placed at the USART2 address with STM32F4
+# status/data offsets and IRQ 38. It is not the vendor USART (BRR and CR1
+# writes are logged and ignored; TXE reads as set). Copy the block and change
+# rx_irq, or omit rx_irq, for a different port.
+
+name: stm32f4-clock
+description: >
+  STM32F405/407-class RCC and FLASH ready-bit stubs plus a UART placed at
+  USART2. Enough for a clock-init poll to finish, not a full SoC.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x08000000
+
+memory:
+  - name: flash
+    base: 0x08000000
+    size: 0x100000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x20000
+    perms: rw
+  - name: usart2
+    base: 0x40004400
+    size: 0x400
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x04
+      status_offset: 0x00
+      tx_empty_mask: 0x80
+      rx_ready_mask: 0x20
+      rx_irq: 38
+  - name: rcc
+    base: 0x40023800
+    size: 0x400
+    perms: rw
+    peripheral: register_block
+    read_default: 0
+    config:
+      registers:
+        # CR. HSIRDY, HSERDY, PLLRDY, and PLLI2SRDY stay set across writes.
+        0x00:
+          reset: 0x00000083
+          writable: true
+          read_set: 0x0A020002
+        # PLLCFGR. Published reset (RM0090). Not decoded.
+        0x04:
+          reset: 0x24003010
+          writable: true
+        # CFGR. SWS (bits 3:2) always reads as PLL (0b10).
+        0x08:
+          reset: 0
+          writable: true
+          read_mask: 0xC
+          read_bits: 0x8
+        0x0C: {reset: 0, writable: true}
+        0x10: {reset: 0, writable: true}
+        0x14: {reset: 0, writable: true}
+        0x18: {reset: 0, writable: true}
+        0x20: {reset: 0, writable: true}
+        0x24: {reset: 0, writable: true}
+        0x30: {reset: 0, writable: true}
+        0x34: {reset: 0, writable: true}
+        0x38: {reset: 0, writable: true}
+        0x40: {reset: 0, writable: true}
+        0x44: {reset: 0, writable: true}
+        0x50: {reset: 0, writable: true}
+        0x54: {reset: 0, writable: true}
+        0x58: {reset: 0, writable: true}
+        0x60: {reset: 0, writable: true}
+        0x64: {reset: 0, writable: true}
+        # BDCR. LSERDY (bit 1) stuck 1.
+        0x70:
+          reset: 0
+          writable: true
+          read_set: 0x2
+        # CSR. LSIRDY (bit 1) stuck 1.
+        0x74:
+          reset: 0
+          writable: true
+          read_set: 0x2
+        0x80: {reset: 0, writable: true}
+        0x84: {reset: 0, writable: true}
+  - name: flash_if
+    base: 0x40023C00
+    size: 0x400
+    perms: rw
+    peripheral: register_block
+    read_default: 0
+    config:
+      registers:
+        # ACR. Latency is writable and reads back. No ready bit.
+        0x00: {reset: 0, writable: true}
+        0x04: {reset: 0, writable: true}
+        0x08: {reset: 0, writable: true}
+        # SR. Writes are ignored. BSY (bit 16) reads as 0.
+        0x0C:
+          reset: 0
+          writable: false
+          read_mask: 0x00010000
+          read_bits: 0
+        0x10: {reset: 0, writable: true}
+        0x14: {reset: 0, writable: true}
+  - name: systick
+    base: 0xE000E010
+    size: 0x10
+    perms: rw
+    peripheral: systick
+
+boot:
+  mode: vector
+  vector_base: 0x08000000
+
+run:
+  timeout_ms: 2000
+  max_instructions: 5000000
+  halt_on_bkpt: true
+  trace_limit: 64
+
+unmapped:
+  action: log
+  read_default: 0
+  log: true

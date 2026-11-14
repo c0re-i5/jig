@@ -198,14 +198,22 @@ class PersistentHarness:
     Take the checkpoint at boot, before any fuzzer bytes are applied, so each
     ``exec_one`` starts from the same CPU, RAM, peripheral, and NVIC state.
     The in-tree campaign and the AFL++ forkserver both call ``exec_one``.
-    When a coverage map is attached to the machine, ``run`` clears it for
-    this execution only.
+    ``reset_to_checkpoint`` is the same restore without a testcase, and it
+    does not require a ``fuzz:`` section. When a coverage map is attached to
+    the machine, ``run`` clears it for this execution only.
     """
 
     def __init__(self, machine) -> None:
         self.machine = machine
-        self.fuzz = FuzzHarness(machine)
+        self._fuzz = None
         self._snapshot = None
+
+    @property
+    def fuzz(self):
+        """The input sink. Built on first use so a restore-only harness needs no ``fuzz:`` section."""
+        if self._fuzz is None:
+            self._fuzz = FuzzHarness(self.machine)
+        return self._fuzz
 
     def checkpoint(self):
         if not self.machine.booted:
@@ -213,11 +221,20 @@ class PersistentHarness:
         self._snapshot = self.machine.snapshot()
         return self._snapshot
 
-    def exec_one(self, data: bytes):
+    def reset_to_checkpoint(self) -> None:
+        """Restore the boot checkpoint, taking it on the first call.
+
+        RAM, plugin state (UART RX/TX, SysTick), and the NVIC image all come
+        back from that checkpoint. A later case cannot replace the baseline:
+        this does not snapshot the machine again.
+        """
         if self._snapshot is None:
             self.checkpoint()
-        else:
-            self.machine.restore(self._snapshot)
+            return
+        self.machine.restore(self._snapshot)
+
+    def exec_one(self, data: bytes):
+        self.reset_to_checkpoint()
         self.fuzz.apply(data)
         return self.machine.run()
 

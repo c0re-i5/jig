@@ -40,6 +40,7 @@ src/rehost/
   backends/         CpuBackend and the Unicorn Cortex-M adapter
   peripherals/      plugin registry plus UART, GPIO, SysTick, register block
   fixtures/         Thumb assembler and the synthetic programs
+  modbus.py         Modbus RTU framing on the existing UART plugin
   config.py         YAML/TOML machine loader
   machine.py        map, load, boot, run, snapshot
   fuzz.py           RAM-buffer and MMIO-script sinks, AFL++ input map
@@ -163,10 +164,10 @@ Regions must not overlap. The backend maps whole pages; two regions may share a 
 
 | Name | Behavior |
 | --- | --- |
-| `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Other offsets are logged. |
+| `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Other offsets are logged. Optional `rx_irq` (alias `irq`) latches that NVIC line when RX goes from empty to non-empty. Omit it and the line stays quiet. |
 | `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. |
-| `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
-| `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable}`. Unlisted offsets log and return `read_default`. |
+| `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. Firmware that never reads VAL still gets that step; there is no `tick_every_n_instructions` divider. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
+| `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable, read_set, read_mask, read_bits}`. Unlisted offsets log and return `read_default`. `read_set` is ORed on read. `read_mask` / `read_bits` then force those bits (`read_bits` must be a subset of `read_mask`). Unknown fields are errors. |
 | `unimplemented` | Every access is logged once at INFO and reads return `read_default`. `mmio: true` selects this plugin when `peripheral` is omitted. |
 
 Unknown config keys are errors, so a typo does not silently do nothing.
@@ -226,7 +227,7 @@ class QemuCortexM(CpuBackend):
 
 `arch: qemu-cortex-m`, `renode`, and `riscv` are recognized as planned names and fail with that explanation. They are not wired up.
 
-`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending.
+`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller.
 
 ## Snapshots
 
@@ -352,7 +353,7 @@ for testcase in inputs:
         machine.snapshot().write_json(result_path)
 ```
 
-`exec_one` restores a checkpoint taken at boot, applies the testcase, and runs. Peripheral logs and RAM from the previous case are gone.
+`exec_one` restores a checkpoint taken at boot, applies the testcase, and runs. Peripheral logs, RAM, UART RX/TX (including the RX IRQ latch), SysTick, and NVIC pending bits from the previous case are gone. `PersistentHarness.reset_to_checkpoint` is that restore without applying a testcase. Queue a Modbus frame after it; bytes queued before the restore are dropped with the previous case.
 
 Input sources, in order:
 
@@ -477,6 +478,7 @@ Not in this triage: exploitability scoring, a symbolic root cause, Ghidra or any
 | `uart-gpio` | Posts `A` to the UART, writes 1 to the GPIO latch, reads SysTick VAL, stores `0x00c0ffee` at `0x20000000`, then `BKPT`. |
 | `fuzz-echo` | Loads the fuzz buffer at `0x20000100` and posts the low byte to the UART. |
 | `fuzz-crash` | `BKPT` unless the buffer starts with `JIG!`, which fetches unmapped memory and faults. |
+| `modbus-rtu` | Enables UART IRQ 0, waits, and answers one Modbus RTU request. Read Holding Registers at address 0, quantity 1, returns holding register `0x1234`. Other reads and other function codes return an exception. See [Modbus RTU](#modbus-rtu). |
 
 Sources live in `src/rehost/fixtures/data/` and are copied under `examples/`. The assembler in `rehost.fixtures.assemble` encodes the few Thumb and Thumb-2 instructions these programs use, so CI does not need a cross toolchain. It is not a general assembler.
 
@@ -488,7 +490,7 @@ To study a real RTOS image, build it yourself (a Zephyr sample or a FreeRTOS dem
 - On Unicorn 2.1 the memory-read hook runs before the load retires. The dispatcher writes the plugin's value into guest memory inside that hook, and the instruction observes it.
 - Unicorn's `uc_emu_start` timeout is microseconds. The machine file's `timeout_ms` is converted at the backend boundary. The Python binding's docstring that says milliseconds does not match Unicorn 2.1.
 - A page is mapped writable so the image can be copied, then `run` applies the permissions from the config.
-- While a `Machine` owns SysTick, the counter steps once per instruction fetched for execution while ENABLE is set. It is not a cycle-accurate clock. `CLKSOURCE` is stored and does not select a separate reference.
+- While a `Machine` owns SysTick, the counter steps once per instruction fetched for execution while ENABLE is set. It is not a cycle-accurate clock, and it is not divided by an extra `tick_every_n_instructions` knob. `CLKSOURCE` is stored and does not select a separate reference. Firmware that never reads VAL still receives COUNTFLAG and, with TICKINT, exception 15.
 
 ## Interrupts
 
@@ -502,23 +504,112 @@ A pending exception runs when it is enabled, not already active, and its group p
 
 Not modeled: tail-chaining and late arrival (a new exception after a return is unstacked and stacked again), lazy floating-point frames (`EXC_RETURN` bit 4 clear stops the run), v8-M stack limits and security extensions, and `SLEEPONEXIT` / `SLEEPDEEP` (the bits are stored and do not change control). `AIRCR.SYSRESETREQ` stops the run as a fault instead of resetting the core.
 
+## UART RX interrupt
+
+Set `rx_irq` on a `uart` region to an external IRQ number (`0` .. `255`). `irq` is an alias; if both are set they must match. When the RX queue goes from empty to non-empty, the plugin calls `Machine.inject_irq`, which pends that line in the NVIC from Phase 1. The handler runs on a later instruction, once the guest has enabled the IRQ and the priority and mask rules allow it.
+
+The latch is one-shot for a burst. A second byte queued while RX is still non-empty does not pend again. After the guest reads the queue empty, the next byte pends again. Reading the data register does not clear a pending bit that was already latched; taking the exception or writing `ICPR` does. Leave `rx_irq` out and preloaded `rx` bytes stay quiet, which is what `uart-gpio` does.
+
+```yaml
+- name: uart0
+  base: 0x40000000
+  size: 0x100
+  perms: rw
+  peripheral: uart
+  config:
+    data_offset: 0x00
+    status_offset: 0x04
+    tx_empty_mask: 0x80
+    rx_ready_mask: 0x01
+    rx_irq: 0
+```
+
+`examples/stm32f4_clock.yaml` places the same plugin at the STM32F405/407 USART2 address (`0x40004400`) with status at offset 0, data at offset 4, `TXE`/`RXNE` masks, and `rx_irq: 38`. That is still this byte UART. BRR and CR1 writes are logged and ignored.
+
+## Modbus RTU
+
+`rehost.modbus` frames RTU requests and checks the CRC on TX. It queues bytes with `Uart.queue_rx`. It does not replace the UART plugin, speak Modbus TCP, or implement EtherNet/IP, DNP3, or OPC-UA. Builders cover Read Holding Registers (`0x03`), Write Single Register (`0x06`), and an exception response (`function | 0x80`). The CRC is the Modbus CRC-16 (polynomial `0xA001`, init `0xFFFF`), low byte first. There is no 3.5-character gap and no multi-drop schedule.
+
+```bash
+jig-emu run --fixture modbus-rtu --modbus-read 1:0:1
+jig-emu run --fixture modbus-rtu --modbus-write 1:0:3
+```
+
+`--modbus-read` is `SLAVE:ADDRESS:COUNT`. `--modbus-write` is `SLAVE:ADDRESS:VALUE`. They are mutually exclusive. `--modbus-uart NAME` picks the peripheral when the machine has more than one UART. The read above is slave 1, address 0, quantity 1. The fixture answers with holding register `0x1234`:
+
+```text
+name: modbus-rtu
+status: halted
+detail: bkpt
+pc: 0x00000054
+sp: 0x20001000
+lr: 0xffffffff
+instructions: 493
+uart0 tx: 0103021234b533
+uart0 rx_irq: 0
+systick ctrl: 0x0 load: 0x0 val: 0x0
+```
+
+`0103021234b533` is slave 1, function `0x03`, two data bytes, value `0x1234`, CRC `0x33B5`. The write command is function `0x06`, which this fixture does not implement, so TX is the exception `01860183a0` (function `0x86`, code 1, illegal function). A read of any other address is exception code 2. A read of address 0 with a quantity other than 1 is exception code 3. The fixture consumes eight request bytes and does not check the request CRC; the response CRC is computed.
+
+The same exchange from Python, with the boot checkpoint restored between cases:
+
+```python
+from rehost.fuzz import PersistentHarness
+from rehost.machine import Machine
+from rehost.modbus import read_holding_registers, read_holding_values, run_exchange
+
+machine = Machine.from_fixture("modbus-rtu")
+harness = PersistentHarness(machine)
+result, frame = run_exchange(
+    machine,
+    read_holding_registers(1, 0, 1),
+    harness=harness,
+)
+assert result.status == "halted"
+assert read_holding_values(frame) == [0x1234]
+```
+
+`run_exchange` calls `reset_to_checkpoint` before `deliver`, so RX from the previous case is gone before the new frame is queued. The fixture has no `fuzz:` section, and `jig-emu run` therefore does not read stdin as a testcase. A harness in your own script can set `machine.config.fuzz` if you also want `exec_one`.
+
+## STM32-class clock and flash stubs
+
+`examples/stm32f4_clock.yaml` is a machine file for an image you build yourself (a Zephyr or FreeRTOS binary is not in this repo). It maps STM32F405/407-class windows and fills RCC and the FLASH interface with `register_block` cells:
+
+| Window | Address | What the stub returns |
+| --- | --- | --- |
+| Flash | `0x08000000` | 1 MiB, execute. The `0x0` alias is not mapped. |
+| SRAM | `0x20000000` | 128 KiB. |
+| USART2 | `0x40004400` | Jig UART, RX IRQ 38. |
+| RCC | `0x40023800` | `CR` keeps `HSIRDY`, `HSERDY`, `PLLRDY`, and `PLLI2SRDY` set (`read_set: 0x0A020002`) even if firmware writes the register. `CFGR.SWS` always reads as PLL (`0b10`). `LSERDY` and `LSIRDY` stay set. Enable-bit registers are ordinary writable cells. |
+| FLASH | `0x40023C00` | `ACR` is writable, so a latency write reads back. `SR` ignores writes and `BSY` (bit 16) reads as 0. |
+| SysTick | `0xE000E010` | The per-instruction counter above. |
+
+Unlisted RCC or FLASH offsets log and return 0. `unmapped.action` is `log`, so an address the file does not mention returns 0 instead of faulting. A typo in a register field (`ready:` instead of `read_set:`) is still a config error. SWS does not follow SW. A loop that waits for HSI or HSE as the system clock will not finish. This file is the Phase 4 beachhead for clock and flash init, not a model of the RCC state machine.
+
+The same keys load from TOML. `examples/stm32f4_clock.yaml` is the copy to start from; point `--firmware` at an image you are allowed to analyze and widen the map for the peripherals that image actually touches.
+
 ## Roadmap
 
 Done:
 
 - Coverage-guided fuzzing. `jig-emu fuzz` runs an in-process campaign, and the same command speaks the AFL++ persistent-mode forkserver when afl-fuzz attaches. See [Fuzzing](#fuzzing).
 - Crash triage. Each crash is classified, deduplicated into a bucket, and written up with the `jig-emu run` command that replays it. `jig-emu triage` rebuilds the reports from an existing `--out` directory. See [Crash triage](#crash-triage).
+- Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt), [Modbus RTU](#modbus-rtu), and [STM32-class clock and flash stubs](#stm32-class-clock-and-flash-stubs).
 
 Not in this version:
 
+- Phase 5: a Zephyr or FreeRTOS image booting to its main loop. That image stays on your machine. CI keeps the synthetic fixture.
+- Phase 6: HAL and RTOS shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
+- EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
+- DMA, a full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path).
 - Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration
 - Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
 - CmpLog / RedQueen, parallel campaigns, and a corpus-minimization UI
-- RTOS and BSP shims for VxWorks, QNX, and ThreadX, including HAL-call replacement
 - A RISC-V backend
 - QEMU and Renode adapters on `CpuBackend`
-- Printer, ICS, and other device-specific peripheral models
 - A new CPU emulator. Decode and execute stay in Unicorn, or in QEMU/Renode when those adapters exist.
+- Third-party firmware in the repository. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 
 ## License
 
