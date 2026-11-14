@@ -1,19 +1,30 @@
 # SPDX-License-Identifier: MIT
 """Byte-oriented UART stub.
 
-Not a 16550. Firmware that writes the data register posts the low byte into
-``tx``. A read of the data register pops one byte from ``rx`` or returns 0.
-The status register reports transmitter-empty and receiver-ready bits from
-config. Any other offset is logged and returns ``read_default``.
+Not a 16550, and not a vendor USART. Firmware that writes the data register
+posts the low byte into ``tx``. A read of the data register pops one byte from
+``rx`` or returns 0. The status register reports transmitter-empty and
+receiver-ready bits from config. Any other offset is logged and returns
+``read_default``.
+
+``rx_irq`` (alias ``irq``) is an NVIC external IRQ number. When the RX queue
+goes from empty to non-empty, the plugin latches that IRQ through the same
+``inject_irq`` path the machine already uses. Omitting the key leaves the line
+quiet, including when ``rx`` is preloaded. The latch is edge-triggered: it
+fires once per burst, and it fires again only after the queue has been emptied
+and another byte arrives. Draining RX does not clear a pending bit that was
+already latched; taking the exception or writing ICPR does, as with any other
+NVIC line. The handler is expected to drain the queue.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from rehost.config import parse_u32
 from rehost.errors import ConfigError
 from rehost.memory import access_mask
+from rehost.nvic import NUM_EXTERNAL
 from rehost.peripherals.base import Peripheral
 from rehost.peripherals.registry import register
 
@@ -28,6 +39,8 @@ class Uart(Peripheral):
             "tx_empty_mask",
             "rx_ready_mask",
             "rx",
+            "rx_irq",
+            "irq",
         }
     )
     _TX_CAP = 1 << 20
@@ -48,14 +61,65 @@ class Uart(Peripheral):
             raise ConfigError(f"{self.name} data_offset and status_offset must differ")
         self.require_aligned(self.data_offset, what="data")
         self.require_aligned(self.status_offset, what="status")
+        self.rx_irq = _parse_rx_irq(self.name, self.config)
         self.tx = bytearray()
         self.tx_dropped = 0
         self.rx = bytearray(_as_bytes(self.config.get("rx", b""), what=f"{self.name} rx"))
+        # True after the rising edge has been reported for the current burst.
+        self.rx_irq_armed = False
+        self._inject: Callable[[int], None] | None = None
+
+    def bind_rx_irq(self, inject: Callable[[int], None]) -> None:
+        """Connect the RX latch to ``Machine.inject_irq`` (or a test double).
+
+        A queue that was already non-empty latches immediately, so a byte
+        supplied in the machine file is pending before the first instruction.
+        """
+        self._inject = inject
+        self.raise_rx_if_needed()
+
+    def queue_rx(self, data: bytes | bytearray) -> None:
+        """Append bytes to RX. An empty-to-non-empty transition latches ``rx_irq``."""
+        blob = _as_bytes(data, what=f"{self.name} rx")
+        if not blob:
+            return
+        if not self.rx:
+            self.rx_irq_armed = False
+        self.rx.extend(blob)
+        self.raise_rx_if_needed()
+
+    def raise_rx_if_needed(self) -> None:
+        """Pend ``rx_irq`` if a rising edge is waiting and an injector is bound."""
+        if self._inject is None:
+            return
+        irq = self.take_rx_irq_edge()
+        if irq is not None:
+            self._inject(irq)
+
+    def take_rx_irq_edge(self) -> int | None:
+        """Return ``rx_irq`` once per non-empty burst, else None.
+
+        The instruction hook calls this so a queue that arrived before
+        ``bind_rx_irq``, or a snapshot restored with the latch clear, still
+        pends on the next instruction. An empty queue re-arms the latch.
+        """
+        if self.rx_irq is None:
+            return None
+        if not self.rx:
+            self.rx_irq_armed = False
+            return None
+        if self.rx_irq_armed:
+            return None
+        self.rx_irq_armed = True
+        return self.rx_irq
 
     def read(self, offset: int, size: int) -> int:
         if offset == self.data_offset:
             if self.rx:
-                return self.rx.pop(0) & access_mask(size)
+                byte = self.rx.pop(0)
+                if not self.rx:
+                    self.rx_irq_armed = False
+                return byte & access_mask(size)
             return 0
         if offset == self.status_offset:
             flags = self.tx_empty_mask
@@ -77,18 +141,42 @@ class Uart(Peripheral):
         self.log_unhandled("write", offset, size, value)
 
     def snapshot_state(self) -> dict[str, Any]:
-        return {"tx": bytes(self.tx), "rx": bytes(self.rx), "tx_dropped": self.tx_dropped}
+        return {
+            "tx": bytes(self.tx),
+            "rx": bytes(self.rx),
+            "tx_dropped": self.tx_dropped,
+            "rx_irq_armed": self.rx_irq_armed,
+        }
 
     def restore_state(self, state: dict[str, Any]) -> None:
         self.tx = bytearray(state["tx"])
         self.rx = bytearray(state["rx"])
         self.tx_dropped = int(state["tx_dropped"])
+        self.rx_irq_armed = bool(state.get("rx_irq_armed", False))
 
     def debug_lines(self) -> list[str]:
         preview = bytes(self.tx[:32])
         extra = "" if len(self.tx) <= 32 else f" (+{len(self.tx) - 32} more)"
         shown = preview.hex() or "(empty)"
-        return [f"{self.name} tx: {shown}{extra}"]
+        lines = [f"{self.name} tx: {shown}{extra}"]
+        if self.rx_irq is not None:
+            lines.append(f"{self.name} rx_irq: {self.rx_irq}")
+        return lines
+
+
+def _parse_rx_irq(name: str, config: dict[str, Any]) -> int | None:
+    has_rx = "rx_irq" in config
+    has_irq = "irq" in config
+    if not has_rx and not has_irq:
+        return None
+    rx_irq = parse_u32(config["rx_irq"], what=f"{name} rx_irq") if has_rx else None
+    irq = parse_u32(config["irq"], what=f"{name} irq") if has_irq else None
+    if has_rx and has_irq and rx_irq != irq:
+        raise ConfigError(f"{name} irq ({irq}) and rx_irq ({rx_irq}) disagree")
+    chosen = rx_irq if rx_irq is not None else irq
+    if chosen is None or not 0 <= chosen < NUM_EXTERNAL:
+        raise ConfigError(f"{name} rx_irq must be an IRQ number from 0 to {NUM_EXTERNAL - 1}")
+    return chosen
 
 
 def _as_bytes(value: object, *, what: str) -> bytes:

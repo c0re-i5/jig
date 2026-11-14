@@ -43,6 +43,22 @@ def test_fuzz_input_and_snapshot(tmp_path, capsys):
     assert '"arch": "cortex-m"' in snap.read_text(encoding="utf-8")
 
 
+def test_modbus_rtu_demo_prints_a_response(capsys):
+    code = main(["run", "--fixture", "modbus-rtu", "--modbus-read", "1:0:1"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "status: halted" in out
+    assert "uart0 tx: 0103021234" in out
+    assert "uart0 rx_irq: 0" in out
+
+
+def test_modbus_request_shape_is_usage(capsys):
+    code = main(["run", "--fixture", "modbus-rtu", "--modbus-read", "1:0"])
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "SLAVE:ADDRESS:COUNT" in err
+
+
 def test_firmware_without_config_is_usage(tmp_path, capsys):
     image = tmp_path / "image.bin"
     image.write_bytes(b"\x00\x00")

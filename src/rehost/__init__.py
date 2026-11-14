@@ -12,6 +12,7 @@ from rehost.errors import (
     ConfigError,
     FuzzInputError,
     MachineError,
+    ModbusError,
     RehostError,
 )
 from rehost.fuzz import FuzzHarness, PersistentHarness, encode_mmio_script, parse_mmio_script
@@ -28,6 +29,7 @@ __all__ = [
     "FuzzInputError",
     "Machine",
     "MachineError",
+    "ModbusError",
     "Peripheral",
     "PersistentHarness",
     "RehostError",

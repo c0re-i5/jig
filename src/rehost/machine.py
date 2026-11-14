@@ -28,6 +28,7 @@ from rehost.memory import PERM_READ, PERM_WRITE, MemoryMap, access_mask, pages_t
 from rehost.nvic import EXC_SYSTICK, REDIRECT, STOP
 from rehost.peripherals import create_peripheral
 from rehost.peripherals.systick import SysTick
+from rehost.peripherals.uart import Uart
 from rehost.result import (
     STATUS_FAULT,
     STATUS_HALTED,
@@ -77,6 +78,10 @@ class Machine:
             if isinstance(plugin, SysTick):
                 # Instruction hooks are the clock. VAL reads must not also step.
                 plugin.cpu_clock = True
+            elif isinstance(plugin, Uart):
+                # After the init snapshot, so boot(reset) restores a clear latch
+                # and raises again below.
+                plugin.bind_rx_irq(self.inject_irq)
         self._final_perms: dict[int, int] = {}
         self._hook_pages: set[int] = set()
         self._map_pages()
@@ -161,6 +166,9 @@ class Machine:
             for plugin in self._peripherals:
                 plugin.restore_state(copy.deepcopy(self._peripheral_init[plugin.name]))
             self.backend.reset_cpu_state()
+            for plugin in self._peripherals:
+                if isinstance(plugin, Uart):
+                    plugin.raise_rx_if_needed()
         boot = self.config.boot
         if boot.mode == "vector":
             sp = self.read_u32(boot.vector_base)
@@ -401,7 +409,7 @@ class Machine:
             self._detail = f"stopped after {self._instructions} instructions"
             self.backend.stop()
             return
-        self._clock_systick()
+        self._clock_peripherals()
         effect = self.backend.service_interrupts(address, size)
         if effect == STOP or self.backend.cpu_fault:
             self._reason = STATUS_FAULT
@@ -418,12 +426,20 @@ class Machine:
         if coverage_map is not None:
             coverage_map.on_instruction(address)
 
-    def _clock_systick(self) -> None:
+    def _clock_peripherals(self) -> None:
+        """Step SysTick and latch a UART RX edge before this instruction retires.
+
+        Both use the NVIC pending bits Phase 1 already delivers. A UART with
+        no ``rx_irq`` contributes nothing.
+        """
         for plugin in self._peripherals:
-            if not isinstance(plugin, SysTick):
-                continue
-            if plugin.consume_cpu_tick():
-                self.backend.pend_exception(EXC_SYSTICK)
+            if isinstance(plugin, SysTick):
+                if plugin.consume_cpu_tick():
+                    self.backend.pend_exception(EXC_SYSTICK)
+            elif isinstance(plugin, Uart):
+                irq = plugin.take_rx_irq_edge()
+                if irq is not None:
+                    self.inject_irq(irq)
 
     def _on_interrupt(self, vector: int) -> None:
         if vector == BKPT_VECTOR and self.config.run.halt_on_bkpt:

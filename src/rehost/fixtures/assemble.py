@@ -3,6 +3,7 @@
 
 It encodes the instructions the synthetic programs use (``movw``/``movt``,
 ``mov`` / ``movs``, ``ldr``/``str`` immediate, ``ldrb``, ``cmp``, ``adds``,
+``subs``, ``ands`` / ``eors`` / ``orrs``, ``lsls`` / ``lsrs`` immediate,
 ``add rd, sp``, ``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``,
 ``wfi`` / ``wfe``, ``bkpt``, ``nop``, short ``b``, and ``beq`` / ``bne``) plus
 ``.word`` / ``.thumb_word``. It is
@@ -43,6 +44,12 @@ _WIDTHS = {
     "str": 2,
     "ldr": 2,
     "adds": 2,
+    "subs": 2,
+    "ands": 2,
+    "eors": 2,
+    "orrs": 2,
+    "lsls": 2,
+    "lsrs": 2,
     "add": 2,
     "bx": 2,
     "bkpt": 2,
@@ -101,6 +108,18 @@ _MOV_REG = re.compile(
 )
 _ADDS = re.compile(
     r"^adds\s+(?P<rd>r\d+)\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_SUBS = re.compile(
+    r"^subs\s+(?P<rd>r\d+)\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_LOGIC = re.compile(
+    r"^(?P<op>ands|eors|orrs)\s+(?P<rd>r\d+)\s*,\s*(?P<rm>r\d+)$",
+    re.IGNORECASE,
+)
+_SHIFT = re.compile(
+    r"^(?P<op>lsls|lsrs)\s+(?P<rd>r\d+)\s*,\s*(?P<rm>r\d+)\s*,\s*#(?P<imm>0x[0-9a-fA-F]+|\d+)$",
     re.IGNORECASE,
 )
 _ADD_SP = re.compile(
@@ -301,6 +320,32 @@ def _encode_insn(text: str, address: int, labels: dict[str, int], line_no: int) 
         if not 0 <= imm <= 0xFF:
             raise AssembleError(f"line {line_no}: adds immediate must fit in 8 bits")
         return struct.pack("<H", 0x3000 | (rd << 8) | imm)
+
+    match = _SUBS.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        imm = int(match.group("imm"), 0)
+        if not 0 <= imm <= 0xFF:
+            raise AssembleError(f"line {line_no}: subs immediate must fit in 8 bits")
+        # SUB (immediate) T2: 00111 Rd imm8.
+        return struct.pack("<H", 0x3800 | (rd << 8) | imm)
+
+    match = _LOGIC.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        rm = _register(match.group("rm"), line_no, low_only=True)
+        base = {"ands": 0x4000, "eors": 0x4040, "orrs": 0x4300}[match.group("op").lower()]
+        return struct.pack("<H", base | (rm << 3) | rd)
+
+    match = _SHIFT.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        rm = _register(match.group("rm"), line_no, low_only=True)
+        imm = int(match.group("imm"), 0)
+        if not 1 <= imm <= 31:
+            raise AssembleError(f"line {line_no}: shift immediate must be 1..31")
+        base = 0x0000 if match.group("op").lower() == "lsls" else 0x0800
+        return struct.pack("<H", base | (imm << 6) | (rm << 3) | rd)
 
     match = _ADD_SP.fullmatch(text)
     if match:

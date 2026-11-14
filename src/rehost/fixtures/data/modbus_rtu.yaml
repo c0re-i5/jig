@@ -1,0 +1,54 @@
+# Synthetic machine for the modbus-rtu fixture.
+# IRQ 0 is the UART RX latch. SysTick is present so a checkpoint restore covers
+# the tick counter; this program does not enable it. There is no fuzz: section,
+# so `jig-emu run` does not treat stdin as a testcase.
+name: modbus-rtu
+description: >
+  Enables UART IRQ 0, waits, parses one Modbus RTU request, writes the
+  response, and stops on BKPT.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x00000000
+
+memory:
+  - name: flash
+    base: 0x00000000
+    size: 0x1000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x1000
+    perms: rw
+  - name: uart0
+    base: 0x40000000
+    size: 0x100
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x00
+      status_offset: 0x04
+      tx_empty_mask: 0x80
+      rx_ready_mask: 0x01
+      rx_irq: 0
+  - name: systick
+    base: 0xE000E010
+    size: 0x10
+    perms: rw
+    peripheral: systick
+
+boot:
+  mode: vector
+  vector_base: 0x00000000
+
+run:
+  timeout_ms: 1000
+  max_instructions: 20000
+  halt_on_bkpt: true
+  trace_limit: 64
+
+unmapped:
+  action: fault
+  read_default: 0
+  log: true

@@ -356,6 +356,39 @@ def test_systick_tickint_runs_the_handler_and_unstacks():
     assert machine.read_u32(0x2000001C) == 0x20001000 - 32
 
 
+def test_systick_tickint_does_not_require_a_val_poll():
+    """ENABLE steps once per instruction even when firmware never reads VAL."""
+    source = _vector_table((EXC_SYSTICK, "systick")) + """
+        reset:
+            movw r3, #0xe010
+            movt r3, #0xe000
+            movs r1, #0xff
+            str r1, [r3, #4]
+            movs r1, #3
+            str r1, [r3, #0]
+        after:
+            nop
+            bkpt #0
+        systick:
+            movw r2, #0
+            movt r2, #0x2000
+            movs r1, #1
+            str r1, [r2, #0]
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[_SYSTICK],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.instructions < 40
+    assert machine.read_u32(0x20000000) == 1
+    assert machine.peripheral("systick").val != 0
+    assert not any(entry.address == 0xE000E018 for entry in result.trace)
+
+
 def test_inject_irq_enters_the_vector_after_it_is_enabled():
     source = _vector_table((16, "irq0")) + """
         reset:

@@ -24,6 +24,12 @@ def test_movw_movt_and_memory_encodings():
     assert assemble("cpsie i") == bytes.fromhex("62b6")
     assert assemble("bx lr") == bytes.fromhex("7047")
     assert assemble("adds r1, #1") == bytes.fromhex("0131")
+    assert assemble("subs r6, #1") == bytes.fromhex("013e")
+    assert assemble("orrs r1, r0") == bytes.fromhex("0143")
+    assert assemble("eors r2, r0") == bytes.fromhex("4240")
+    assert assemble("ands r0, r1") == bytes.fromhex("0840")
+    assert assemble("lsrs r2, r2, #1") == bytes.fromhex("5208")
+    assert assemble("lsls r0, r0, #8") == bytes.fromhex("0002")
     assert assemble("mov r0, lr") == bytes.fromhex("7046")
     assert assemble("add r0, sp, #0") == bytes.fromhex("00a8")
     assert assemble("svc #0") == bytes.fromhex("00df")
@@ -113,6 +119,31 @@ def test_cmp_ldrb_and_conditional_branch_execute():
     )
     machine.write_memory(0x20000000, b"\x11\x22\x33\x44")
     assert machine.run().registers["r1"] == 0x22
+
+
+def test_logic_shift_and_subs_execute():
+    machine = machine_from_asm(
+        """
+        movs r0, #0xff
+        movs r1, #0x0f
+        ands r0, r1
+        movs r2, #0x80
+        orrs r0, r2
+        lsrs r0, r0, #1
+        movs r3, #0x7f
+        eors r0, r3
+        subs r0, #1
+        bkpt #0
+        """
+    )
+    result = machine.run()
+    assert result.status == "halted"
+    assert result.registers["r0"] == 0x37
+
+
+def test_shift_immediate_zero_is_rejected():
+    with pytest.raises(AssembleError, match="shift immediate"):
+        assemble("lsrs r0, r0, #0")
 
 
 def test_unknown_instruction_and_far_branch_fail():

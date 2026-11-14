@@ -4,10 +4,54 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+import pytest
+
+from rehost.errors import ConfigError
 from rehost.fuzz import FuzzHarness, encode_mmio_script
+from rehost.machine import Machine
 from rehost.peripherals import Gpio, RegisterBlock, SysTick, Uart, Unimplemented
 from tests.helpers import machine_from_asm
+
+
+def test_uart_rx_irq_latches_once_per_burst():
+    seen: list[int] = []
+    uart = Uart(
+        name="uart0",
+        base=0x40000000,
+        size=0x100,
+        config={"rx_irq": 4, "irq": 4},
+    )
+    assert uart.rx_irq == 4
+    uart.bind_rx_irq(seen.append)
+    assert seen == []
+    uart.queue_rx(b"\x01\x02")
+    assert seen == [4]
+    uart.queue_rx(b"\x03")
+    assert seen == [4]
+    assert uart.read(0, 1) == 1
+    assert uart.read(0, 1) == 2
+    assert uart.read(0, 1) == 3
+    assert uart.take_rx_irq_edge() is None
+    uart.queue_rx(b"\x04")
+    assert seen == [4, 4]
+
+    quiet = Uart(name="uart0", base=0x40000000, size=0x100, config={"rx": "A"})
+    quiet.bind_rx_irq(seen.append)
+    assert seen == [4, 4]
+    assert quiet.take_rx_irq_edge() is None
+
+    primed = Uart(name="uart0", base=0x40000000, size=0x100, config={"rx": [0x11], "rx_irq": 7})
+    primed.bind_rx_irq(seen.append)
+    assert seen == [4, 4, 7]
+
+    with pytest.raises(ConfigError, match="disagree"):
+        Uart(name="uart0", base=0x40000000, size=0x100, config={"irq": 1, "rx_irq": 2})
+    with pytest.raises(ConfigError, match="rx_irq"):
+        Uart(name="uart0", base=0x40000000, size=0x100, config={"rx_irq": 256})
+    with pytest.raises(ConfigError, match="does not accept"):
+        Uart(name="uart0", base=0x40000000, size=0x100, config={"rx_interrupt": 1})
 
 
 def test_uart_posts_tx_and_pops_rx():
@@ -143,3 +187,145 @@ def test_mmio_script_reaches_the_plugin_before_the_cpu_reads_it():
     result = machine.run()
     assert result.status == "halted"
     assert machine.read_u32(0x20000000) == 0x99
+
+
+def test_uart_rx_irq_enters_the_handler_when_a_byte_is_queued():
+    lines = [".word 0x20001000", ".thumb_word reset"]
+    lines.extend(".word 0" for _ in range(14))
+    lines.append(".thumb_word irq0")
+    source = "\n".join(lines) + """
+        reset:
+            movw r0, #0xe100
+            movt r0, #0xe000
+            movs r1, #1
+            str r1, [r0, #0]
+            wfi
+            bkpt #0
+        irq0:
+            movw r0, #0
+            movt r0, #0x4000
+            ldr r1, [r0, #0]
+            movw r2, #0
+            movt r2, #0x2000
+            str r1, [r2, #0]
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "uart0",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "uart",
+                "config": {"rx_irq": 0},
+            }
+        ],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    machine.peripheral("uart0").queue_rx(b"\x5a")
+    assert machine.backend.pending_irqs == [0]
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000000) == 0x5A
+    assert machine.backend.pending_irqs == []
+
+
+def test_preloaded_rx_without_irq_does_not_pend():
+    machine = machine_from_asm(
+        """
+        movw r0, #0
+        movt r0, #0x4000
+        ldr r1, [r0, #0]
+        bkpt #0
+        """,
+        regions=[
+            {
+                "name": "uart0",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "uart",
+                "config": {"rx": [0x41]},
+            }
+        ],
+    )
+    assert machine.backend.pending_irqs == []
+    result = machine.run()
+    assert result.status == "halted"
+    assert result.registers["r1"] == 0x41
+    assert machine.backend.pending_irqs == []
+
+
+def test_register_block_ready_bits_survive_writes_and_unknown_fields_fail():
+    block = RegisterBlock(
+        name="rcc",
+        base=0x40023800,
+        size=0x100,
+        config={
+            "registers": {
+                "0x0": {"reset": 0x83, "read_set": 0x20000},
+                "0x8": {"reset": 0, "writable": True, "read_mask": 0xC, "read_bits": 0x8},
+            }
+        },
+    )
+    block.write(0, 4, 0)
+    assert block.read(0, 4) & 0x20000
+    block.write(8, 4, 0)
+    assert block.read(8, 4) & 0xC == 0x8
+    with pytest.raises(ConfigError, match="unknown field"):
+        RegisterBlock(
+            name="rcc",
+            base=0x40023800,
+            size=0x100,
+            config={"registers": {"0x0": {"reset": 1, "ready": True}}},
+        )
+    with pytest.raises(ConfigError, match="subset"):
+        RegisterBlock(
+            name="rcc",
+            base=0x40023800,
+            size=0x100,
+            config={"registers": {"0x0": {"read_mask": 0x1, "read_bits": 0x2}}},
+        )
+
+
+def test_stm32f4_clock_template_returns_ready_bits():
+    root = Path(__file__).resolve().parents[1]
+    machine = Machine.from_path(root / "examples" / "stm32f4_clock.yaml")
+    cr = 0x40023800
+    cfgr = 0x40023808
+    sr = 0x40023C0C
+    machine.write_mmio(cr, 0, 4)
+    assert machine.read_mmio(cr, 4) & 0x0A020002 == 0x0A020002
+    machine.write_mmio(cfgr, 0, 4)
+    assert machine.read_mmio(cfgr, 4) & 0xC == 0x8
+    machine.write_mmio(sr, 0xFFFFFFFF, 4)
+    assert machine.read_mmio(sr, 4) & 0x00010000 == 0
+    assert machine.peripheral("usart2").rx_irq == 38
+
+
+def test_ready_bits_load_from_toml(tmp_path: Path):
+    path = tmp_path / "rcc.toml"
+    path.write_text(
+        """
+        name = "rcc-toml"
+        arch = "cortex-m"
+        [[memory]]
+        name = "rcc"
+        base = 0x40023800
+        size = 0x100
+        perms = "rw"
+        peripheral = "register_block"
+        read_default = 0
+
+        [memory.config.registers."0x00"]
+        reset = 0x83
+        writable = true
+        read_set = 0x20000
+        """,
+        encoding="utf-8",
+    )
+    machine = Machine.from_path(path)
+    machine.write_mmio(0x40023800, 0, 4)
+    assert machine.read_mmio(0x40023800, 4) & 0x20000 == 0x20000

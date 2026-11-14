@@ -6,7 +6,7 @@ This is not legal advice.
 
 ## What this project ships
 
-The repository contains the framework, its tests, and small synthetic Cortex-M programs assembled from source in this tree. Those programs exist so CI can exercise UART, GPIO, and SysTick stubs.
+The repository contains the framework, its tests, and small synthetic Cortex-M programs assembled from source in this tree. Those programs exist so CI can exercise UART, GPIO, SysTick, and a Modbus RTU exchange. The STM32-class file under `examples/` is a machine map, not a firmware image.
 
 The project does **not** distribute, mirror, download, or commit third-party firmware, ROMs, BIOS images, or proprietary dumps. A machine config names addresses and plugins. The image path is an argument you pass at runtime from a file you already have.
 

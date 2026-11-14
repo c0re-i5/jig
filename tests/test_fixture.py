@@ -56,6 +56,8 @@ def test_examples_match_packaged_fixtures():
         "fuzz_echo.yaml",
         "fuzz_crash.s",
         "fuzz_crash.yaml",
+        "modbus_rtu.s",
+        "modbus_rtu.yaml",
     ):
         assert (examples / name).read_text(encoding="utf-8") == (
             packaged / name

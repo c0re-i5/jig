@@ -31,6 +31,11 @@ FIXTURES: dict[str, dict[str, str]] = {
         "config": "fuzz_crash.yaml",
         "summary": "Halts on BKPT unless the fuzz buffer starts with the bytes JIG!, which fault.",
     },
+    "modbus-rtu": {
+        "asm": "modbus_rtu.s",
+        "config": "modbus_rtu.yaml",
+        "summary": "IRQ-driven Modbus RTU: answers Read Holding Registers 0 with 0x1234, else an exception.",
+    },
 }
 
 
