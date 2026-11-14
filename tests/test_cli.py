@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from rehost.cli import main
 
 
@@ -41,6 +44,23 @@ def test_fuzz_input_and_snapshot(tmp_path, capsys):
     assert "uart0 tx: 5a" in out
     assert snap.is_file()
     assert '"arch": "cortex-m"' in snap.read_text(encoding="utf-8")
+
+
+def test_plant_floor_demo_prints_tick_and_modbus():
+    # The fixture has a fuzz buffer, so a non-tty stdin is a testcase. An empty
+    # pipe is what a script feeds; it must not steal the Modbus exchange.
+    proc = subprocess.run(
+        [sys.executable, "-m", "rehost", "run", "--fixture", "plant-floor", "--modbus-read", "1:0:1"],
+        input=b"",
+        capture_output=True,
+        check=False,
+    )
+    out = proc.stdout.decode()
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert "status: halted" in out
+    assert "usart2 tx: 0103021234b533" in out
+    assert "gpioa odr: 0x3" in out
+    assert "systick ctrl: 0x7 load: 0xffff" in out
 
 
 def test_modbus_rtu_demo_prints_a_response(capsys):

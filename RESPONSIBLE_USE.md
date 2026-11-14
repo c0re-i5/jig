@@ -6,15 +6,15 @@ This is not legal advice.
 
 ## What this project ships
 
-The repository contains the framework, its tests, and small synthetic Cortex-M programs assembled from source in this tree. Those programs exist so CI can exercise UART, GPIO, SysTick, and a Modbus RTU exchange. The STM32-class file under `examples/` is a machine map, not a firmware image.
+The repository contains the framework, its tests, and small synthetic Cortex-M programs assembled from source in this tree. Those programs exist so CI can exercise UART, GPIO, SysTick, NVIC delivery, and a Modbus RTU exchange. One of them is shaped like a small plant-floor controller: it boots from a vector table, takes a SysTick interrupt, and answers one Modbus read. The STM32-class file under `examples/` is a machine map, not a firmware image.
 
-The project does **not** distribute, mirror, download, or commit third-party firmware, ROMs, BIOS images, or proprietary dumps. A machine config names addresses and plugins. The image path is an argument you pass at runtime from a file you already have.
+The project does **not** distribute, mirror, download, or commit third-party firmware, ROMs, BIOS images, proprietary dumps, or a Zephyr or FreeRTOS build. A machine config names addresses and plugins. The image path is an argument you pass at runtime from a file you already have.
 
 ## What you bring
 
 Use rehost on a target you are allowed to analyze. That means you hold the image under your own authorization: you own the device, you administer it, your employer or client engaged you to test it, a bug-bounty program covers it, or you are working from hardware in your lab under the same kind of permission. Keep the image on your machine. Do not add it to this repository, a fork, or a bug report.
 
-If you build a larger fixture yourself, prefer source you can rebuild: a Zephyr sample, a FreeRTOS demo, or your own bare-metal program. The framework will load the raw image you point it at. It will not fetch one for you.
+If you build a larger fixture yourself, prefer source you can rebuild: a Zephyr sample, a FreeRTOS demo, or your own bare-metal program. The README plant-floor section is the procedure: copy `examples/stm32f4_clock.yaml`, pass the raw image with `--firmware`, and keep that image on your machine. The framework will load the bytes you point it at. It will not fetch an image for you.
 
 ## Disclosure
 

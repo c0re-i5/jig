@@ -1,0 +1,107 @@
+# CI sibling of examples/stm32f4_clock.yaml. Same addresses for the windows
+# this program touches, a smaller flash and SRAM, and unmapped.action fault
+# so a stray access fails the run instead of reading as zero. The long tail
+# (unimplemented GPIO and UART windows) lives on the template, not here.
+# The image is assembled at load.base. No third-party firmware.
+name: plant-floor
+description: >
+  Synthetic STM32F4-shaped controller. Polls RCC and FLASH ready bits, enables
+  SysTick with TICKINT, answers one Modbus RTU request on USART2 (IRQ 38), then
+  checks the fuzz buffer. The bytes JIG! fetch unmapped memory.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x08000000
+
+memory:
+  - name: flash
+    base: 0x08000000
+    size: 0x1000
+    perms: rx
+  - name: sram
+    base: 0x20000000
+    size: 0x4000
+    perms: rw
+  - name: gpioa
+    base: 0x40020000
+    size: 0x400
+    perms: rw
+    peripheral: gpio
+    config:
+      odr_offset: 0x14
+      idr_offset: 0x10
+  - name: usart2
+    base: 0x40004400
+    size: 0x400
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x04
+      status_offset: 0x00
+      # TXE (bit 7) and TC (bit 6). The stub has no shift register, so both
+      # read as set. RXNE (bit 5) is set while the RX queue is non-empty.
+      tx_empty_mask: 0xC0
+      rx_ready_mask: 0x20
+      rx_irq: 38
+  - name: rcc
+    base: 0x40023800
+    size: 0x400
+    perms: rw
+    peripheral: register_block
+    read_default: 0
+    config:
+      registers:
+        # CR. HSIRDY (bit 1) stays set, along with the other ready bits the
+        # full template forces. See examples/stm32f4_clock.yaml for the rest.
+        0x00:
+          reset: 0x00000083
+          writable: true
+          read_set: 0x0A020002
+        # CFGR. SWS always reads as PLL (0b10).
+        0x08:
+          reset: 0
+          writable: true
+          read_mask: 0xC
+          read_bits: 0x8
+  - name: flash_if
+    base: 0x40023C00
+    size: 0x400
+    perms: rw
+    peripheral: register_block
+    read_default: 0
+    config:
+      registers:
+        0x00: {reset: 0, writable: true}
+        # SR. Writes ignored. BSY (bit 16) reads as 0.
+        0x0C:
+          reset: 0
+          writable: false
+          read_mask: 0x00010000
+          read_bits: 0
+  - name: systick
+    base: 0xE000E010
+    size: 0x10
+    perms: rw
+    peripheral: systick
+
+boot:
+  mode: vector
+  vector_base: 0x08000000
+
+run:
+  timeout_ms: 1000
+  max_instructions: 10000
+  halt_on_bkpt: true
+  trace_limit: 64
+
+unmapped:
+  action: fault
+  read_default: 0
+  log: true
+
+fuzz:
+  mode: buffer
+  buffer:
+    address: 0x20000100
+    max_size: 16

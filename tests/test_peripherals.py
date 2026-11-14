@@ -302,7 +302,22 @@ def test_stm32f4_clock_template_returns_ready_bits():
     assert machine.read_mmio(cfgr, 4) & 0xC == 0x8
     machine.write_mmio(sr, 0xFFFFFFFF, 4)
     assert machine.read_mmio(sr, 4) & 0x00010000 == 0
-    assert machine.peripheral("usart2").rx_irq == 38
+    usart = machine.peripheral("usart2")
+    assert usart.rx_irq == 38
+    assert usart.tx_empty_mask == 0xC0
+    assert usart.rx_ready_mask == 0x20
+    gpioa = machine.peripheral("gpioa")
+    assert gpioa.odr_offset == 0x14
+    assert gpioa.idr_offset == 0x10
+    # The long tail is an unimplemented window, not a second HAL.
+    assert machine.peripheral("gpiob").read(0x14, 4) == 0
+    assert machine.peripheral("usart6").read(0, 4) == 0
+    flash = next(region for region in machine.config.memory if region.name == "flash")
+    sram = next(region for region in machine.config.memory if region.name == "sram")
+    assert flash.base == 0x08000000
+    assert sram.base == 0x20000000
+    assert machine.config.boot.vector_base == 0x08000000
+    assert not any(region.base == 0xE000E000 for region in machine.config.memory)
 
 
 def test_ready_bits_load_from_toml(tmp_path: Path):
