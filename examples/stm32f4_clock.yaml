@@ -1,26 +1,83 @@
-# STM32F405/407-class map for getting past clock and flash init.
+# STM32F405/407-class beachhead map.
 #
-# This is a register_block template, not a model of RCC or FLASH. Ready bits
-# are stuck on (or, for FLASH_SR.BSY and RCC_CFGR.SWS, forced to a fixed
-# pattern) so a poll loop exits. It does not follow enable bits, it does not
-# implement clear-on-write-1, and it does not update SWS when firmware writes
-# SW. SWS always reads as PLL (0b10). A wait for SWS == HSI or HSE will not
-# pass. Unknown register fields are errors. Addresses this file does not
-# list follow unmapped.action (log and return 0 here).
+# This is the machine file to copy when you point jig-emu at an image you
+# built yourself (a Zephyr sample or a FreeRTOS UART program). It is not a
+# vendor HAL, and it does not boot a binary that this repository does not
+# contain. The synthetic proof that the same addresses tick and answer Modbus
+# is the plant-floor fixture. The procedure for swapping in your image is in
+# the README section "Plant-floor beachhead".
 #
-# Layout follows RM0090: flash at 0x08000000, SRAM at 0x20000000, RCC at
-# 0x40023800, FLASH interface at 0x40023C00. The 0x00000000 flash alias is
-# not mapped, so a null fetch still faults. Resize flash and SRAM to the part.
+# Layout follows RM0090. Flash is the 1 MiB window at 0x08000000. The alias at
+# 0x00000000 is not mapped, so a null fetch still faults. SRAM is 128 KiB at
+# 0x20000000 (the F405/407 SRAM1+SRAM2 block). CCM is 64 KiB at 0x10000000.
+# Resize these three to the part you actually built for. An STM32F429ZI, for
+# example, has 2 MiB of flash and 192 KiB of system SRAM plus the 64 KiB CCM.
 #
-# usart2 is the Jig byte UART placed at the USART2 address with STM32F4
-# status/data offsets and IRQ 38. It is not the vendor USART (BRR and CR1
-# writes are logged and ignored; TXE reads as set). Copy the block and change
-# rx_irq, or omit rx_irq, for a different port.
+# What is modeled
+#   gpioa     STM32 GPIO offsets: IDR 0x10, ODR 0x14. MODER, BSRR, and AFR
+#             are not cells. A write there is logged and a read returns 0.
+#   usart2    Jig byte UART at the USART2 address. Status at +0, data at +4.
+#             TXE (bit 7) and TC (bit 6) read as set, because this stub has no
+#             shift register. RXNE (bit 5) is set while RX is non-empty.
+#             rx_irq 38 is USART2 in the RM0090 vector table. BRR and CR1
+#             writes are logged and ignored. Copy the block for another port
+#             and change base and rx_irq (USART1 37, USART3 39, UART4 52,
+#             UART5 53, USART6 71).
+#   rcc       register_block ready-bit stub. Not an RCC state machine.
+#   flash_if  register_block. ACR reads back. FLASH_SR.BSY reads as 0.
+#   systick   The per-instruction SysTick plugin.
+#   NVIC/SCB  Not a region in this file. The Cortex-M backend owns the system
+#             control page at 0xE000E000 (ISER, ICER, ISPR, ICPR, IPR, VTOR,
+#             AIRCR, SHPR, and the rest of the exception model). Do not map a
+#             peripheral over that page. SysTick at 0xE000E010 is the one
+#             plugin that sits inside it; the NVIC model does not claim those
+#             16 bytes.
+#
+# Ready bits are stuck on (or, for FLASH_SR.BSY and RCC_CFGR.SWS, forced to a
+# fixed pattern) so a poll loop exits. The stub does not follow enable bits,
+# it does not implement clear-on-write-1, and it does not update SWS when
+# firmware writes SW. SWS always reads as PLL (0b10). A wait for SWS == HSI
+# or HSE will not pass. Unknown register fields are errors.
+#
+# Filling in the rest
+#   1. Run with -v. "unhandled MMIO" lines are offsets inside a window below.
+#      "unmapped read/write" lines are addresses this file does not list.
+#      unmapped.action is log, so those reads return 0 and the run continues.
+#      A fetch of an unmapped address still faults.
+#   2. When the image spins on a bit, add a register_block cell at that
+#      offset. read_set ORs bits on every read (ready flags). read_mask and
+#      read_bits force a field (SWS). writable: false ignores stores (a pure
+#      status register). Copy the pattern from RCC_CR and FLASH_SR.
+#   3. Prefer an unimplemented window for a peripheral you have not looked at
+#      yet, and register_block for the few offsets the image actually polls.
+#      Do not transcribe the reference manual into a HAL.
+#   4. In Ghidra, import the raw bin as ARM Cortex little-endian at the load
+#      address (0x08000000 for this file). Constants in 0x40000000..0x5FFFFFFF
+#      and 0xE0000000..0xE00FFFFF are the MMIO sites. Cross-check RM0090.
+#
+# Windows that are listed but not modeled read as 0. A poll of a ready bit in
+# one of those windows will not finish until you promote the offset.
+#
+# Not mapped, on purpose. Copy a 0x400-byte unimplemented window (or a
+# register_block, once you know which bits matter) when the trace shows the
+# image touching it:
+#   TIM3  0x40000400   TIM4  0x40000800   TIM5  0x40000C00
+#   TIM6  0x40001000   TIM7  0x40001400   TIM12 0x40001800
+#   TIM13 0x40001C00   TIM14 0x40002000
+#   RTC   0x40002800   WWDG  0x40002C00   IWDG  0x40003000
+#   SPI2  0x40003800   SPI3  0x40003C00
+#   I2C2  0x40005800   I2C3  0x40005C00
+#   CAN1  0x40006400   CAN2  0x40006800   DAC   0x40007400
+#   TIM1  0x40010000   TIM8  0x40010400
+#   TIM9  0x40014000   TIM10 0x40014400   TIM11 0x40014800
+#   Ethernet MAC 0x40028000 is larger than 0x400. USB OTG FS is 0x50000000.
+#   Neither is a serial-line beachhead. Add them only if your image touches them.
 
-name: stm32f4-clock
+name: stm32f4
 description: >
-  STM32F405/407-class RCC and FLASH ready-bit stubs plus a UART placed at
-  USART2. Enough for a clock-init poll to finish, not a full SoC.
+  STM32F405/407-class map: flash, SRAM, CCM, GPIOA, USART2 with RX IRQ 38,
+  RCC and FLASH ready-bit stubs, SysTick, and unimplemented windows for the
+  GPIO and serial-line tail. Starting point for an image you build yourself.
 arch: cortex-m
 endian: little
 
@@ -32,10 +89,20 @@ memory:
     base: 0x08000000
     size: 0x100000
     perms: rx
+  - name: ccm
+    base: 0x10000000
+    size: 0x10000
+    perms: rw
   - name: sram
     base: 0x20000000
     size: 0x20000
     perms: rw
+  - name: tim2
+    base: 0x40000000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
   - name: usart2
     base: 0x40004400
     size: 0x400
@@ -44,9 +111,137 @@ memory:
     config:
       data_offset: 0x04
       status_offset: 0x00
-      tx_empty_mask: 0x80
+      tx_empty_mask: 0xC0
       rx_ready_mask: 0x20
       rx_irq: 38
+  - name: usart3
+    base: 0x40004800
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: uart4
+    base: 0x40004C00
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: uart5
+    base: 0x40005000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: i2c1
+    base: 0x40005400
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: pwr
+    base: 0x40007000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: usart1
+    base: 0x40011000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: usart6
+    base: 0x40011400
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: adc
+    base: 0x40012000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: spi1
+    base: 0x40013000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: syscfg
+    base: 0x40013800
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: exti
+    base: 0x40013C00
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpioa
+    base: 0x40020000
+    size: 0x400
+    perms: rw
+    peripheral: gpio
+    config:
+      idr_offset: 0x10
+      odr_offset: 0x14
+  - name: gpiob
+    base: 0x40020400
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpioc
+    base: 0x40020800
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpiod
+    base: 0x40020C00
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpioe
+    base: 0x40021000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpiof
+    base: 0x40021400
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpiog
+    base: 0x40021800
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpioh
+    base: 0x40021C00
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: gpioi
+    base: 0x40022000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: crc
+    base: 0x40023000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
   - name: rcc
     base: 0x40023800
     size: 0x400
@@ -118,6 +313,22 @@ memory:
           read_bits: 0
         0x10: {reset: 0, writable: true}
         0x14: {reset: 0, writable: true}
+  - name: bkpsram
+    base: 0x40024000
+    size: 0x1000
+    perms: rw
+  - name: dma1
+    base: 0x40026000
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
+  - name: dma2
+    base: 0x40026400
+    size: 0x400
+    perms: rw
+    peripheral: unimplemented
+    read_default: 0
   - name: systick
     base: 0xE000E010
     size: 0x10

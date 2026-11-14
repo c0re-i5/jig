@@ -479,10 +479,11 @@ Not in this triage: exploitability scoring, a symbolic root cause, Ghidra or any
 | `fuzz-echo` | Loads the fuzz buffer at `0x20000100` and posts the low byte to the UART. |
 | `fuzz-crash` | `BKPT` unless the buffer starts with `JIG!`, which fetches unmapped memory and faults. |
 | `modbus-rtu` | Enables UART IRQ 0, waits, and answers one Modbus RTU request. Read Holding Registers at address 0, quantity 1, returns holding register `0x1234`. Other reads and other function codes return an exception. See [Modbus RTU](#modbus-rtu). |
+| `plant-floor` | STM32-shaped controller at `0x08000000`. Polls the RCC and FLASH stubs, takes one SysTick interrupt, answers the same Modbus read on USART2, and fetches unmapped memory if the fuzz buffer is `JIG!`. See [Plant-floor beachhead](#plant-floor-beachhead). |
 
 Sources live in `src/rehost/fixtures/data/` and are copied under `examples/`. The assembler in `rehost.fixtures.assemble` encodes the few Thumb and Thumb-2 instructions these programs use, so CI does not need a cross toolchain. It is not a general assembler.
 
-To study a real RTOS image, build it yourself (a Zephyr sample or a FreeRTOS demo you compile) and pass the raw binary with `--firmware` and a machine file you write for that part. Do not commit the image here.
+To study a real RTOS image, build it yourself and pass the raw binary with `--firmware` and a machine file you write for that part. [Plant-floor beachhead](#plant-floor-beachhead) is the procedure, and `examples/stm32f4_clock.yaml` is the map to copy. Do not commit the image here.
 
 ## Design notes
 
@@ -524,7 +525,7 @@ The latch is one-shot for a burst. A second byte queued while RX is still non-em
     rx_irq: 0
 ```
 
-`examples/stm32f4_clock.yaml` places the same plugin at the STM32F405/407 USART2 address (`0x40004400`) with status at offset 0, data at offset 4, `TXE`/`RXNE` masks, and `rx_irq: 38`. That is still this byte UART. BRR and CR1 writes are logged and ignored.
+`examples/stm32f4_clock.yaml` places the same plugin at the STM32F405/407 USART2 address (`0x40004400`) with status at offset 0, data at offset 4, and `rx_irq: 38`. Status bit 7 (`TXE`) and bit 6 (`TC`) both read as set (`tx_empty_mask: 0xC0`), because the stub has no shift register, and bit 5 (`RXNE`) is set while RX is non-empty. That is still this byte UART. BRR and CR1 writes are logged and ignored.
 
 ## Modbus RTU
 
@@ -572,22 +573,140 @@ assert read_holding_values(frame) == [0x1234]
 
 `run_exchange` calls `reset_to_checkpoint` before `deliver`, so RX from the previous case is gone before the new frame is queued. The fixture has no `fuzz:` section, and `jig-emu run` therefore does not read stdin as a testcase. A harness in your own script can set `machine.config.fuzz` if you also want `exec_one`.
 
-## STM32-class clock and flash stubs
+## Plant-floor beachhead
 
-`examples/stm32f4_clock.yaml` is a machine file for an image you build yourself (a Zephyr or FreeRTOS binary is not in this repo). It maps STM32F405/407-class windows and fills RCC and the FLASH interface with `register_block` cells:
+Phase 5's proof is a controller that boots, takes a tick, answers one serial request, and leaves a crash you can open. CI runs a synthetic image assembled in this repo. A Zephyr or FreeRTOS binary stays on your machine. Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before you point `--firmware` at one. This tree does not download or commit that image.
+
+### Synthetic demo
+
+`plant-floor` is the CI image. Flash is at `0x08000000`, which is where an STM32F4 boots when the boot pins select main flash. The program polls `RCC_CR` until `HSIRDY` is set, writes `FLASH_ACR`, reads `FLASH_SR` until it is zero, lights GPIOA `ODR` bit 0, and enables SysTick with `TICKINT`. The main loop waits until the word at `0x20000000` is non-zero. That store is the SysTick handler, which also sets GPIOA `ODR` bit 1. `LOAD` is `0xFFFF`, so the counter fires once (it starts at 0) and does not fire again during this program.
+
+After that tick the reset path enables IRQ 38. A Modbus frame queued before the run is already pending, so the USART2 handler runs, writes the response, and returns. Control then falls into a maintenance window that reads the fuzz buffer at `0x20000100`. `JIG!` fetches unmapped `0x60000000`. Any other buffer executes `BKPT`. `--modbus-read` queues the RTU frame. The fuzzer feeds the maintenance window and leaves the UART idle.
+
+```bash
+jig-emu run --fixture plant-floor --modbus-read 1:0:1
+jig-emu fuzz --fixture plant-floor --out ./fuzz-out --max-execs 4000 --stop-on-crash
+jig-emu triage --fixture plant-floor --out ./fuzz-out
+jig-emu run --fixture plant-floor --input ./fuzz-out/buckets/31fe281f1c29dd2b/representative
+```
+
+The fixture has a `fuzz:` section. In a terminal, `jig-emu run` does not read stdin. If stdin is a pipe, those bytes are the fuzz buffer. An empty pipe still answers the Modbus read. Pass `--input` when you want a specific buffer and a pipe at the same time.
+
+A successful exchange:
+
+```text
+name: plant-floor
+status: halted
+detail: bkpt
+pc: 0x08000164
+sp: 0x20004000
+lr: 0xffffffff
+instructions: 537
+usart2 tx: 0103021234b533
+usart2 rx_irq: 38
+gpioa odr: 0x3
+systick ctrl: 0x7 load: 0xffff val: 0xfdfb
+```
+
+`0103021234b533` is the same slave-1 read of holding register `0x1234` as [Modbus RTU](#modbus-rtu). `odr: 0x3` is the run lamp plus the tick lamp. `ctrl: 0x7` is `ENABLE | TICKINT | CLKSOURCE`. The tick word at `0x20000000` is 1.
+
+`jig-emu fuzz` writes the usual `crashes/`, `buckets/`, and `reports/` layout. From a four-byte zero seed the deterministic walk reaches `JIG!` and stops. The summary is `crashes: 1` and `buckets: 1`. `jig-emu triage` deletes `buckets/` and `reports/` and rebuilds them from `crashes/`. The bucket id in this tree is `31fe281f1c29dd2b`. The material line is:
+
+```text
+unmapped_fetch|fetch|60000000|-|08000158,0800015a,0800015e,08000162|-|1785,1787,1785,1766
+```
+
+The fault PC is the same unmapped address as `fuzz-crash`. The preceding PCs are the maintenance window in flash at `0x08000000`, so the bucket is not the `fuzz-crash` bucket. The replay line in the report is the `jig-emu run --input` command above, with the directory you passed to `--out`.
+
+The machine file for this fixture is `examples/plant_floor.yaml` (the packaged copy is what `--fixture` loads). It is a smaller sibling of the template: same peripheral addresses, 4 KiB of flash, 16 KiB of SRAM, and `unmapped.action: fault` so a stray access fails the test. The template logs unmapped data accesses instead, which is what you want while you are still finding them.
+
+### Machine file to copy
+
+`examples/stm32f4_clock.yaml` is the STM32F405/407-class map. The name is historical; the file is the beachhead template, not only the clock stub. Copy it, resize the memories to your part, and pass it as `--config`. It does not contain a `fuzz:` section. Add one when you are ready to fuzz, aimed at a buffer the image already reads:
+
+```yaml
+fuzz:
+  mode: buffer
+  buffer:
+    address: 0x20000100
+    max_size: 64
+```
+
+`jig-emu fuzz` writes that buffer. It does not inject each testcase as UART RX. To fuzz the RTU parser, restore the boot checkpoint and call `rehost.modbus.deliver` yourself between cases. `run_exchange` does that restore before it queues the frame.
 
 | Window | Address | What the stub returns |
 | --- | --- | --- |
-| Flash | `0x08000000` | 1 MiB, execute. The `0x0` alias is not mapped. |
+| Flash | `0x08000000` | 1 MiB, execute. The `0x0` alias is not mapped, so a null fetch still faults. |
+| CCM | `0x10000000` | 64 KiB, read/write. |
 | SRAM | `0x20000000` | 128 KiB. |
-| USART2 | `0x40004400` | Jig UART, RX IRQ 38. |
+| Backup SRAM | `0x40024000` | 4 KiB, read/write. |
+| GPIOA | `0x40020000` | `IDR` at `0x10`, `ODR` at `0x14`. `MODER`, `BSRR`, and `AFR` are logged and read as 0. GPIOB through GPIOI are `unimplemented` windows. |
+| USART2 | `0x40004400` | Jig UART, RX IRQ 38. `TXE` and `TC` read as set. `RXNE` tracks the RX queue. |
 | RCC | `0x40023800` | `CR` keeps `HSIRDY`, `HSERDY`, `PLLRDY`, and `PLLI2SRDY` set (`read_set: 0x0A020002`) even if firmware writes the register. `CFGR.SWS` always reads as PLL (`0b10`). `LSERDY` and `LSIRDY` stay set. Enable-bit registers are ordinary writable cells. |
 | FLASH | `0x40023C00` | `ACR` is writable, so a latency write reads back. `SR` ignores writes and `BSY` (bit 16) reads as 0. |
 | SysTick | `0xE000E010` | The per-instruction counter above. |
+| NVIC / SCB | `0xE000E000` | Not a region. The Cortex-M backend owns this page. Do not map a plugin over it. SysTick is the one plugin inside the page; the NVIC model does not claim those 16 bytes. |
 
-Unlisted RCC or FLASH offsets log and return 0. `unmapped.action` is `log`, so an address the file does not mention returns 0 instead of faulting. A typo in a register field (`ready:` instead of `read_set:`) is still a config error. SWS does not follow SW. A loop that waits for HSI or HSE as the system clock will not finish. This file is the Phase 4 beachhead for clock and flash init, not a model of the RCC state machine.
+USART1, USART3, UART4, UART5, USART6, TIM2, I2C1, SPI1, ADC, SYSCFG, EXTI, PWR, CRC, and DMA1/DMA2 are `unimplemented` 1 KiB windows: a read returns 0 and is logged once. A poll of a ready bit in one of those windows does not finish until you promote that offset to `register_block`. The file header lists the bases that are not mapped (other timers, CAN, DAC, Ethernet, USB) so you can paste a window when the trace names it.
 
-The same keys load from TOML. `examples/stm32f4_clock.yaml` is the copy to start from; point `--firmware` at an image you are allowed to analyze and widen the map for the peripherals that image actually touches.
+Unlisted RCC or FLASH offsets log and return 0. `unmapped.action` is `log`, so an address the file does not mention returns 0 instead of faulting. A fetch of an unmapped address still faults. A typo in a register field (`ready:` instead of `read_set:`) is still a config error. SWS does not follow SW. A loop that waits for HSI or HSE as the system clock will not finish. This is not a model of the RCC state machine, and it is not a GPIO or USART HAL.
+
+The same keys load from TOML.
+
+### Widen the map from a trace
+
+1. Run `jig-emu run -v --config examples/stm32f4_clock.yaml --firmware /path/to/image.bin`. `--firmware` is a raw image whose first word is the initial stack pointer. An ELF does not boot: the tool copies bytes to `load.base` and does not parse program headers. `arm-none-eabi-objcopy -O binary firmware.elf firmware.bin` is the usual conversion.
+2. `unhandled MMIO` names an offset inside a window the file already lists. `unmapped read` or `unmapped write` names an address to add. An instruction limit with the PC sitting in a compare/branch is a poll of a bit that still reads as 0.
+3. For that bit, add a `register_block` cell. `read_set` ORs bits on every read. `read_mask` and `read_bits` force a field. `writable: false` ignores stores. Copy `RCC_CR` and `FLASH_SR` in the template.
+4. Leave a peripheral you have not read yet as `unimplemented`. Promote the offsets the image actually spins on. Do not transcribe RM0090 into a HAL.
+5. In Ghidra, import the raw bin as ARM Cortex little-endian at `0x08000000`. Constants in `0x40000000`–`0x5FFFFFFF` and `0xE0000000`–`0xE00FFFFF` are the MMIO sites. Cross-check them against RM0090. The vector table in the startup file is where `rx_irq` comes from: USART1 is 37, USART2 is 38, USART3 is 39, UART4 is 52, UART5 is 53, USART6 is 71 on the F405/407.
+
+### Build the image yourself
+
+These commands run on your machine. They are not part of CI, and nothing in this repository executes them.
+
+Zephyr's Modbus RTU server sample is `samples/subsys/modbus/rtu_server`. Zephyr's own docs exercise it on boards that are not STM32. For an STM32F4-class part, `nucleo_f429zi` is a maintained Cortex-M4 board (STM32F429ZI). Confirm the identifier with `west boards`; hardware-model v2 trees may want `nucleo_f429zi/stm32f429xx`.
+
+```bash
+west build -b nucleo_f429zi samples/subsys/modbus/rtu_server -- \
+  -DCONFIG_BUILD_OUTPUT_BIN=y \
+  -DCONFIG_ARM_MPU=n \
+  -DCONFIG_HW_STACK_PROTECTION=n
+```
+
+The image is `build/zephyr/zephyr.bin`. This model has no MPU. The board defconfig turns the MPU on, and hardware stack protection uses it, so the two `CONFIG_` lines above keep early init from programming an MPU this backend will not enforce.
+
+That part is not the F405/407 the template sizes. Give it 2 MiB of flash (`size: 0x200000`) and 192 KiB of system SRAM at `0x20000000`. CCM stays 64 KiB at `0x10000000`. On this board the console is USART3 (`0x40004800`, IRQ 39) and the sample's Arduino serial is USART6 (`0x40011400`, IRQ 71). Copy the `usart2` block onto those bases and set `rx_irq`. The sample's overlay also requests a driver-enable GPIO; a write to `MODER` or `BSRR` is logged and ignored, which is enough for this UART stub because the stub does not check pin mux.
+
+The sample serves coils and holding registers. Those holding values are whatever the application stored. The synthetic fixture is the program that answers with `0x1234`. Expect the first run of a stock image to stop or spin, and widen the map from the `-v` trace, then:
+
+```bash
+jig-emu run -v --config my-board.yaml --firmware build/zephyr/zephyr.bin --modbus-read 1:0:1
+jig-emu fuzz --config my-board.yaml --firmware build/zephyr/zephyr.bin --out ./fuzz-out --max-execs 10000
+jig-emu triage --config my-board.yaml --firmware build/zephyr/zephyr.bin --out ./fuzz-out
+```
+
+The fuzz command needs the `fuzz:` section above, and it needs a buffer the image actually consumes. Until you have that, the run command is the exchange, and a short Python loop around `PersistentHarness` plus `deliver` is how you feed frames:
+
+```python
+from rehost.fuzz import PersistentHarness
+from rehost.machine import Machine
+from rehost.modbus import read_holding_registers, run_exchange
+
+machine = Machine.from_path("my-board.yaml")
+with open("build/zephyr/zephyr.bin", "rb") as handle:
+    machine.load_image(handle.read())
+harness = PersistentHarness(machine)
+result, frame = run_exchange(
+    machine,
+    read_holding_registers(1, 0, 1),
+    harness=harness,
+)
+```
+
+FreeRTOS is the same shape when you build it. STM32Cube's FreeRTOS USART examples are one starting point; this repo does not vendor them. Produce a raw bin with `arm-none-eabi-objcopy -O binary firmware.elf firmware.bin`, point the UART plugin at the instance that example uses, and take `rx_irq` from that project's startup file. Then the same three steps: boot until SysTick is enabled and a counter in SRAM moves, one UART or Modbus exchange, then a short fuzz once a `fuzz:` buffer exists.
+
+Treat a stock SDK image as something you bring up from the trace. The synthetic fixture is the proof the loop works. The template is the map you edit until your image does too.
 
 ## Roadmap
 
@@ -595,19 +714,20 @@ Done:
 
 - Coverage-guided fuzzing. `jig-emu fuzz` runs an in-process campaign, and the same command speaks the AFL++ persistent-mode forkserver when afl-fuzz attaches. See [Fuzzing](#fuzzing).
 - Crash triage. Each crash is classified, deduplicated into a bucket, and written up with the `jig-emu run` command that replays it. `jig-emu triage` rebuilds the reports from an existing `--out` directory. See [Crash triage](#crash-triage).
-- Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt), [Modbus RTU](#modbus-rtu), and [STM32-class clock and flash stubs](#stm32-class-clock-and-flash-stubs).
+- Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt) and [Modbus RTU](#modbus-rtu).
+- Phase 5 beachhead. The `plant-floor` fixture boots from a vector table, takes one SysTick interrupt, answers one Modbus RTU read, and a short fuzz campaign writes a triage bucket for a planted fetch. `examples/stm32f4_clock.yaml` is the map and the procedure for an image you build. See [Plant-floor beachhead](#plant-floor-beachhead).
 
 Not in this version:
 
-- Phase 5: a Zephyr or FreeRTOS image booting to its main loop. That image stays on your machine. CI keeps the synthetic fixture.
+- An authorized real Cortex-M industrial image in CI, or committed to the tree. That image stays on your machine. Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 - Phase 6: HAL and RTOS shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
+- Phase 7: QEMU and Renode adapters on `CpuBackend`, and a RISC-V backend.
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
-- DMA, a full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path).
-- Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration
+- A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.
+- Fuzzing a live plant. The fuzzer talks to a rehosted image.
+- Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration. Ghidra is named in the beachhead procedure as a way to read MMIO constants, not as a plugin.
 - Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
 - CmpLog / RedQueen, parallel campaigns, and a corpus-minimization UI
-- A RISC-V backend
-- QEMU and Renode adapters on `CpuBackend`
 - A new CPU emulator. Decode and execute stay in Unicorn, or in QEMU/Renode when those adapters exist.
 - Third-party firmware in the repository. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 

@@ -6,7 +6,7 @@ It encodes the instructions the synthetic programs use (``movw``/``movt``,
 ``subs``, ``ands`` / ``eors`` / ``orrs``, ``lsls`` / ``lsrs`` immediate,
 ``add rd, sp``, ``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``,
 ``wfi`` / ``wfe``, ``bkpt``, ``nop``, short ``b``, and ``beq`` / ``bne``) plus
-``.word`` / ``.thumb_word``. It is
+``.word`` / ``.thumb_word`` and even-length ``.zero``. It is
 not a general assembler. CI never needs a cross toolchain, and the bytes it
 emits are executed by the Unicorn backend.
 """
@@ -148,6 +148,7 @@ _MSR = re.compile(
     r"^msr\s+(?P<sysm>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*(?P<rn>r\d+|sp|lr|pc)$",
     re.IGNORECASE,
 )
+_ZERO = re.compile(r"^\.zero\s+(?P<count>0x[0-9a-fA-F]+|\d+)$", re.IGNORECASE)
 
 
 def assemble(source: str, *, base: int = 0) -> bytes:
@@ -204,6 +205,12 @@ def _parse(source: str, base: int) -> list[tuple]:
             statements.append(("stmt", line_no, text, pc, 4))
             pc += 4
             continue
+        if lowered.startswith(".zero"):
+            count = _zero_count(text, line_no)
+            if count:
+                statements.append(("stmt", line_no, text, pc, count))
+                pc += count
+            continue
         if lowered.startswith("."):
             if lowered.startswith(_IGNORED_PREFIXES):
                 continue
@@ -229,6 +236,8 @@ def _strip_comment(line: str) -> str:
 def _encode_statement(item: tuple, labels: dict[str, int]) -> tuple[int, str, int, bytes]:
     _kind, line_no, text, address, _width = item
     lowered = text.lower()
+    if lowered.startswith(".zero"):
+        return line_no, text, address, bytes(_zero_count(text, line_no))
     if lowered.startswith(".thumb_word") or lowered.startswith(".word"):
         parts = text.split(None, 1)
         if len(parts) != 2:
@@ -238,6 +247,17 @@ def _encode_statement(item: tuple, labels: dict[str, int]) -> tuple[int, str, in
         return line_no, text, address, encoded
     encoded = _encode_insn(text, address, labels, line_no)
     return line_no, text, address, encoded
+
+
+def _zero_count(text: str, line_no: int) -> int:
+    """Byte count for ``.zero``. Even, so the next Thumb instruction stays aligned."""
+    match = _ZERO.fullmatch(text.strip())
+    if not match:
+        raise AssembleError(f"line {line_no}: .zero needs a byte count")
+    count = int(match.group("count"), 0)
+    if count % 2:
+        raise AssembleError(f"line {line_no}: .zero count must be even so Thumb stays aligned")
+    return count
 
 
 def _encode_word(operand: str, labels: dict[str, int], *, thumb: bool, line_no: int) -> bytes:

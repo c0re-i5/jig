@@ -36,6 +36,15 @@ FIXTURES: dict[str, dict[str, str]] = {
         "config": "modbus_rtu.yaml",
         "summary": "IRQ-driven Modbus RTU: answers Read Holding Registers 0 with 0x1234, else an exception.",
     },
+    "plant-floor": {
+        "asm": "plant_floor.s",
+        "config": "plant_floor.yaml",
+        "base": "0x08000000",
+        "summary": (
+            "STM32-shaped controller: one SysTick, then a Modbus RTU read on USART2. "
+            "Fuzz buffer JIG! fetches unmapped memory."
+        ),
+    },
 }
 
 
@@ -62,8 +71,15 @@ def fixture_source(name: str) -> str:
 
 
 def build_fixture(name: str) -> bytes:
-    """Assemble a named fixture to a raw image. The load address is 0."""
-    return assemble(fixture_source(name))
+    """Assemble a named fixture to a raw image.
+
+    The default assemble base is 0, which matches fixtures loaded at address 0.
+    A fixture that sets ``base`` (the plant-floor image at ``0x08000000``) is
+    assembled there so ``.thumb_word`` entries match ``load.base``.
+    """
+    spec = _spec(name)
+    base = int(spec.get("base", "0"), 0)
+    return assemble(fixture_source(name), base=base)
 
 
 def _spec(name: str) -> dict[str, str]:

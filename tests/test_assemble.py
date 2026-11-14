@@ -39,6 +39,22 @@ def test_movw_movt_and_memory_encodings():
     assert assemble("self:\n    b self") == bytes.fromhex("fee7")
 
 
+def test_zero_directive_pads_and_stays_halfword_aligned():
+    blob = assemble(".word 0x11\n.zero 4\n.word 0x22\n")
+    assert blob == bytes.fromhex("110000000000000022000000")
+    with pytest.raises(AssembleError, match="even"):
+        assemble(".zero 3")
+    with pytest.raises(AssembleError, match="byte count"):
+        assemble(".zero")
+
+
+def test_branch_encoding_does_not_depend_on_the_assemble_base():
+    source = "hsi:\n    beq hsi\n"
+    assert assemble(source, base=0) == assemble(source, base=0x08000000)
+    blob = assemble(".thumb_word start\nstart:\n    bkpt #0", base=0x08000000)
+    assert int.from_bytes(blob[:4], "little") == (0x08000004 | 1)
+
+
 def test_thumb_word_sets_the_low_bit():
     blob = assemble(".thumb_word reset\nreset:\n    bkpt #0")
     # The label sits at byte 4; the vector must set the Thumb bit.
