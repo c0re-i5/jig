@@ -10,17 +10,24 @@ Optional read-time overlays model status bits without a new peripheral.
 They are config, not snapshot state, so a fuzz restore cannot clear them by
 replaying a write of zero. A read is built in this order:
 
-1. ``follow`` copies bits from the stored value onto other bits of the same
-   word. Each entry is ``{src, dst, width}`` (``width`` defaults to 1). The
-   source is the stored value, so a ready bit clears when its enable bit
-   clears. Destination ranges must not overlap.
+1. ``follow`` copies bits onto this word, in list order. Each entry is
+   ``{src, dst, width}`` (``width`` defaults to 1). The source is a stored
+   value, so a ready bit clears when its enable bit clears. ``from`` names
+   another register in this block; omitted, the source is this register.
+   ``value`` with ``src_width`` (default 1) is an override: a non-zero source
+   field writes that constant into the destination, and a zero source leaves
+   the destination as earlier rules left it. Plain copies must not overlap
+   each other. A ``value`` rule may overlap an earlier destination.
 2. ``read_set`` is ORed in, which forces those bits high on every read.
 3. ``read_mask`` / ``read_bits`` then replace those bits (``read_bits`` must
    be a subset of ``read_mask``). ``read_mask`` wins where it overlaps the
    earlier overlays.
 
 ``follow`` is the HAL clock-tree case: HSERDY tracks HSEON, and a multi-bit
-field such as SWS can track SW. ``read_set`` remains the "stuck ready" stub.
+field such as SWS can track SW. ``from`` is the same idea when the enable and
+the ready bit are in different registers. ``value`` covers a status field
+that takes one encoding when an enable is set and otherwise keeps the copy
+from an earlier rule. ``read_set`` remains the "stuck ready" stub.
 """
 
 from __future__ import annotations
@@ -40,6 +47,9 @@ class _Follow:
     src: int
     dst: int
     width: int
+    from_offset: int | None = None
+    value: int | None = None
+    src_width: int = 1
 
 
 @dataclass
@@ -110,6 +120,14 @@ class RegisterBlock(Peripheral):
                 read_bits=read_bits,
                 follow=follow,
             )
+        for cell in self.cells.values():
+            for rule in cell.follow:
+                if rule.from_offset is None or rule.from_offset in self.cells:
+                    continue
+                raise ConfigError(
+                    f"{self.name} register {cell.offset:#x} follow source "
+                    f"{rule.from_offset:#x} is not a register in this block"
+                )
 
     def read(self, offset: int, size: int) -> int:
         cell = self._cell_for(offset, size)
@@ -136,11 +154,27 @@ class RegisterBlock(Peripheral):
             cell.value = int(values[str(offset)]) & 0xFFFFFFFF
 
     def _shown(self, cell: _Cell) -> int:
-        value = _apply_follow(cell.value, cell.follow)
+        value = self._apply_follow(cell)
         value = (value | cell.read_set) & 0xFFFFFFFF
         if cell.read_mask:
             value = (value & ~cell.read_mask) | cell.read_bits
         return value & 0xFFFFFFFF
+
+    def _apply_follow(self, cell: _Cell) -> int:
+        """Apply follow rules in order. Sources are stored values, not overlays."""
+        updated = cell.value & 0xFFFFFFFF
+        for rule in cell.follow:
+            source_cell = cell if rule.from_offset is None else self.cells[rule.from_offset]
+            field = (source_cell.value >> rule.src) & ((1 << rule.src_width) - 1)
+            if rule.value is None:
+                written = field
+            elif field == 0:
+                continue
+            else:
+                written = rule.value
+            dst_mask = ((1 << rule.width) - 1) << rule.dst
+            updated = (updated & ~dst_mask) | ((written & ((1 << rule.width) - 1)) << rule.dst)
+        return updated & 0xFFFFFFFF
 
     def _cell_for(self, offset: int, size: int) -> _Cell | None:
         for cell in self.cells.values():
@@ -159,7 +193,7 @@ def _parse_follow(name: str, offset: int, raw: Any) -> tuple[_Follow, ...]:
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ConfigError(f"{name} register {offset:#x} follow[{index}] must be a mapping")
-        unknown = sorted(set(item) - {"src", "dst", "width"})
+        unknown = sorted(set(item) - {"src", "dst", "width", "from", "value", "src_width"})
         if unknown:
             raise ConfigError(
                 f"{name} register {offset:#x} follow[{index}] has unknown field(s): {', '.join(unknown)}"
@@ -170,13 +204,40 @@ def _parse_follow(name: str, offset: int, raw: Any) -> tuple[_Follow, ...]:
         src = _parse_bit(item["src"], f"{what} src")
         dst = _parse_bit(item["dst"], f"{what} dst")
         width = 1 if "width" not in item else parse_int(item["width"], what=f"{what} width")
-        if width < 1 or src + width > 32 or dst + width > 32:
-            raise ConfigError(f"{what} width {width} does not fit in the word at src {src} dst {dst}")
+        if "value" in item and "src_width" not in item:
+            src_width = 1
+        elif "src_width" in item:
+            src_width = parse_int(item["src_width"], what=f"{what} src_width")
+        else:
+            src_width = width
+        if "src_width" in item and "value" not in item:
+            raise ConfigError(f"{what} src_width is only used with value")
+        value = None if "value" not in item else parse_u32(item["value"], what=f"{what} value")
+        from_offset = None
+        if "from" in item:
+            from_offset = parse_u32(item["from"], what=f"{what} from")
+            if from_offset % 4 != 0:
+                raise ConfigError(f"{what} from {from_offset:#x} must be 4-byte aligned")
+        if width < 1 or src_width < 1 or src + src_width > 32 or dst + width > 32:
+            raise ConfigError(
+                f"{what} width {width} src_width {src_width} does not fit at src {src} dst {dst}"
+            )
+        if value is not None and value >= (1 << width):
+            raise ConfigError(f"{what} value {value:#x} does not fit in {width} destination bits")
         mask = ((1 << width) - 1) << dst
-        if covered & mask:
+        if covered & mask and value is None:
             raise ConfigError(f"{name} register {offset:#x} follow destination bits overlap")
         covered |= mask
-        rules.append(_Follow(src=src, dst=dst, width=width))
+        rules.append(
+            _Follow(
+                src=src,
+                dst=dst,
+                width=width,
+                from_offset=from_offset,
+                value=value,
+                src_width=src_width,
+            )
+        )
     return tuple(rules)
 
 
@@ -185,13 +246,3 @@ def _parse_bit(value: Any, what: str) -> int:
     if not 0 <= number <= 31:
         raise ConfigError(f"{what} must be a bit number from 0 to 31")
     return number
-
-
-def _apply_follow(value: int, rules: tuple[_Follow, ...]) -> int:
-    """Copy each source field onto its destination, reading sources first."""
-    updated = value & 0xFFFFFFFF
-    for rule in rules:
-        field = (value >> rule.src) & ((1 << rule.width) - 1)
-        dst_mask = ((1 << rule.width) - 1) << rule.dst
-        updated = (updated & ~dst_mask) | (field << rule.dst)
-    return updated & 0xFFFFFFFF

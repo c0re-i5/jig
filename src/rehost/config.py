@@ -52,6 +52,7 @@ _RUN_KEYS = {
     "halt_addresses",
     "trace_limit",
     "collect_coverage",
+    "svc_nop",
 }
 _UNMAPPED_KEYS = {"action", "read_default", "log"}
 _FUZZ_KEYS = {"mode", "buffer", "crash_addresses"}
@@ -114,6 +115,9 @@ class RunConfig:
     halt_addresses: tuple[int, ...] = ()
     trace_limit: int = 256
     collect_coverage: bool = False
+    # SVC immediates that retire as NOP. A research image can use one as a
+    # harness hook (P2IM ``svc #63``) that must not enter the SVCall handler.
+    svc_nop: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -344,6 +348,7 @@ def _parse_run(value: Any) -> RunConfig:
     if trace_limit < 0:
         raise ConfigError("run.trace_limit must be >= 0")
     collect_coverage = _bool(raw.get("collect_coverage", False), "run.collect_coverage")
+    svc_nop = _parse_svc_nop(raw.get("svc_nop", []))
     return RunConfig(
         timeout_ms=timeout_ms,
         max_instructions=max_instructions,
@@ -351,7 +356,20 @@ def _parse_run(value: Any) -> RunConfig:
         halt_addresses=halt_addresses,
         trace_limit=trace_limit,
         collect_coverage=collect_coverage,
+        svc_nop=svc_nop,
     )
+
+
+def _parse_svc_nop(value: Any) -> frozenset[int]:
+    if not isinstance(value, list):
+        raise ConfigError("run.svc_nop must be a list of SVC immediates")
+    immediates: list[int] = []
+    for item in value:
+        number = parse_int(item, what="run.svc_nop immediate")
+        if not 0 <= number <= 255:
+            raise ConfigError(f"run.svc_nop immediate {number} must be 0..255")
+        immediates.append(number)
+    return frozenset(immediates)
 
 
 def _parse_unmapped(value: Any) -> UnmappedConfig:

@@ -7,14 +7,21 @@ posts the low byte into ``tx``. A read of the data register pops one byte from
 receiver-ready bits from config. Any other offset is logged and returns
 ``read_default``.
 
+``data_offset`` and ``status_offset`` are exact byte offsets, not required to
+be word-aligned. A Kinetis UART keeps its status at ``0x04`` and its data
+register at ``0x07``; a byte access at that offset hits the register. A wider
+access hits it only when the access starts at the same offset.
+
 ``rx_irq`` (alias ``irq``) is an NVIC external IRQ number. When the RX queue
 goes from empty to non-empty, the plugin latches that IRQ through the same
 ``inject_irq`` path the machine already uses. Omitting the key leaves the line
-quiet, including when ``rx`` is preloaded. The latch is edge-triggered: it
-fires once per burst, and it fires again only after the queue has been emptied
-and another byte arrives. Draining RX does not clear a pending bit that was
-already latched; taking the exception or writing ICPR does, as with any other
-NVIC line. The handler is expected to drain the queue.
+quiet, including when ``rx`` is preloaded. The latch is edge-triggered unless
+``rx_level`` is true: edge mode fires once per burst and again only after the
+queue has been emptied, and the handler is expected to drain RX. Level mode
+pends again on the next instruction while bytes remain, which is a ready bit
+that stays set after a one-byte read. Draining RX does not clear a pending
+bit that was already latched; taking the exception or writing ICPR does, as
+with any other NVIC line.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ class Uart(Peripheral):
             "rx",
             "rx_irq",
             "irq",
+            "rx_level",
         }
     )
     _TX_CAP = 1 << 20
@@ -59,15 +67,25 @@ class Uart(Peripheral):
         )
         if self.data_offset == self.status_offset:
             raise ConfigError(f"{self.name} data_offset and status_offset must differ")
-        self.require_aligned(self.data_offset, what="data")
-        self.require_aligned(self.status_offset, what="status")
+        self._require_offset(self.data_offset, what="data")
+        self._require_offset(self.status_offset, what="status")
         self.rx_irq = _parse_rx_irq(self.name, self.config)
+        rx_level = self.config.get("rx_level", False)
+        if not isinstance(rx_level, bool):
+            raise ConfigError(f"{self.name} rx_level must be true or false")
+        self.rx_level = rx_level
         self.tx = bytearray()
         self.tx_dropped = 0
         self.rx = bytearray(_as_bytes(self.config.get("rx", b""), what=f"{self.name} rx"))
         # True after the rising edge has been reported for the current burst.
         self.rx_irq_armed = False
         self._inject: Callable[[int], None] | None = None
+
+    def _require_offset(self, offset: int, *, what: str) -> None:
+        if offset >= self.size:
+            raise ConfigError(
+                f"{self.name} {what} at {offset:#x} does not fit in a {self.size:#x}-byte region"
+            )
 
     def bind_rx_irq(self, inject: Callable[[int], None]) -> None:
         """Connect the RX latch to ``Machine.inject_irq`` (or a test double).
@@ -117,7 +135,11 @@ class Uart(Peripheral):
         if offset == self.data_offset:
             if self.rx:
                 byte = self.rx.pop(0)
-                if not self.rx:
+                # Edge mode re-arms only when the queue drains, so one burst is
+                # one IRQ and the handler is expected to empty RX. Level mode
+                # matches a ready bit that stays set: another IRQ is pended
+                # on the next instruction while bytes remain.
+                if not self.rx or self.rx_level:
                     self.rx_irq_armed = False
                 return byte & access_mask(size)
             return 0

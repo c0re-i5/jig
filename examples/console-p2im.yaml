@@ -1,0 +1,133 @@
+# P2IM Console: RIOT examples/default on an NXP FRDM-K64F (MK64FN1M0).
+#
+# This is not the STM32F4 CNC map. Flash is at 0x00000000, SRAM is the
+# 256 KiB block at 0x1FFF0000, and the console is a Kinetis UART0. The
+# firmware ELF is not in this repository, and CI does not run it. Download
+# binary/Console from https://github.com/RiS3-Lab/p2im-real_firmware and
+# pass that path to jig-emu. examples/console-p2im.md is the procedure.
+#
+# MCG status bits are follow rules on the bytes the startup actually polls.
+# CLKST copies CLKS until PLLS is set, and then reads as the PLL encoding.
+# That is enough for this image's FEI to PEE walk. It is not an MCG model.
+# The wide RAM windows under the other peripheral addresses are sticky
+# storage so a bit-band store and a later read see the same byte. They are
+# not decoded.
+
+name: p2im-console
+description: >
+  P2IM Console, RIOT 2018.04 examples/default on an NXP Kinetis K64.
+  Pass the published ELF directly. The firmware binary is not in this
+  repository.
+arch: cortex-m
+endian: little
+
+load:
+  base: 0x00000000
+
+memory:
+  - name: flash
+    base: 0x00000000
+    size: 0x100000
+    perms: rx
+  - name: sram
+    base: 0x1FFF0000
+    size: 0x40000
+    perms: rw
+  # SRAM bit-band alias onto 0x20000000. SRAM_L below that address is not
+  # in the alias window.
+  - name: sram_bitband
+    base: 0x22000000
+    size: 0x02000000
+    perms: rw
+    peripheral: bitband
+    config:
+      target: 0x20000000
+  # SIM, PORT, WDOG, and the other blocks below MCG. Sticky RAM, not a
+  # model. Bit-band stores land here.
+  - name: peripherals_below_mcg
+    base: 0x40000000
+    size: 0x64000
+    perms: rw
+  - name: mcg
+    base: 0x40064000
+    size: 0x1000
+    perms: rw
+    peripheral: register_block
+    read_default: 0
+    config:
+      registers:
+        # C1 C2 C3 C4. IREFS is C1 bit 2. CLKS is C1 bits 7:6.
+        # EREFS0 is C2 bit 2, which is bit 10 of this word.
+        0x00: {reset: 0, writable: true}
+        # C5 C6 S and the following byte. PLLS is C6 bit 6 (bit 14).
+        # S is the third byte: OSCINIT0 bit 17, CLKST bits 19:18,
+        # IREFST bit 20, PLLST bit 21, LOCK0 bit 22.
+        0x04:
+          reset: 0
+          writable: true
+          follow:
+            - {from: 0x00, src: 6, dst: 18, width: 2}   # CLKST copies CLKS
+            - {src: 14, dst: 18, width: 2, value: 3}    # PLLS set => CLKST = 3
+            - {src: 14, dst: 21}                        # PLLST follows PLLS
+            - {src: 14, dst: 22}                        # LOCK0 follows PLLS
+            - {from: 0x00, src: 2, dst: 20}             # IREFST follows IREFS
+            - {from: 0x00, src: 10, dst: 17}            # OSCINIT0 follows EREFS0
+        0x08: {reset: 0, writable: true}
+        0x0C: {reset: 0, writable: true}
+  # OSC through the byte before UART0.
+  - name: peripherals_before_uart0
+    base: 0x40065000
+    size: 0x5000
+    perms: rw
+  # Kinetis UART0. S1 is +0x04 (TDRE bit 7, TC bit 6, RDRF bit 5).
+  # D is +0x07. IRQ 31 is UART0_RX_TX. rx_level is on because the RIOT
+  # handler reads one byte and expects the line to stay pending.
+  - name: uart0
+    base: 0x4006A000
+    size: 0x1000
+    perms: rw
+    peripheral: uart
+    config:
+      data_offset: 0x07
+      status_offset: 0x04
+      tx_empty_mask: 0xC0
+      rx_ready_mask: 0x20
+      rx_irq: 31
+      rx_level: true
+  # UART1 through the top of the peripheral bit-band target.
+  - name: peripherals_above_uart0
+    base: 0x4006B000
+    size: 0x95000
+    perms: rw
+  - name: peripheral_bitband
+    base: 0x42000000
+    size: 0x02000000
+    perms: rw
+    peripheral: bitband
+    config:
+      target: 0x40000000
+  - name: systick
+    base: 0xE000E010
+    size: 0x10
+    perms: rw
+    peripheral: systick
+
+boot:
+  mode: vector
+  vector_base: 0x00000000
+
+run:
+  # The shell does not halt. The cap stops a boot plus one help command.
+  timeout_ms: 0
+  max_instructions: 800000
+  halt_on_bkpt: true
+  # P2IM builds call aflCall with svc #63. QEMU treats that as a hook that
+  # does not change CPU state. 63 is retired as a NOP. svc #1 is still the
+  # RIOT context switch.
+  svc_nop: [63]
+  trace_limit: 64
+
+unmapped:
+  action: log
+  read_default: 0
+  log: true
