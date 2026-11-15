@@ -231,7 +231,10 @@ def _persistent_loop(
     coverage = _map_afl_coverage()
     machine.attach_coverage(coverage)
     harness = PersistentHarness(machine)
-    # Checkpoint at boot, before any fuzzer bytes, including NVIC state.
+    # Checkpoint before any fuzzer bytes, including NVIC state. Banner mode
+    # runs until the UART goes quiet first. That warmup is inside this
+    # child, so afl-fuzz's first -t has to cover it. Later cases restore
+    # the snapshot and only pay for one command.
     harness.checkpoint()
     triage = TriageStore(out, replay=replay) if out is not None else None
     remaining = persistent_iters

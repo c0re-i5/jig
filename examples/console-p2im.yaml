@@ -131,3 +131,23 @@ unmapped:
   action: log
   read_default: 0
   log: true
+
+# UART0 RX is the fuzz input. The checkpoint is the RIOT banner, after TX
+# has gone quiet. The shell does not halt, so the instruction cap is a
+# finished case. CI does not download the ELF or start this campaign.
+# examples/console-p2im.md has the seeds.
+fuzz:
+  mode: uart
+  uart:
+    name: uart0
+    max_size: 64
+  checkpoint:
+    mode: banner
+    idle_instructions: 8000
+    contains: "Welcome to RIOT"
+    max_instructions: 800000
+  exec:
+    max_instructions: 120000
+    timeout_ms: 8000
+    idle_instructions: 8000
+  hang_on_limit: false
