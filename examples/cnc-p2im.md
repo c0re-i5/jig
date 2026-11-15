@@ -1,17 +1,17 @@
-# P2IM CNC (grbl 0.8c) on stock jig-emu
+# P2IM CNC (grbl 0.8c) on jig-emu
 
-Stock `jig-emu run` on main has booted a published Cortex-M image to its
-application banner. The sample is P2IM CNC: grbl 0.8c on an STM32F407VG.
-The precompiled ELF is
+`jig-emu run` on the STM32F4 map boots a published Cortex-M image and then
+exchanges a short Grbl session on USART2. The sample is P2IM CNC: grbl 0.8c
+on an STM32F407VG. The precompiled ELF is
 [`binary/CNC`](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/binary/CNC)
 in [RiS3-Lab/p2im-real_firmware](https://github.com/RiS3-Lab/p2im-real_firmware).
 The same target is written up with a map in the
 [Fuzzware P2IM CNC experiment](https://github.com/fuzzware-fuzzer/fuzzware-experiments/tree/main/02-comparison-with-state-of-the-art/P2IM/CNC).
 
 This repository does not contain the ELF or the raw bin. CI executes the
-synthetic `plant-floor` fixture. The run below is one local smoke on commit
-`06230276f7344c89e8259751e4c98b19200e936e` (14 Nov 2026). The numbers are
-that observation. No test in this tree checks them.
+synthetic `plant-floor` fixture and the serial-injection unit tests. The
+session below was run in a local VM against that ELF (15 Nov 2026). No test
+in this tree checks those bytes.
 
 The collection's
 [LICENSE.md](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/LICENSE.md)
@@ -22,20 +22,53 @@ are outside this note.
 
 ## Map
 
-[`cnc-p2im.yaml`](cnc-p2im.yaml) is
-[`stm32f4_clock.yaml`](stm32f4_clock.yaml) with a name, a description, and
-three run limits: `timeout_ms: 15000`, `max_instructions: 2000000`,
-`trace_limit: 128`. RCC `follow` and both bit-band windows are the
-template's. The smoke left TIM2, GPIO BSRR, and the EEPROM path unmodeled.
+[`cnc-p2im.yaml`](cnc-p2im.yaml) starts from
+[`stm32f4_clock.yaml`](stm32f4_clock.yaml). RCC `follow` and both bit-band
+windows are the template's. The CNC file adds:
 
-The template's own `timeout_ms` is 2000. The recorded smoke set it to
-15000 and hit that timeout with the banner already transmitted. The same
-boot with the template file is:
+- `tim2` as the `timer` plugin, IRQ 28, `tick_every: 1500`. That is one
+  update event per 1500 retired instructions while CR1.CEN is set. Compare
+  flags are raised when CCR1 or CCR2 is non-zero, which is how this image
+  arms the step pulse. The next event waits until the handler clears the
+  enabled status bits. ARR is a latch. It does not pace the event.
+- GPIO A through E as `gpio` plugins with `idr_offset: 0x10`,
+  `odr_offset: 0x14`, `bsrr_offset: 0x18`, and `idr: 0xFFFF`. A 1 in the low
+  half of BSRR sets ODR. A 1 in the high half clears it. IDR reads high so
+  idle-high inputs look released.
+- `timeout_ms: 0` and `max_instructions: 2400000`. The protocol loop does
+  not halt. The cap stops the run after the session.
 
-```bash
-jig-emu run -c examples/stm32f4_clock.yaml -f CNC.bin -v \
-  --timeout-ms 15000 --max-instructions 2000000
-```
+USART2 is the byte UART at `0x40004400` (status +0, data +4, `rx_irq: 38`).
+This image polls `usart_tstc` / `usart_getc`. It does not enable the USART2
+NVIC line. The weak `USART2_IRQHandler` is a spin, so leave that line
+disabled.
+
+## What the image actually waits on
+
+After the banner the CPU sits in `serial_read` (`0x08008287`), which calls
+`usart_tstc` and returns `0xff` while RXNE is clear. Commands are ordinary
+USART2 bytes. `?` is handled in `serial_rx_hook` and does not enter the
+line buffer.
+
+The step generator is TIM2. `TIM2_IRQHandler` (`0x08007c7d`) checks SR/DIER
+bits 1, 2, and 0 (CC1, CC2, update) and calls `step_delay_isr`,
+`step_pulse_isr`, and `step_period_isr`. `step_isr_enable` sets CR1.CEN and
+DIER.UIE, plus the compare enables when CCR1/CCR2 are non-zero. Step and
+direction pins are GPIOE ODR (`0x40021000`) via a read-modify-write in
+`step_wr`, not BSRR. `gpio_set` / `gpio_clr` and `HAL_GPIO_WritePin` do use
+BSRR halfword stores. Both paths are covered by the gpio plugin.
+
+`eeprom_get_char` / `eeprom_put_char` are a 1 KiB RAM buffer at
+`0x20000470`. `eeprom_init` fills four bytes with `0xFF`. The checksum fails,
+Grbl prints `error: EEPROM read fail. Using defaults`, and then writes the
+compiled defaults into that buffer. There is no flash-backed EEPROM model
+because this image does not program one. A later `$0=100` in the same run
+reads back as `$0=100.000`. A new process prints the failure again.
+
+TIM4 at `0x40000800` is the g540 timer. `timers_init` starts it with CEN set
+and DIER clear. Nothing in the command session waits on it. The window is
+still unmapped. PWR, SYSCFG, and EXTI are `unimplemented` and are touched
+during init only.
 
 ## Raw image
 
@@ -92,69 +125,100 @@ the first word is `0x2001ffff`:
 python3 -c 'b=open("CNC.bin","rb").read(); print(len(b), hex(int.from_bytes(b[:4],"little")))'
 ```
 
-## Run
+## Command session
+
+`--serial-idle 8000` holds each line until USART2 TX has been quiet for 8000
+instructions, and it does not send the first line until the banner has
+started. `--serial-settle 700000` waits that many extra instructions before
+the last `?`, so the step ISR can finish. Without the settle, a `?` typed in
+the next quiet gap often still sees `<Run,MPos:0.000,...>` because Grbl
+prints `ok` when the block is planned, and the steps happen afterward.
 
 ```bash
-jig-emu run -c examples/cnc-p2im.yaml -f CNC.bin -v \
-  --max-instructions 2000000 \
+jig-emu run -c examples/cnc-p2im.yaml -f CNC.bin \
+  --serial-uart usart2 \
+  --serial-idle 8000 \
+  --serial-settle 700000 \
+  --serial-in '$$\n' \
+  --serial-in '?\n' \
+  --serial-in '$X\n' \
+  --serial-in 'G91 G0 X1\n' \
+  --serial-in '?\n' \
   --snapshot-out cnc.snapshot.json
 ```
 
-Exit status 2 is a timeout. Exit status 1 is a fault. The recorded run
-exited 2: `status: timeout`, `detail: timeout after 15000 ms`, with the
-CPU in the Grbl serial poll and an empty USART2 RX.
-
-With `examples/cnc-p2im.yaml` the name line is `p2im-cnc`. The recorded run's
-identifying fields were:
-
-```text
-status: timeout
-detail: timeout after 15000 ms
-pc: 0x08007e6c
-sp: 0x2001ffbc
-lr: 0x08008291
-instructions: 673777
-systick ctrl: 0x7 load: 0x2903f
-```
-
-`load: 0x2903f` is the SysTick reload after clock setup (168000-1). On that
-run `sp` was word-aligned at `0x2001ffbc`. The vector table still held the
-odd `_estack`. `lr` was `0x08008291`, in the serial poll. The timeout is
-wall-clock time, and after the banner the firmware spins on an empty USART2
-RX, so the PC and the instruction count are where that host was when 15
-seconds elapsed. A repeat keeps the timeout, `load: 0x2903f`, and the
-USART2 text. The PC and the instruction count can differ. The report also
-prints one line per unimplemented window. Those windows (PWR, SYSCFG, EXTI,
-GPIOB, GPIOD, GPIOE, TIM2, and the rest of the template tail) were touched
-during init. The banner did not require promoting them.
-
-USART2 TX in the report is the first 32 bytes, as hex, then `(+859 more)`.
-The recorded preview is:
-
-```text
-usart2 tx: 6572726f723a20454550524f4d2072656164206661696c2e205573696e672064 (+859 more)
-```
-
-Those 32 bytes are `error: EEPROM read fail. Using d`. The banner is later
-in the buffer. The snapshot keeps the whole TX (891 bytes on this run):
+The recorded run exited 3: `status: instruction_limit`,
+`detail: stopped after 2400000 instructions`, `pc: 0x08007e66` (inside
+`usart_tstc`), `sp: 0x2001ffbc`, SysTick `ctrl: 0x7` `load: 0x2903f`,
+`tim2 cr: 0x0 dier: 0x0 sr: 0x0 events: 158`. GPIOE `odr` was `0xa80`.
+The same command on another host can stop at a different PC inside the
+poll. The TX text and the timer having stopped are the check.
 
 ```bash
 python3 -c 'import json; tx=json.load(open("cnc.snapshot.json"))["peripherals"]["usart2"]["tx"]["__bytes__"]; print(bytes.fromhex(tx).decode())'
 ```
 
-Success is that text containing `Grbl 0.8c`. The recorded capture opens
-with the firmware's own EEPROM fallback, prints the compiled `$` settings,
-and then:
+Key replies from that capture, in order:
 
 ```text
 error: EEPROM read fail. Using defaults
-$0=157.480 (x, step/mm)
 ...
 Grbl 0.8c ['$' for help]
 ['$H'|'$X' to unlock]
+$0=157.480 (x, step/mm)
+...
+ok
+<Alarm,MPos:0.000,0.000,0.000,WPos:0.000,0.000,0.000>
+ok
+[Caution: Unlocked]
+ok
+ok
+<Idle,MPos:0.997,0.000,0.000,WPos:0.997,0.000,0.000>
+ok
 ```
 
-The map has no EEPROM model. Grbl reports the failed read, uses its
-compiled defaults, and reaches the protocol banner. The run then waits for
-serial input. `jig-emu fuzz` writes a RAM buffer. This machine file has no
-`fuzz:` section. The image's input is USART2.
+`$$` repeats the compiled settings and ends with `ok`. The first `?` is the
+alarm lock from `$17=1` (homing cycle), not from a limit pin. `$X` prints
+`[Caution: Unlocked]` and `ok`. `G91 G0 X1` prints `ok`. The settled `?`
+prints Idle at X `0.997`. That is 157 steps divided by 157.480 steps/mm,
+shown to three decimals. TIM2 had delivered 158 update events and the
+firmware had cleared CEN.
+
+A separate pass in the same VM sent `$0=100` and then `$$`. The second
+listing showed `$0=100.000`. That write lives in the RAM EEPROM buffer for
+the rest of the process.
+
+The same exchange from Python:
+
+```python
+from rehost.machine import Machine
+from rehost.serial import run_lines
+
+machine = Machine.from_path("examples/cnc-p2im.yaml")
+machine.load_image(open("CNC.bin", "rb").read())
+result, tx, _new = run_lines(
+    machine,
+    ["$$", "?", "$X", "G91 G0 X1", "?"],
+    uart="usart2",
+    idle_instructions=8000,
+    settle_before=[0, 0, 0, 0, 700000],
+)
+assert b"<Idle,MPos:0.997," in tx
+```
+
+## What is still rough
+
+- The timer counts instructions, not the STM32 prescaler. Pulse width and
+  step rate are not the microseconds in `$3`. The move still completes.
+- TIM4 (g540) is unmapped. The session did not need it.
+- Cold boot still reports `EEPROM read fail`. Nothing restores the RAM
+  buffer from flash.
+- PWR, SYSCFG, and EXTI stay `unimplemented`. Init touches them and moves on.
+- USART CR, BRR, and GTPR writes are logged and ignored. The stub is always
+  ready to transmit and reports RXNE from the queue.
+- A cap of 3000000 on this command entered `main` again and printed a second
+  `Grbl 0.8c` banner. 2400000 stops in the poll after the Idle line. The
+  step timer had already gone idle; that later re-entry is not the move.
+- There is no interactive TTY. `--serial-in` and `rehost.serial.run_lines`
+  are the console. `jig-emu fuzz` still writes a RAM buffer, and this map
+  has no `fuzz:` section.

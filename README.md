@@ -1,6 +1,6 @@
 # Jig
 
-Jig runs a firmware image you already have on a modeled microcontroller so you can trace it, snapshot it, and feed it fuzz input. The command is `jig-emu`. The Python package is `rehost`. The first CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. QEMU and Renode can sit behind the same backend interface later; this tree does not implement them yet.
+Jig is a machine shop for plant-controller firmware: emulate it, instrument it, fuzz it, and triage what breaks. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost` (`import rehost`, `python -m rehost`), so existing imports keep working. The first CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. QEMU and Renode can sit behind the same backend interface later; this tree does not implement them yet.
 
 The tool does not download firmware. Tests and the built-in fixtures are synthetic programs assembled from source in this repository. A separate local smoke on main boots the published P2IM CNC image (grbl 0.8c on STM32F407VG) to the Grbl protocol banner with the STM32F4 map. That binary is not in this repository, and CI does not run it. See [P2IM CNC](#p2im-cnc). Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before you point the tool at a real image.
 
@@ -38,9 +38,10 @@ Exit status is `0` for a halt (`BKPT` or a configured halt address), `1` for a f
 ```text
 src/rehost/
   backends/         CpuBackend and the Unicorn Cortex-M adapter
-  peripherals/      plugin registry plus UART, GPIO, SysTick, register block, bit-band
+  peripherals/      plugin registry plus UART, GPIO, SysTick, timer, register block, bit-band
   fixtures/         Thumb assembler and the synthetic programs
   modbus.py         Modbus RTU framing on the existing UART plugin
+  serial.py         line-oriented UART RX injection
   config.py         YAML/TOML machine loader
   machine.py        map, load, boot, run, snapshot
   fuzz.py           RAM-buffer and MMIO-script sinks, AFL++ input map
@@ -165,8 +166,9 @@ Regions must not overlap. The backend maps whole pages; two regions may share a 
 | Name | Behavior |
 | --- | --- |
 | `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Other offsets are logged. Optional `rx_irq` (alias `irq`) latches that NVIC line when RX goes from empty to non-empty. Omit it and the line stays quiet. |
-| `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. |
+| `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. Optional `bsrr_offset` is an STM32-style bit set/reset: a 1 in the low half sets that `ODR` bit, a 1 in the high half clears it, and a bit set in both halves clears. |
 | `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. Firmware that never reads VAL still gets that step; there is no `tick_every_n_instructions` divider. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
+| `timer` | While the enable bit is set, every `tick_every` instructions is one update event. The update flag is set, compare flags are set for compare registers that hold a non-zero value, and if an enabled flag is set the plugin pends `irq`. The next event waits until the guest clears those enabled flags, so a long handler cannot re-pend before it returns. ARR and the compare registers are latches. They do not pace the event. Defaults match STM32 general-purpose timer offsets. This is not a cycle-accurate timer. |
 | `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable, read_set, read_mask, read_bits, follow}`. Unlisted offsets log and return `read_default`. On read, `follow` copies bits from the stored value (`{src, dst, width}`, `width` defaults to 1) so a ready bit tracks an enable and clears when the enable clears. `read_set` is then ORed. `read_mask` / `read_bits` replace those bits last (`read_bits` must be a subset of `read_mask`). Unknown fields are errors. |
 | `bitband` | Cortex-M bit-band alias. `config.target` is the first real address. A word at `base + byte*32 + bit*4` reads or writes that one bit of `target`. Bit 0 of the stored word is the bit. The target may be a plugin or RAM. |
 | `unimplemented` | Every access is logged once at INFO and reads return `read_default`. `mmio: true` selects this plugin when `peripheral` is omitted. |
@@ -512,6 +514,8 @@ Three behaviors that show up in STM32 HAL startup are part of the model, not of 
 
 **Stack pointer.** Writes to SP, MSP, and PSP clear bits [1:0]. The vector-table load does this, and so does a guest `MSR`, `MOV`, or `LDR` into SP: the bits are clear before the next instruction and before exception entry. `CCR.STKALIGN` still looks at bit 2 after that.
 
+**IT blocks.** An asynchronous exception is not taken on the predicated instructions that follow an `IT`. The pending bit stays set and the exception is taken on the instruction after the block. Redirecting PC in the middle of an `IT` block does not stick on this backend.
+
 **Ready bits.** A `register_block` cell may list `follow`. Each entry copies `width` bits from `src` onto `dst` at read time, using the value firmware stored. HSERDY can follow HSEON, including the wait for the bit to read 0 after a disable. A two-bit field is the same mechanism: `src: 0`, `dst: 2`, `width: 2` makes SWS a copy of SW. `read_set` still forces bits high when that is what you want. `read_mask` still wins last.
 
 **Bit-band.** The architecture aliases each bit of a 1 MiB region to its own word. A `bitband` region declares the alias window and `target`:
@@ -597,6 +601,30 @@ assert read_holding_values(frame) == [0x1234]
 ```
 
 `run_exchange` calls `reset_to_checkpoint` before `deliver`, so RX from the previous case is gone before the new frame is queued. The fixture has no `fuzz:` section, and `jig-emu run` therefore does not read stdin as a testcase. A harness in your own script can set `machine.config.fuzz` if you also want `exec_one`.
+
+## Serial text
+
+`rehost.serial` queues bytes on the same UART plugin. It is the line-oriented counterpart of `rehost.modbus.run_exchange`. There is no TTY. A string passed to `run_lines` is ASCII and gains a newline when it does not already end in `\n` or `\r`.
+
+`jig-emu run` accepts the same idea as flags:
+
+- `--serial-in TEXT` is repeatable. Escapes are `\n`, `\r`, `\t`, `\\`, and `\xHH`. With `--serial-idle`, each flag is its own chunk. Without it, the chunks are concatenated.
+- `--serial-file PATH` appends one raw chunk.
+- `--serial-uart NAME` selects the peripheral. The default is the only UART.
+- `--serial-after N` queues once N instructions have retired. `0` queues before the first instruction.
+- `--serial-idle N` waits until TX has been quiet for N instructions. The first chunk also waits until TX has grown, so a banner can finish. Later chunks wait until the guest has made progress on the previous one and TX is quiet again.
+- `--serial-settle N` waits N extra instructions before the last chunk. Use it when the guest keeps working after it stops printing.
+
+```python
+from rehost.machine import Machine
+from rehost.serial import run_lines
+
+machine = Machine.from_path("machine.yaml")
+machine.load_image(open("image.bin", "rb").read())
+result, tx, _new = run_lines(machine, ["$$\n", "?\n"], uart="usart2", idle_instructions=8000)
+```
+
+The P2IM CNC section is a real image driven with these flags. The unit tests use a synthetic UART poll, not that image.
 
 ## Plant-floor beachhead
 
@@ -733,21 +761,21 @@ result, frame = run_exchange(
 
 FreeRTOS is the same shape when you build it. STM32Cube's FreeRTOS USART examples are one starting point; this repo does not vendor them. Produce a raw bin with `arm-none-eabi-objcopy -O binary firmware.elf firmware.bin`, point the UART plugin at the instance that example uses, and take `rx_irq` from that project's startup file. Then the same three steps: boot until SysTick is enabled and a counter in SRAM moves, one UART or Modbus exchange, then a short fuzz once a `fuzz:` buffer exists.
 
-Treat a stock SDK image as something you bring up from the trace. The synthetic fixture is what CI runs. The P2IM CNC note is a recorded run of one published image on this map, through to the USART2 banner, with the template's follow bits and bit-band windows and with TIM2, GPIO BSRR, and EEPROM still unmodeled. The template is the file you edit until your image gets as far as you need.
+Treat a stock SDK image as something you bring up from the trace. The synthetic fixture is what CI runs. The P2IM CNC note is a recorded run of one published image: the banner, then a short Grbl session on USART2, with TIM2 as an instruction-paced timer and BSRR on GPIO A-E. The template is the file you edit until your image gets as far as you need.
 
 ## P2IM CNC
 
-Stock `jig-emu run` on main has booted a published Cortex-M image to its application banner. The sample is P2IM CNC: grbl 0.8c on an STM32F407VG. The precompiled ELF is [`binary/CNC`](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/binary/CNC) in [RiS3-Lab/p2im-real_firmware](https://github.com/RiS3-Lab/p2im-real_firmware). The same target is written up with a map in the [Fuzzware P2IM CNC experiment](https://github.com/fuzzware-fuzzer/fuzzware-experiments/tree/main/02-comparison-with-state-of-the-art/P2IM/CNC).
+Stock `jig-emu run` has booted a published Cortex-M image past its banner and into a short Grbl session. The sample is P2IM CNC: grbl 0.8c on an STM32F407VG. The precompiled ELF is [`binary/CNC`](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/binary/CNC) in [RiS3-Lab/p2im-real_firmware](https://github.com/RiS3-Lab/p2im-real_firmware). The same target is written up with a map in the [Fuzzware P2IM CNC experiment](https://github.com/fuzzware-fuzzer/fuzzware-experiments/tree/main/02-comparison-with-state-of-the-art/P2IM/CNC).
 
-This repository does not contain the ELF or the raw bin. CI executes the synthetic `plant-floor` fixture. The numbers below are one local smoke on commit `06230276f7344c89e8259751e4c98b19200e936e` (14 Nov 2026). No test in this tree checks them. [`examples/cnc-p2im.md`](examples/cnc-p2im.md) is the same note beside the map.
+This repository does not contain the ELF or the raw bin. CI executes the synthetic `plant-floor` fixture. The session below was run in a local VM against that ELF. No test in this tree checks those bytes. [`examples/cnc-p2im.md`](examples/cnc-p2im.md) is the procedure, the command, and the honest limits.
 
 The collection's [LICENSE.md](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/LICENSE.md) does not relicense the binaries. It points at each firmware's upstream project. Grbl is GPLv3. Keep your copy on your machine. Other images in that collection are outside this example. Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 
 ### Map
 
-[`examples/cnc-p2im.yaml`](examples/cnc-p2im.yaml) is [`examples/stm32f4_clock.yaml`](examples/stm32f4_clock.yaml) with a name, a description, and three run limits: `timeout_ms: 15000`, `max_instructions: 2000000`, `trace_limit: 128`. RCC `follow` and both bit-band windows are the template's. The smoke left TIM2, GPIO BSRR, and the EEPROM path unmodeled.
+[`examples/cnc-p2im.yaml`](examples/cnc-p2im.yaml) keeps the STM32F4 regions, RCC `follow`, and both bit-band windows. TIM2 is the `timer` plugin (IRQ 28, one update every 1500 instructions). GPIO A-E set `bsrr_offset: 0x18` and sample `IDR` as `0xFFFF`. The run limit is `timeout_ms: 0` and `max_instructions: 2400000`. The Grbl loop does not halt, so the cap is what stops the session.
 
-The template's own `timeout_ms` is 2000. The recorded smoke set it to 15000 and hit that timeout with the banner already transmitted. The same boot with the template file is:
+The template's own `timeout_ms` is 2000. A banner-only boot on the template file is still:
 
 ```bash
 jig-emu run -c examples/stm32f4_clock.yaml -f CNC.bin -v \
@@ -803,50 +831,25 @@ python3 -c 'b=open("CNC.bin","rb").read(); print(len(b), hex(int.from_bytes(b[:4
 ### Run
 
 ```bash
-jig-emu run -c examples/cnc-p2im.yaml -f CNC.bin -v \
-  --max-instructions 2000000 \
+jig-emu run -c examples/cnc-p2im.yaml -f CNC.bin \
+  --serial-uart usart2 \
+  --serial-idle 8000 \
+  --serial-settle 700000 \
+  --serial-in '$$\n' \
+  --serial-in '?\n' \
+  --serial-in '$X\n' \
+  --serial-in 'G91 G0 X1\n' \
+  --serial-in '?\n' \
   --snapshot-out cnc.snapshot.json
 ```
 
-Exit status 2 is a timeout. Exit status 1 is a fault. The recorded run exited 2: `status: timeout`, `detail: timeout after 15000 ms`, with the CPU in the Grbl serial poll and an empty USART2 RX.
-
-With `examples/cnc-p2im.yaml` the name line is `p2im-cnc`. The recorded run's identifying fields were:
-
-```text
-status: timeout
-detail: timeout after 15000 ms
-pc: 0x08007e6c
-sp: 0x2001ffbc
-lr: 0x08008291
-instructions: 673777
-systick ctrl: 0x7 load: 0x2903f
-```
-
-`load: 0x2903f` is the SysTick reload after clock setup (168000-1). On that run `sp` was word-aligned at `0x2001ffbc`. The vector table still held the odd `_estack`. `lr` was `0x08008291`, in the serial poll. The timeout is wall-clock time, and after the banner the firmware spins on an empty USART2 RX, so the PC and the instruction count are where that host was when 15 seconds elapsed. A repeat keeps the timeout, `load: 0x2903f`, and the USART2 text. The PC and the instruction count can differ. The report also prints one line per unimplemented window. Those windows (PWR, SYSCFG, EXTI, GPIOB, GPIOD, GPIOE, TIM2, and the rest of the template tail) were touched during init. The banner did not require promoting them.
-
-USART2 TX in the report is the first 32 bytes, as hex, then `(+859 more)`. The recorded preview is:
-
-```text
-usart2 tx: 6572726f723a20454550524f4d2072656164206661696c2e205573696e672064 (+859 more)
-```
-
-Those 32 bytes are `error: EEPROM read fail. Using d`. The banner is later in the buffer. The snapshot keeps the whole TX (891 bytes on this run):
+Exit status 3 is the instruction cap. Exit status 1 is a fault. The recorded session exited 3 after 2400000 instructions, with `pc` still in the USART2 poll (`0x08007e66`), SysTick `load: 0x2903f`, and TIM2 stopped (`events: 158`, `cr: 0x0`). The snapshot text contains, in order, the EEPROM fallback and the banner, `ok` after `$$`, `<Alarm,MPos:0.000,0.000,0.000,...>`, `[Caution: Unlocked]`, `ok` for `G91 G0 X1`, and `<Idle,MPos:0.997,0.000,0.000,WPos:0.997,0.000,0.000>`.
 
 ```bash
 python3 -c 'import json; tx=json.load(open("cnc.snapshot.json"))["peripherals"]["usart2"]["tx"]["__bytes__"]; print(bytes.fromhex(tx).decode())'
 ```
 
-Success is that text containing `Grbl 0.8c`. The recorded capture opens with the firmware's own EEPROM fallback, prints the compiled `$` settings, and then:
-
-```text
-error: EEPROM read fail. Using defaults
-$0=157.480 (x, step/mm)
-...
-Grbl 0.8c ['$' for help]
-['$H'|'$X' to unlock]
-```
-
-The map has no EEPROM model. Grbl reports the failed read, uses its compiled defaults, and reaches the protocol banner. The run then waits for serial input. `jig-emu fuzz` writes a RAM buffer. This machine file has no `fuzz:` section. The image's input is USART2.
+`0.997` is 157 steps at the compiled 157.480 steps/mm, printed to three decimals. The timer is not cycle-accurate: each enabled period is 1500 instructions, and the step ISR clears the status flags before the next one. GPIOE `ODR` ended at `0xa80` (this image steps with an ODR read-modify-write). BSRR is modeled for `HAL_GPIO_WritePin` and `gpio_set` / `gpio_clr`. The EEPROM message is the firmware's own RAM buffer failing its checksum; `$0=100` followed by `$$` in the same run showed `$0=100.000`, and a fresh boot prints the failure again. TIM4 at `0x40000800` (the g540 timer) is still unmapped. PWR, SYSCFG, and EXTI are still `unimplemented` windows touched at init. A cap of 3000000 on the same command entered `main` again and printed a second banner; 2400000 stops after the Idle line. [`examples/cnc-p2im.md`](examples/cnc-p2im.md) has the full transcript notes.
 
 ## Roadmap
 
@@ -857,12 +860,13 @@ Done:
 - Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt) and [Modbus RTU](#modbus-rtu).
 - Phase 5 beachhead. The `plant-floor` fixture boots from a vector table, takes one SysTick interrupt, answers one Modbus RTU read, and a short fuzz campaign writes a triage bucket for a planted fetch. `examples/stm32f4_clock.yaml` is the map and the procedure for an image you build. See [Plant-floor beachhead](#plant-floor-beachhead).
 - Phase 6. SP[1:0] are RAZ/WI, `register_block` `follow` tracks enable bits, and a `bitband` region maps the Cortex-M alias windows. See [Stack pointer, ready bits, and bit-band](#stack-pointer-ready-bits-and-bit-band). Stock `jig-emu run` on `06230276f7344c89e8259751e4c98b19200e936e` then booted the published P2IM CNC image (grbl 0.8c, STM32F407VG) to the USART2 banner. The odd Atollic `_estack` (`0x2001FFFF`) was left unchanged. The binary is not in this tree, and CI does not run it. See [P2IM CNC](#p2im-cnc).
+- Grbl session on that image. GPIO BSRR, an instruction-paced `timer` on TIM2, and `rehost.serial` / `--serial-in` take the published CNC ELF from the banner through `$$`, `?`, `$X`, and `G91 G0 X1` to `<Idle,MPos:0.997,...>`. Asynchronous exceptions wait out an `IT` block. The binary is still not in this tree. See [Serial text](#serial-text) and [P2IM CNC](#p2im-cnc).
 
 Not in this version:
 
 - An authorized real Cortex-M industrial image in CI, or committed to the tree. The P2IM CNC smoke is a local run of a published research binary you download yourself. See [P2IM CNC](#p2im-cnc) and [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md). Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on.
 - HAL and RTOS call shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
-- A full rehost of one industrial image. On the P2IM CNC smoke, TIM2, GPIO BSRR, and the EEPROM path were still unmodeled. The image still printed the Grbl banner and then waited on an empty USART2 RX. Those stubs are target-specific and are not in this tree.
+- A full rehost of one industrial image. The P2IM CNC session models the step timer and GPIO set/reset far enough for one unlocked `G0` to finish and report Idle. TIM4 (g540) is still unmapped, pulse timing is an instruction count, and the EEPROM checksum still fails on a cold boot because that storage is a RAM buffer inside the image. See [P2IM CNC](#p2im-cnc).
 - Phase 7: QEMU and Renode adapters on `CpuBackend`, and a RISC-V backend.
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
 - A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.

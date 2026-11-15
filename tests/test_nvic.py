@@ -807,3 +807,69 @@ def test_restored_nvic_pending_bit_is_delivered():
     result = machine.run()
     assert result.status == "halted", result.detail
     assert machine.read_u32(0x20000000) == 1
+
+
+def test_async_irq_waits_until_the_it_block_finishes():
+    """A pending SysTick is not taken on the predicated instructions.
+
+    Redirecting PC in the middle of an IT block does not stick, and the
+    following exception return then reads ordinary stack data as xPSR.
+    """
+    core = FakeCore()
+    nvic = Nvic(core)
+    core.regs["msp"] = core.regs["sp"] = 0x20001000
+    core.regs["xpsr"] = 1 << 24
+    core.w32(EXC_SYSTICK * 4, 0x201)
+    # ite ne is 0xBF14, then two following halfwords, then nop.
+    core.write_mem(0x100, bytes.fromhex("14bf0123002300bf"))
+    assert nvic.service(0x100, 2) == "retire"
+    assert nvic.it_remaining == 2
+    nvic.systick_pending = True
+    assert nvic.service(0x102, 2) == "retire"
+    assert nvic.it_remaining == 1
+    assert EXC_SYSTICK not in nvic.active
+    assert nvic.service(0x104, 2) == "retire"
+    assert nvic.it_remaining == 0
+    assert nvic.service(0x106, 2) == REDIRECT
+    assert nvic.fault is None
+    assert EXC_SYSTICK in nvic.active
+    assert core.regs["pc"] & ~1 == 0x200
+
+
+def test_it_block_on_unicorn_does_not_fault_the_return():
+    source = _vector_table((EXC_SYSTICK, "systick")) + """
+        reset:
+            movw r2, #0
+            movt r2, #0x2000
+            movs r0, #0
+            str r0, [r2, #0]
+            movw r3, #0xe010
+            movt r3, #0xe000
+            movs r1, #30
+            str r1, [r3, #4]
+            movs r1, #4
+            str r1, [r3, #8]
+            movs r1, #7
+            str r1, [r3, #0]
+            cmp r0, #0
+            .word 0x2307BF0C
+            movs r3, #9
+            str r3, [r2, #4]
+            bkpt #0
+        systick:
+            movw r2, #0
+            movt r2, #0x2000
+            movs r1, #1
+            str r1, [r2, #0]
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[_SYSTICK],
+        boot={"mode": "vector", "vector_base": 0},
+        run={"timeout_ms": 1000, "max_instructions": 2000},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000000) == 1
+    assert machine.read_u32(0x20000004) == 7

@@ -27,8 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="jig-emu",
         description=(
-            "Rehost a firmware image you are authorized to analyze. "
-            "jig-emu does not download or bundle firmware."
+            "Jig: a machine shop for plant-controller firmware "
+            "(emulate, instrument, fuzz, triage). "
+            "jig-emu does not download or bundle firmware. "
+            "The Python import package is rehost."
         ),
     )
     parser.add_argument("--version", action="version", version=f"jig-emu {__version__}")
@@ -63,6 +65,42 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--modbus-uart",
         help="UART peripheral for --modbus-read / --modbus-write (default: the only UART)",
+    )
+    run.add_argument(
+        "--serial-in",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="ASCII chunk for UART RX. Repeatable. Escapes: \\n \\r \\t \\\\ \\xHH. "
+        "With --serial-idle each chunk is its own line; otherwise the chunks are concatenated.",
+    )
+    run.add_argument(
+        "--serial-file",
+        help="Raw bytes queued on UART RX as one chunk. Combined with --serial-in.",
+    )
+    run.add_argument(
+        "--serial-uart",
+        help="UART for --serial-in / --serial-file (default: the only UART)",
+    )
+    run.add_argument(
+        "--serial-after",
+        type=int,
+        metavar="N",
+        help="Queue serial RX once N instructions have retired (0 queues before the first)",
+    )
+    run.add_argument(
+        "--serial-idle",
+        type=int,
+        metavar="N",
+        help="Queue the next serial chunk after TX has been quiet for N instructions. "
+        "The first chunk waits until TX has grown, so a banner can finish first.",
+    )
+    run.add_argument(
+        "--serial-settle",
+        type=int,
+        metavar="N",
+        help="Before the last --serial-in / --serial-file chunk, wait N extra instructions. "
+        "Requires --serial-idle. Use it when the guest keeps working after it has stopped transmitting.",
     )
 
     fuzz = sub.add_parser(
@@ -153,8 +191,9 @@ def _plugins() -> int:
     print("peripherals:")
     described = {
         "uart": "TX byte log, RX queue, status flags, optional RX IRQ",
-        "gpio": "output latch and sampled input",
+        "gpio": "output latch, sampled input, optional BSRR set/reset",
         "systick": "per-instruction CTRL/LOAD/VAL/CALIB",
+        "timer": "instruction-paced counter that can pend an IRQ",
         "register_block": "config-defined 32-bit registers, with optional follow bits",
         "bitband": "Cortex-M bit-band alias onto a target address",
         "unimplemented": "log the access and return read_default",
@@ -327,6 +366,7 @@ def _run(args: argparse.Namespace) -> int:
     if data is not None:
         FuzzHarness(machine).apply(data)
     _queue_modbus(args, machine)
+    _queue_serial(args, machine)
     result = machine.run()
     dumps = [_dump_line(machine, spec) for spec in args.dump]
     print(
@@ -356,6 +396,73 @@ def _queue_modbus(args: argparse.Namespace, machine: Machine) -> None:
         slave, address, value = _modbus_triple(args.modbus_write, "SLAVE:ADDRESS:VALUE")
         frame = write_single_register(slave, address, value)
     deliver(machine, frame, uart=args.modbus_uart)
+
+
+def _queue_serial(args: argparse.Namespace, machine: Machine) -> None:
+    """Queue UART RX from ``--serial-in`` / ``--serial-file``, now or mid-run."""
+    chunks = _serial_chunks(args)
+    if (
+        not chunks
+        and args.serial_after is None
+        and args.serial_idle is None
+        and args.serial_settle is None
+        and not args.serial_uart
+    ):
+        return
+    if not chunks:
+        raise RehostError(
+            "--serial-after, --serial-idle, --serial-settle, and --serial-uart "
+            "need --serial-in or --serial-file"
+        )
+    if args.serial_after is not None and args.serial_after < 0:
+        raise RehostError("--serial-after must be >= 0")
+    if args.serial_idle is not None and args.serial_idle < 1:
+        raise RehostError("--serial-idle must be >= 1")
+    if args.serial_settle is not None and args.serial_settle < 0:
+        raise RehostError("--serial-settle must be >= 0")
+    if args.serial_settle and args.serial_idle is None:
+        raise RehostError("--serial-settle requires --serial-idle")
+    from rehost.serial import attach_feed, deliver
+
+    settles = None
+    if args.serial_settle:
+        settles = [0] * len(chunks)
+        settles[-1] = args.serial_settle
+
+    if args.serial_idle is None and (args.serial_after is None or args.serial_after == 0):
+        deliver(machine, b"".join(chunks), uart=args.serial_uart)
+        return
+    if args.serial_idle is None:
+        # One shot after N instructions. Chunks share that moment.
+        attach_feed(
+            machine,
+            [b"".join(chunks)],
+            uart=args.serial_uart,
+            after_instructions=args.serial_after,
+        )
+        return
+    attach_feed(
+        machine,
+        chunks,
+        uart=args.serial_uart,
+        after_instructions=args.serial_after,
+        idle_instructions=args.serial_idle,
+        settle_before=settles,
+    )
+
+
+def _serial_chunks(args: argparse.Namespace) -> list[bytes]:
+    from rehost.serial import decode_escapes
+
+    chunks: list[bytes] = []
+    for text in args.serial_in:
+        chunks.append(decode_escapes(text))
+    if args.serial_file:
+        path = Path(args.serial_file)
+        if not path.is_file():
+            raise RehostError(f"serial file not found: {path}")
+        chunks.append(path.read_bytes())
+    return chunks
 
 
 def _modbus_triple(text: str, shape: str) -> tuple[int, int, int]:

@@ -12,7 +12,7 @@ from rehost.config import load_config
 from rehost.errors import ConfigError
 from rehost.fuzz import FuzzHarness, encode_mmio_script
 from rehost.machine import Machine
-from rehost.peripherals import Gpio, RegisterBlock, SysTick, Uart, Unimplemented
+from rehost.peripherals import Gpio, RegisterBlock, SysTick, Timer, Uart, Unimplemented
 from tests.helpers import machine_from_asm
 
 
@@ -75,6 +75,111 @@ def test_gpio_latch_and_loopback():
     assert gpio.read(4, 4) == 0x3
     gpio.write(1, 1, 0xFF)
     assert gpio.odr == 0xFF03
+
+
+def test_timer_update_sets_sr_and_reports_irq():
+    timer = Timer(
+        name="tim2",
+        base=0x40000000,
+        size=0x400,
+        config={"irq": 28, "tick_every": 3},
+    )
+    timer.cpu_clock = True
+    timer.write(0x0C, 4, 0x1)
+    assert timer.consume_cpu_tick() is None
+    timer.write(0x00, 4, 0x1)
+    assert timer.consume_cpu_tick() is None
+    assert timer.consume_cpu_tick() is None
+    assert timer.consume_cpu_tick() == 28
+    assert timer.read(0x10, 4) & 0x1
+    # The update flag is still set, so another period does not start.
+    assert timer.consume_cpu_tick() is None
+    timer.write(0x10, 4, 0)
+    timer.write(0x34, 4, 0x10)
+    assert timer.consume_cpu_tick() is None
+    assert timer.consume_cpu_tick() is None
+    assert timer.consume_cpu_tick() == 28
+    assert timer.read(0x10, 4) & 0x3 == 0x3
+    # Read-modify-write clear of the update flag, the pattern TIM2_IRQHandler uses.
+    sr = timer.read(0x10, 4)
+    timer.write(0x10, 4, sr & ~1)
+    assert timer.read(0x10, 4) & 0x1 == 0
+    assert timer.read(0x10, 4) & 0x2
+    restored = timer.snapshot_state()
+    timer.write(0x00, 4, 0)
+    timer.restore_state(restored)
+    assert timer.read(0x00, 4) & 0x1
+    assert timer.events == restored["events"]
+
+
+def test_timer_irq_reaches_the_handler():
+    lines = [".word 0x20001000", ".thumb_word reset"]
+    lines.extend(".word 0" for _ in range(14))
+    lines.append(".thumb_word tim")
+    source = "\n".join(lines) + """
+        reset:
+            movw r4, #0xe100
+            movt r4, #0xe000
+            movs r1, #1
+            str r1, [r4, #0]
+            movw r0, #0
+            movt r0, #0x4000
+            str r1, [r0, #0xc]
+            str r1, [r0, #0]
+            movw r2, #0
+            movt r2, #0x2000
+        wait:
+            ldr r3, [r2, #0]
+            cmp r3, #1
+            bne wait
+            bkpt #0
+        tim:
+            movw r2, #0
+            movt r2, #0x2000
+            movs r1, #1
+            str r1, [r2, #0]
+            movw r0, #0
+            movt r0, #0x4000
+            movs r1, #0
+            str r1, [r0, #0x10]
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "tim2",
+                "base": 0x40000000,
+                "size": 0x400,
+                "perms": "rw",
+                "peripheral": "timer",
+                "config": {"irq": 0, "tick_every": 32},
+            }
+        ],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000000) == 1
+    assert machine.peripheral("tim2").events >= 1
+
+
+def test_gpio_bsrr_sets_and_resets_odr():
+    gpio = Gpio(
+        name="gpioe",
+        base=0x40021000,
+        size=0x400,
+        config={"odr_offset": 0x14, "idr_offset": 0x10, "bsrr_offset": 0x18, "idr": 0xFFFF},
+    )
+    gpio.write(0x18, 2, 0x0005)
+    assert gpio.odr == 0x0005
+    gpio.write(0x1A, 2, 0x0001)
+    assert gpio.odr == 0x0004
+    # Both halves in one word: reset wins on the overlap.
+    gpio.write(0x18, 4, 0x0004000F)
+    assert gpio.odr == 0x000B
+    assert gpio.read(0x18, 4) == 0
+    assert gpio.read(0x10, 4) == 0xFFFF
 
 
 def test_systick_poll_reloads_and_sets_countflag():
@@ -550,11 +655,11 @@ def test_stm32f4_clock_template_returns_ready_bits():
     assert not any(region.base == 0xE000E000 for region in machine.config.memory)
 
 
-def test_cnc_p2im_map_is_the_clock_template_with_smoke_limits():
-    """The CNC example is the F4 map plus the recorded run limits.
+def test_cnc_p2im_map_extends_the_clock_template():
+    """The CNC example keeps the F4 map and adds the Grbl session peripherals.
 
-    The firmware binary stays out of the tree. This only locks the machine
-    file so a later edit of the template cannot silently diverge.
+    The firmware binary stays out of the tree. TIM2 is a timer and GPIO A-E
+    gain BSRR; every other region still matches the template.
     """
     root = Path(__file__).resolve().parents[1]
     clock = load_config(root / "examples" / "stm32f4_clock.yaml")
@@ -564,17 +669,36 @@ def test_cnc_p2im_map_is_the_clock_template_with_smoke_limits():
     assert cnc.arch == clock.arch
     assert cnc.endian == clock.endian
     assert cnc.load_base == clock.load_base == 0x08000000
-    assert cnc.memory == clock.memory
     assert cnc.boot == clock.boot
     assert cnc.unmapped == clock.unmapped
     assert cnc.fuzz is None and clock.fuzz is None
-    assert cnc.run.timeout_ms == 15000
-    assert cnc.run.max_instructions == 2_000_000
+    assert cnc.run.timeout_ms == 0
+    assert cnc.run.max_instructions == 2_400_000
     assert cnc.run.trace_limit == 128
     assert cnc.run.halt_on_bkpt == clock.run.halt_on_bkpt
     assert cnc.run.halt_addresses == clock.run.halt_addresses
     assert cnc.run.collect_coverage == clock.run.collect_coverage
     assert clock.run.timeout_ms == 2000
+
+    clock_by_name = {region.name: region for region in clock.memory}
+    cnc_by_name = {region.name: region for region in cnc.memory}
+    assert set(clock_by_name) == set(cnc_by_name)
+    promoted = {"tim2", "gpioa", "gpiob", "gpioc", "gpiod", "gpioe"}
+    for name, region in cnc_by_name.items():
+        template = clock_by_name[name]
+        assert region.base == template.base
+        assert region.size == template.size
+        assert region.perms == template.perms
+        if name not in promoted:
+            assert region == template
+    assert cnc_by_name["tim2"].peripheral == "timer"
+    assert cnc_by_name["tim2"].peripheral_config["irq"] == 28
+    for name in ("gpioa", "gpiob", "gpioc", "gpiod", "gpioe"):
+        region = cnc_by_name[name]
+        assert region.peripheral == "gpio"
+        assert region.peripheral_config["bsrr_offset"] == 0x18
+        assert region.peripheral_config["odr_offset"] == 0x14
+        assert region.peripheral_config["idr_offset"] == 0x10
 
 
 def test_ready_bits_load_from_toml(tmp_path: Path):

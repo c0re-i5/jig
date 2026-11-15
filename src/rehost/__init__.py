@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Firmware-agnostic embedded rehosting for authorized security research.
+"""Jig, a machine shop for plant-controller firmware.
 
-The researcher supplies the firmware image. This package supplies the CPU
-backend interface, config-driven MMIO plugins, snapshots, and a fuzz harness.
+The import package is still ``rehost``. The researcher supplies the firmware
+image. This package supplies the CPU backend interface, config-driven MMIO
+plugins, snapshots, and a fuzz harness.
 """
 
 from rehost.backends import available_backends, register_backend
@@ -14,6 +15,7 @@ from rehost.errors import (
     MachineError,
     ModbusError,
     RehostError,
+    SerialError,
 )
 from rehost.fuzz import FuzzHarness, PersistentHarness, encode_mmio_script, parse_mmio_script
 from rehost.machine import Machine
@@ -33,6 +35,7 @@ __all__ = [
     "Peripheral",
     "PersistentHarness",
     "RehostError",
+    "SerialError",
     "__version__",
     "available_backends",
     "available_plugins",

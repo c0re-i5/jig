@@ -26,7 +26,11 @@ Modeled
     BASEPRI. BASEPRI compares group priority and is disabled when its group
     field is 0. NMI is -2, HardFault is -1, and both are fixed.
 
-Not modeled
+    Not modeled
+    Taking an asynchronous exception in the middle of an IT block. The block
+    runs to completion and the pending exception is taken on the next
+    instruction. Redirecting PC between the predicated instructions does not
+    stick on this backend, and the stacked xPSR would be read back as data.
     Tail-chaining and late arrival. A new exception taken as another returns is
     unstacked and then stacked again, so register state matches the architecture
     and the stack pointer briefly moves back up.
@@ -151,6 +155,8 @@ class Nvic:
         self.scr = 0
         self.shcsr = 0
         self.fault = None
+        # Instructions still inside an IT block. Asynchronous entry waits.
+        self.it_remaining = 0
 
     def snapshot_state(self) -> dict:
         """Plain data for a machine snapshot. Keys stay JSON-friendly."""
@@ -168,6 +174,7 @@ class Nvic:
             "active": sorted(self.active),
             "priority": list(self.external_priority),
             "shpr": {str(exc): self.shpr[exc] for exc in _SHPR_EXCEPTIONS},
+            "it_remaining": self.it_remaining,
         }
 
     def restore_state(self, state: dict) -> None:
@@ -211,6 +218,9 @@ class Nvic:
                 raise MachineError(f"nvic active exception {number} is out of range")
             if number:
                 self.active.add(number)
+        self.it_remaining = int(state.get("it_remaining", 0))
+        if self.it_remaining < 0 or self.it_remaining > 4:
+            raise MachineError(f"nvic it_remaining {self.it_remaining} is out of range")
 
     def pend(self, exc: int) -> None:
         """Latch a system exception, or an external exception number."""
@@ -244,23 +254,31 @@ class Nvic:
         except BackendError as exc:
             self.fault = f"could not read instruction at {address:#x}: {exc}"
             return STOP
+        in_it = self.it_remaining > 0
+        if in_it:
+            self.it_remaining -= 1
         if first in (_WFI, _WFE):
-            exc_num = self.select_exception()
+            exc_num = None if in_it else self.select_exception()
             if exc_num is not None:
                 # The hint completes; the stacked PC is the following instruction.
                 self.enter(exc_num, (address + 2) & 0xFFFFFFFF)
                 return STOP if self.fault else REDIRECT
             self._write_pc((address + 2) & 0xFFFFFFFF)
             return SKIP
-        exc_num = self.select_exception()
-        if exc_num is not None:
-            self.enter(exc_num, address & ~1)
-            return STOP if self.fault else REDIRECT
+        if not in_it:
+            exc_num = self.select_exception()
+            if exc_num is not None:
+                self.enter(exc_num, address & ~1)
+                return STOP if self.fault else REDIRECT
         outcome = self._try_exception_return(address, first)
         if self.fault:
             return STOP
         if outcome is not None:
             return outcome
+        if not in_it:
+            length = _it_block_length(first)
+            if length:
+                self.it_remaining = length
         return RETIRE
 
     def request_exception(self, exc: int, return_pc: int) -> None:
@@ -934,6 +952,23 @@ class Nvic:
                 self.external_pending[number] = True
             elif owner == "icpr":
                 self.external_pending[number] = False
+
+def _it_block_length(first: int) -> int:
+    """How many following instructions an IT encoding covers, or 0.
+
+    Thumb IT is ``0xBFxx`` with a non-zero mask. The lowest set bit of the
+    4-bit mask selects the length: ``0b1000`` is one instruction, ``0b0100``
+    is two, ``0b0010`` is three, and ``0b0001`` is four. Mask 0 is NOP, YIELD,
+    WFE, WFI, or SEV, not an IT block.
+    """
+    if (first & 0xFF00) != 0xBF00:
+        return 0
+    mask = first & 0xF
+    if mask == 0:
+        return 0
+    low = mask & -mask
+    return {8: 1, 4: 2, 2: 3, 1: 4}.get(low, 0)
+
 
 def _looks_like_exc_return(value: int) -> bool:
     return (value & 0xF0000000) == 0xF0000000

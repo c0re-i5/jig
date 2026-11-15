@@ -17,8 +17,10 @@
 # example, has 2 MiB of flash and 192 KiB of system SRAM plus the 64 KiB CCM.
 #
 # What is modeled
-#   gpioa     STM32 GPIO offsets: IDR 0x10, ODR 0x14. MODER, BSRR, and AFR
-#             are not cells. A write there is logged and a read returns 0.
+#   gpioa     STM32 GPIO offsets: IDR 0x10, ODR 0x14. Set bsrr_offset to 0x18
+#             when a BSRR write should set or clear ODR; this file does not,
+#             so a BSRR write is logged and ignored. MODER and AFR are not
+#             cells. A write there is logged and a read returns 0.
 #   usart2    Jig byte UART at the USART2 address. Status at +0, data at +4.
 #             TXE (bit 7) and TC (bit 6) read as set, because this stub has no
 #             shift register. RXNE (bit 5) is set while RX is non-empty.
