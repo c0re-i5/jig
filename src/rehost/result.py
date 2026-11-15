@@ -47,6 +47,9 @@ class RunResult:
     # the tail without storing the whole path.
     recent_pcs: tuple[int, ...] = ()
     recent_edges: tuple[int, ...] = ()
+    # Modeled AIRCR resets performed during this run. A halt on the next
+    # silent request does not increment this.
+    resets: int = 0
 
     @property
     def faulted(self) -> bool:
@@ -78,6 +81,7 @@ def format_report(
         f"sp: {result.sp:#010x}",
         f"lr: {result.lr:#010x}",
         f"instructions: {result.instructions}",
+        f"resets: {result.resets}",
     ]
     lines.extend(peripheral_lines)
     if dumps:

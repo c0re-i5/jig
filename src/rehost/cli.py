@@ -168,6 +168,14 @@ def main(argv: list[str] | None = None) -> int:
         "firmware",
         help="ELF32 or Intel HEX you already have. Not executed, and not fetched.",
     )
+    inspect.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Include guessed RCC/MCG register blocks and UART stubs in the report. "
+            "The default report leaves those constants unimplemented."
+        ),
+    )
 
     map_parser = sub.add_parser(
         "map",
@@ -195,6 +203,15 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Overwrite --output if it already exists.",
+    )
+    init.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Promote a recognized RCC/MCG constant to a register_block and a "
+            "UART-like constant to a uart stub. Those rules are guesses. "
+            "The default scaffold leaves the windows unimplemented."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -261,7 +278,7 @@ def _read_user_image(path: str) -> bytes:
 def _inspect(args: argparse.Namespace) -> int:
     from rehost.mapinit import format_inspection, inspect_image
 
-    info = inspect_image(_read_user_image(args.firmware))
+    info = inspect_image(_read_user_image(args.firmware), aggressive=args.aggressive)
     print(format_inspection(info))
     return 0
 
@@ -270,7 +287,7 @@ def _map_init(args: argparse.Namespace) -> int:
     from rehost.mapinit import inspect_image, machine_name_from_stem, render_machine_yaml
 
     blob = _read_user_image(args.firmware)
-    info = inspect_image(blob)
+    info = inspect_image(blob, aggressive=args.aggressive)
     name = args.name or machine_name_from_stem(Path(args.firmware).stem)
     text = render_machine_yaml(info, name=name)
     if args.output:

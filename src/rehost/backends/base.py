@@ -148,6 +148,15 @@ class CpuBackend(ABC):
         """Clear sticky fault state from a previous run."""
         self.cpu_fault = None
 
+    def take_reset_request(self) -> str | None:
+        """Return and clear a pending core reset, or None.
+
+        ``AIRCR.SYSRESETREQ`` and ``AIRCR.VECTRESET`` are the strings the
+        Unicorn backend produces. The machine decides whether to reset or
+        halt. Backends without a system control block return None.
+        """
+        return None
+
     def reset_cpu_state(self) -> None:
         """Restore architectural interrupt state to reset values."""
         self.pending_irqs.clear()

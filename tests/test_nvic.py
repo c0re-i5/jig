@@ -816,21 +816,300 @@ def test_thread_psp_stacks_on_psp_and_returns_with_exc_return_fd():
     assert machine.backend.read_register("msp") == 0x20001000
 
 
-def test_aircr_sysresetreq_stops_the_run():
-    source = """
-        movw r0, #0xed0c
-        movt r0, #0xe000
-        movw r1, #4
-        movt r1, #0x05fa
-        str r1, [r0, #0]
-        movs r0, #1
-        bkpt #0
+def test_aircr_reset_bits_are_a_request_not_a_fault():
+    nvic = Nvic(FakeCore())
+    assert nvic.io_write(0xE000ED0C, 4, (0x05FA << 16) | (1 << 2)) is True
+    assert nvic.reset_request == "AIRCR.SYSRESETREQ"
+    assert nvic.fault is None
+    assert nvic.io_write(0xE000ED0C, 4, (0x05FA << 16) | 1) is True
+    assert nvic.reset_request == "AIRCR.VECTRESET"
+    # A bad key does not change the latched request or PRIGROUP.
+    assert nvic.io_write(0xE000ED0C, 4, (0x1234 << 16) | (1 << 2) | (5 << 8)) is True
+    assert nvic.reset_request == "AIRCR.VECTRESET"
+    assert nvic.prigroup == 0
+    assert nvic.io_write(0xE000ED0C, 4, (0x05FA << 16) | (1 << 2) | 1) is True
+    assert nvic.reset_request == "AIRCR.SYSRESETREQ"
+
+
+def _reset_program(low: int, key: int = 0x05FA) -> str:
+    """Vector-table program. Pass 1 dirties core state and writes AIRCR.
+
+    The low half of the store is ``low`` (SYSRESETREQ is 4, VECTRESET is 1).
+    ``key`` is the VECTKEY halfword. Pass 2 records CONTROL, PRIMASK, SP,
+    ISER, and AIRCR. The word at 0x20000004 stays 0 unless the store after
+    the AIRCR write actually retires.
     """
-    machine = machine_from_asm(source)
+    return _vector_table(sp=0x20001003) + f"""
+        reset:
+            movw r4, #0
+            movt r4, #0x2000
+            ldr r0, [r4, #0]
+            adds r0, #1
+            str r0, [r4, #0]
+            cmp r0, #1
+            bne continue
+            b request
+        continue:
+            mrs r1, control
+            str r1, [r4, #8]
+            mrs r1, primask
+            str r1, [r4, #12]
+            mov r1, sp
+            str r1, [r4, #16]
+            movw r3, #0xe100
+            movt r3, #0xe000
+            ldr r1, [r3, #0]
+            str r1, [r4, #20]
+            movw r3, #0xed0c
+            movt r3, #0xe000
+            ldr r1, [r3, #0]
+            str r1, [r4, #24]
+            bkpt #0
+        request:
+            movw r0, #0x0c00
+            movt r0, #0x2000
+            mov sp, r0
+            movs r1, #2
+            msr control, r1
+            cpsid i
+            movw r3, #0xe100
+            movt r3, #0xe000
+            movs r1, #1
+            str r1, [r3, #0]
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #{low}
+            movt r1, #{key:#x}
+            str r1, [r0, #0]
+            movs r1, #0xff
+            str r1, [r4, #4]
+            bkpt #0
+    """
+
+
+def test_sysresetreq_reloads_sp_pc_and_continues():
+    machine = machine_from_asm(
+        _reset_program(0x0604),
+        boot={"mode": "vector", "vector_base": 0},
+    )
     result = machine.run()
-    assert result.status == "fault"
+    assert result.status == "halted", result.detail
+    assert result.resets == 1
+    assert machine.read_u32(0x20000000) == 2
+    # The instruction after the AIRCR store did not retire.
+    assert machine.read_u32(0x20000004) == 0
+    assert machine.read_u32(0x20000008) == 0  # CONTROL
+    assert machine.read_u32(0x2000000C) == 0  # PRIMASK
+    # Odd vector SP, low bits cleared, not the 0x20000C00 written before reset.
+    assert machine.read_u32(0x20000010) == 0x20001000
+    assert machine.read_u32(0x20000014) == 0  # ISER
+    assert machine.read_u32(0x20000018) == 0xFA050000  # PRIGROUP back at 0
+    assert machine.backend.read_register("msp") == 0x20001000
+    assert machine.backend.read_register("control") == 0
+
+
+def test_vectreset_reloads_the_same_way():
+    machine = machine_from_asm(
+        _reset_program(1),
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.resets == 1
+    assert machine.read_u32(0x20000000) == 2
+    assert machine.read_u32(0x20000010) == 0x20001000
+    assert machine.read_u32(0x20000004) == 0
+
+
+def test_aircr_without_the_vector_key_does_not_reset():
+    machine = machine_from_asm(
+        _reset_program(4, key=0x1234),
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.resets == 0
+    assert machine.read_u32(0x20000000) == 1
+    assert machine.read_u32(0x20000004) == 0xFF
+
+
+def test_halt_on_reset_stops_before_the_core_restarts():
+    machine = machine_from_asm(
+        _reset_program(4),
+        boot={"mode": "vector", "vector_base": 0},
+        run={"halt_on_reset": True, "max_instructions": 10000},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.detail == "AIRCR.SYSRESETREQ"
+    assert result.resets == 0
+    assert machine.read_u32(0x20000000) == 1
+    assert machine.read_u32(0x20000004) == 0
+
+
+def test_entry_boot_is_what_a_reset_reloads():
+    source = """
+        start:
+            movw r4, #0
+            movt r4, #0x2000
+            ldr r0, [r4, #0]
+            adds r0, #1
+            str r0, [r4, #0]
+            cmp r0, #1
+            bne done
+            movw r0, #0x0f00
+            movt r0, #0x2000
+            mov sp, r0
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #4
+            movt r1, #0x05fa
+            str r1, [r0, #0]
+            bkpt #0
+        done:
+            mov r1, sp
+            str r1, [r4, #4]
+            bkpt #0
+    """
+    machine = machine_from_asm(
+        source,
+        boot={"mode": "entry", "sp": 0x20000800, "entry": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.resets == 1
+    assert machine.read_u32(0x20000000) == 2
+    assert machine.read_u32(0x20000004) == 0x20000800
+
+
+def test_silent_reset_loop_stops_before_the_instruction_cap():
+    from rehost.fuzz import is_fuzz_crash
+
+    source = _vector_table() + """
+        reset:
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #4
+            movt r1, #0x05fa
+            str r1, [r0, #0]
+            b reset
+    """
+    machine = machine_from_asm(
+        source,
+        boot={"mode": "vector", "vector_base": 0},
+        run={"timeout_ms": 1000, "max_instructions": 50000, "max_resets": 3},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert "silent core resets" in result.detail
     assert "SYSRESETREQ" in result.detail
-    assert result.registers["r0"] != 1
+    assert result.resets == 3
+    assert result.instructions < 500
+    assert is_fuzz_crash(result, None) is False
+
+
+def test_uart_output_breaks_the_silent_reset_streak_and_tx_is_kept():
+    source = _vector_table() + """
+        reset:
+            movw r4, #0
+            movt r4, #0x2000
+            ldr r0, [r4, #0]
+            adds r0, #1
+            str r0, [r4, #0]
+            cmp r0, #1
+            beq do_reset
+            cmp r0, #2
+            beq do_tx
+            bkpt #0
+        do_reset:
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #4
+            movt r1, #0x05fa
+            str r1, [r0, #0]
+            bkpt #0
+        do_tx:
+            movw r2, #0
+            movt r2, #0x4000
+            movs r1, #0x41
+            str r1, [r2, #0]
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #4
+            movt r1, #0x05fa
+            str r1, [r0, #0]
+            bkpt #0
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "uart0",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "uart",
+            }
+        ],
+        boot={"mode": "vector", "vector_base": 0},
+        run={"timeout_ms": 1000, "max_instructions": 10000, "max_resets": 1},
+    )
+    machine.boot()
+    machine.peripheral("uart0").queue_rx(b"Z")
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.resets == 2
+    assert machine.read_u32(0x20000000) == 3
+    uart = machine.peripheral("uart0")
+    assert bytes(uart.tx) == b"A"
+    assert uart.rx == bytearray()
+
+
+def test_sysresetreq_restores_register_block_state():
+    source = _vector_table() + """
+        reset:
+            movw r4, #0
+            movt r4, #0x2000
+            ldr r0, [r4, #0]
+            adds r0, #1
+            str r0, [r4, #0]
+            cmp r0, #1
+            bne read_back
+            movw r2, #0
+            movt r2, #0x4001
+            movs r1, #0x22
+            str r1, [r2, #0]
+            movw r0, #0xed0c
+            movt r0, #0xe000
+            movw r1, #4
+            movt r1, #0x05fa
+            str r1, [r0, #0]
+            bkpt #0
+        read_back:
+            movw r2, #0
+            movt r2, #0x4001
+            ldr r1, [r2, #0]
+            str r1, [r4, #4]
+            bkpt #0
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "blk",
+                "base": 0x40010000,
+                "size": 0x10,
+                "perms": "rw",
+                "peripheral": "register_block",
+                "config": {"registers": {0: {"reset": 0x11, "writable": True}}},
+            }
+        ],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.resets == 1
+    assert machine.read_u32(0x20000004) == 0x11
 
 
 def test_restored_nvic_pending_bit_is_delivered():

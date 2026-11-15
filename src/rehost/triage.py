@@ -743,7 +743,7 @@ def _parse(detail: str, result: RunResult) -> _Parsed:
     match = _HALT.fullmatch(detail)
     if match:
         return _Parsed("halt_crash", "halt", address=_addr(match.group(1)))
-    if "SYSRESETREQ" in detail:
+    if "SYSRESETREQ" in detail or "VECTRESET" in detail:
         return _Parsed("other", "reset")
     return _Parsed("other", "unknown")
 
@@ -887,8 +887,12 @@ def _explain(parsed: _Parsed, detail: str) -> str:
         )
     if parsed.reason == "reset":
         return (
-            f"The guest wrote AIRCR.SYSRESETREQ ({detail}). The model stops the run "
-            "instead of resetting the core."
+            f"The guest wrote an AIRCR reset request ({detail}). "
+            "The default models SYSRESETREQ and VECTRESET: the core reloads "
+            "SP and PC from the boot vector or boot.entry and keeps running. "
+            "run.halt_on_reset stops on the first request. run.max_resets "
+            "stops a streak of resets that produced no new UART output, so "
+            "the instruction cap is not spent on a silent reboot loop."
         )
     if parsed.reason.startswith("unicorn-exc-"):
         return (

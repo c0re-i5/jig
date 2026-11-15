@@ -170,6 +170,148 @@ def test_raw_bin_is_rejected_and_hex_uses_the_lowest_address():
     assert flash.base == 0x08000000
 
 
+def _image_with_constants(
+    constants: list[int],
+    *,
+    base: int = 0x08000000,
+    sp: int = 0x20001000,
+    reset: int | None = None,
+) -> bytes:
+    if reset is None:
+        reset = (base + 9) | 1
+    blob = bytearray()
+    blob += sp.to_bytes(4, "little")
+    blob += reset.to_bytes(4, "little")
+    blob += b"\x00" * 8
+    for word in constants:
+        blob += word.to_bytes(4, "little")
+    return build_elf([(base, base, bytes(blob), len(blob), 5)])
+
+
+def test_default_scaffold_maps_bitband_and_leaves_uart_unimplemented():
+    info = inspect_image(_cnc_shaped())
+    assert info.aggressive is False
+    mmio = next(region for region in info.regions if region.base == 0x40004400)
+    assert mmio.peripheral == "unimplemented"
+    sram_alias = next(region for region in info.regions if region.name == "sram_bitband")
+    periph_alias = next(region for region in info.regions if region.name == "peripheral_bitband")
+    assert sram_alias.peripheral == "bitband"
+    assert periph_alias.base == 0x42000000
+    assert "target: 0x20000000" in "\n".join(sram_alias.extra)
+    text = render_machine_yaml(info, name="cnc-shaped")
+    assert "timeout_ms: 0" in text
+    assert "halt_on_reset: false" in text
+    assert "SP[1:0]" in text
+    assert "--aggressive" in text
+    assert "peripheral: uart" not in text
+    # K64-shaped SRAM stops at 0x20000000 and has no peripheral constant.
+    k64 = inspect_image(_k64_shaped())
+    assert not any(region.peripheral == "bitband" for region in k64.regions)
+
+
+def test_aggressive_promotes_stm32_rcc_and_uart_but_not_f4_gpioe():
+    elf = _image_with_constants([0x40023800, 0x40004400, 0x40021000, 0x40011000])
+    default = inspect_image(elf)
+    assert any(region.base == 0x40023800 and region.peripheral == "unimplemented" for region in default.regions)
+    info = inspect_image(elf, aggressive=True)
+    text = render_machine_yaml(info, name="f4-guess")
+    assert "peripheral: register_block" in text
+    assert "peripheral: uart" in text
+    assert "HSIRDY follows HSION" in text
+    from pathlib import Path
+    import tempfile
+
+    from rehost.machine import Machine
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "board.yaml"
+        path.write_text(text, encoding="utf-8")
+        loaded = load_config(path)
+        rcc = next(region for region in loaded.memory if region.name == "rcc")
+        assert rcc.base == 0x40023800
+        follow = rcc.peripheral_config["registers"][0]["follow"]
+        assert any(item["src"] == 0 and item["dst"] == 1 for item in follow)
+        assert rcc.peripheral_config["registers"][8]["follow"][0]["width"] == 2
+        usart2 = next(region for region in loaded.memory if region.name == "usart2")
+        assert usart2.peripheral_config["data_offset"] == 4
+        assert usart2.peripheral_config["status_offset"] == 0
+        # 0x40021000 is F4 GPIOE when the F4 RCC is present, not a second RCC.
+        gpioe = next(region for region in loaded.memory if region.base == 0x40021000)
+        assert gpioe.peripheral == "unimplemented"
+        machine = Machine(loaded)
+        block = machine.peripheral("rcc")
+        block.write(0, 4, 0)
+        assert block.read(0, 4) & 2 == 0
+        block.write(0, 4, 1 << 16)
+        assert block.read(0, 4) & (1 << 17)
+        uart = machine.peripheral("usart2")
+        assert uart.read(0, 4) & 0xC0
+        uart.write(4, 1, 0x41)
+        assert bytes(uart.tx) == b"A"
+        flash = machine.peripheral("flash_if")
+        flash.write(0, 1, 0x5)
+        assert flash.read(0, 4) == 0x5
+        assert flash.read(0x0C, 4) & 0x00010000 == 0
+
+
+def test_aggressive_does_not_call_f4_gpioe_an_rcc():
+    elf = _image_with_constants([0x40021000, 0x40020000])
+    info = inspect_image(elf, aggressive=True)
+    assert not any(region.peripheral == "register_block" for region in info.regions)
+    assert any(region.base == 0x40021000 and region.peripheral == "unimplemented" for region in info.regions)
+
+
+def test_aggressive_f1_rcc_uses_cfgr_at_offset_four():
+    elf = _image_with_constants([0x40021000, 0x40013800])
+    info = inspect_image(elf, aggressive=True)
+    text = render_machine_yaml(info, name="f1-guess")
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "board.yaml"
+        path.write_text(text, encoding="utf-8")
+        loaded = load_config(path)
+    rcc = next(region for region in loaded.memory if region.name == "rcc")
+    assert rcc.base == 0x40021000
+    assert "follow" in rcc.peripheral_config["registers"][4]
+    assert "follow" not in rcc.peripheral_config["registers"].get(8, {})
+    usart1 = next(region for region in loaded.memory if region.name == "usart1")
+    assert usart1.base == 0x40013800
+    assert usart1.peripheral == "uart"
+
+
+def test_aggressive_kinetis_mcg_and_uart_offsets():
+    elf = _image_with_constants(
+        [0x40064000, 0x4006A000],
+        base=0x00000000,
+        sp=0x1FFF0200,
+        reset=0x411,
+    )
+    info = inspect_image(elf, aggressive=True)
+    text = render_machine_yaml(info, name="k64-guess")
+    assert "IREFST follows IREFS" in text
+    from pathlib import Path
+    import tempfile
+
+    from rehost.machine import Machine
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "board.yaml"
+        path.write_text(text, encoding="utf-8")
+        loaded = load_config(path)
+        machine = Machine(loaded)
+    mcg = machine.peripheral("mcg")
+    mcg.write(0, 1, 0x04)
+    assert mcg.read(6, 1) & 0x10
+    uart = machine.peripheral("uart0")
+    assert uart.data_offset == 7
+    assert uart.status_offset == 4
+    assert uart.read(4, 1) & 0xC0
+    uart.write(7, 1, 0x55)
+    assert bytes(uart.tx) == b"U"
+
+
 def test_cli_map_init_and_inspect(tmp_path, capsys):
     elf_path = tmp_path / "Image"
     elf_path.write_bytes(_cnc_shaped())
@@ -190,3 +332,13 @@ def test_cli_map_init_and_inspect(tmp_path, capsys):
     assert code == 0
     assert "format: ELF32" in report
     assert "initial SP" in report
+    aggressive = tmp_path / "aggressive.yaml"
+    code = main(["map", "init", str(elf_path), "-o", str(aggressive), "--aggressive", "--name", "guess"])
+    assert code == 0, capsys.readouterr().err
+    guessed = load_config(aggressive)
+    assert guessed.name == "guess"
+    assert any(region.peripheral == "uart" for region in guessed.memory)
+    code = main(["inspect", str(elf_path), "--aggressive"])
+    report = capsys.readouterr().out
+    assert code == 0
+    assert "aggressive: yes" in report

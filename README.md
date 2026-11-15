@@ -127,10 +127,11 @@ The published P2IM CNC file is an ELF with two loadable segments. `jig-emu run -
 ```bash
 jig-emu inspect firmware.elf
 jig-emu map init firmware.elf -o board.yaml
+jig-emu map init firmware.elf --aggressive -o board.yaml
 jig-emu map init firmware.elf --name my-part -o board.yaml --force
 ```
 
-`inspect` prints the program headers, the vector table at the lowest file-backed address (initial SP and reset), and the suggested regions. `map init` writes YAML. Omit `-o` to print that YAML on stdout. `--force` overwrites an existing file. `--name` overrides the machine name; the default is the file stem.
+`inspect` prints the program headers, the vector table at the lowest file-backed address (initial SP and reset), and the suggested regions. `map init` writes YAML. Omit `-o` to print that YAML on stdout. `--force` overwrites an existing file. `--name` overrides the machine name; the default is the file stem. `--aggressive` is the opt-in guess described below. `inspect --aggressive` prints the same guess.
 
 What the file contains, and what it is not:
 
@@ -138,10 +139,26 @@ What the file contains, and what it is not:
 - **SRAM** covers the ELF's RAM segments. If the initial SP is the top of that RAM (including an odd `_estack` such as `0x2001FFFF`, which the CPU model word-aligns), the window ends there. If the SP sits inside the loaded RAM, the ELF does not say how big the part's SRAM is, and the window adds 64 KiB of slack. The comment says so.
 - **SysTick** is the real plugin at `0xE000E010`. The rest of the system control block stays with the CPU backend. Do not map over `0xE000E000`.
 - **`mmio_*` windows** are 1 KiB-aligned constants in `0x40000000..0x40100000` or `0x50000000..0x51000000`. Each is `unimplemented`: the access is logged once and the read returns 0. That is not a decoded peripheral. Thumb encodings can look like addresses; the alignment filter drops most of them, and a hit is still only a constant. If the image reads back a value it stored, delete `peripheral:` and the window is sticky RAM. If it spins on a ready bit, replace the offset with a `register_block` `follow` or `read_set`.
+- **Bit-band.** When the suggested SRAM covers `0x20000000`, the file emits the SRAM alias at `0x22000000`. When a peripheral constant was found, it emits the peripheral alias at `0x42000000`. Both are the Cortex-M3/M4 windows. Delete them for an M0 or M0+.
 - **`unmapped.action: log`** covers every other address. `-v` prints those accesses. A fetch of an unmapped address still faults.
-- Boot is `vector` at the vector table address. `run.max_instructions` is 1000000. A firmware loop will hit that cap.
+- Boot is `vector` at the vector table address. The boot comment says the CPU model clears SP[1:0], so an odd `_estack` is left as it is. `timeout_ms` is 0 and `max_instructions` is 1000000. The instruction cap is what stops a loop. `halt_on_reset` is false: `SYSRESETREQ` reboots the core and the run continues.
 
-The comments at the top of the YAML are the TODOs. A bit-band constant is mentioned and not turned into a 32 MiB alias. After the file loads, the next step is the same one as the beachhead template: run with `-v`, and promote the offsets the image actually polls. [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console) are hand-written maps that have already done that for two images. `map init` is how you start a third.
+`--aggressive` promotes constants it recognizes. The rules are guesses, and each promoted region says TODO:
+
+- `0x40023800` (seen more often than a Kinetis MCG constant) becomes an STM32F2/F4/F7-shaped RCC `register_block`. Ready bits follow the enable bits, and SWS copies SW. `0x40023C00` becomes the flash interface: ACR reads back, and `FLASH_SR.BSY` stays 0.
+- `0x40021000` is that same RCC guess only when `0x40023800` and the F4 GPIOA window `0x40020000` are both absent. On an F4 image it is GPIOE and stays `unimplemented`.
+- `0x40064000` becomes a Kinetis MCG block with the FEI-to-PEE follow rules (CLKST, PLLST, LOCK0, IREFST, OSCINIT0).
+- UART-like constants become `uart` stubs. STM32 status is `+0` and data is `+4`. Kinetis S1 is `+0x04` and D is `+0x07`. `rx_irq` is omitted. F4 USART1/USART6 are included only with the F4 RCC guess. F1 USART1 at `0x40013800` is included only with the F1 RCC guess, because that address is SYSCFG on F4.
+
+The default file does not promote any of those. It names them in a TODO and leaves the window `unimplemented`.
+
+The comments at the top of the YAML are the TODOs. After the file loads, run with `-v` and promote the offsets the image actually polls. [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console) are hand-written maps. `map init` is how you start another, and `--aggressive` is a head start, not a chip model.
+
+A local check on 15 Nov 2026, against the published ELFs (not stored in this tree, and not run in CI):
+
+- The default scaffold, 250000 instructions, still spins. CNC reads RCC `0x40023800` and the window returns 0, with no USART traffic. Console reads MCG `0x40064000` the same way. The new bit-band windows do not by themselves move a ready bit.
+- `map init --aggressive` on the CNC ELF, 700000 instructions, prints the EEPROM fallback, the `$0` through `$23` settings, and `Grbl 0.8c ['$' for help]` on the guessed USART2 (891 bytes, the same startup text as the hand-written map). PC is `0x0800400c`, in the USART2 poll. There is still no TIM2, no GPIO, and no `rx_irq`. The hand-written map reaches that banner in fewer instructions.
+- `map init --aggressive` on the Console ELF prints `main(): This is RIOT! (Version: 2018.04-vm-HEAD)` and a newline on the guessed UART0 (25000 instructions), then `bx r0` fetches the NMI slot at `0x8` and the run faults with an invalid instruction. It does not print `Welcome to RIOT!`. SIM, PORT, and the rest of the K64 are still `unimplemented`.
 
 ## Machine file
 
@@ -188,6 +205,8 @@ run:
   timeout_ms: 1000      # 0 means no time limit
   max_instructions: 1000000
   halt_on_bkpt: true
+  halt_on_reset: false  # true stops on the first SYSRESETREQ or VECTRESET
+  max_resets: 8         # silent reboot streak; 0 leaves only the other caps
   halt_addresses: []    # stop before executing these PCs
   trace_limit: 256
   collect_coverage: false
@@ -201,6 +220,8 @@ unmapped:
 Regions must not overlap. The backend maps whole pages; two regions may share a page, and the page's permissions are the union. At least one of `timeout_ms` and `max_instructions` must be non-zero so a run cannot hang. `endian: big` is rejected.
 
 `boot.mode: vector` reads the initial stack pointer and reset vector from `vector_base`, and sets the Thumb bit. `boot.mode: entry` starts at `entry` with `sp`. Cortex-M ignores bits [1:0] of SP, MSP, and PSP (they read as zero). An odd word in the vector table, or a later `MSR` / `MOV` / `LDR` into SP, is word-aligned before the next instruction and before exception entry. A firmware image whose `_estack` is `0x2001FFFF` can take SysTick without a patched binary.
+
+A word write to `AIRCR` (`0xE000ED0C`) with VECTKEY `0x05FA` and `SYSRESETREQ` (bit 2) or `VECTRESET` (bit 0) uses the same path as `boot(reset=True)`. SP and PC are loaded again from `vector_base`, or from `boot.sp` and `boot.entry`. CONTROL, PRIMASK, BASEPRI, and FAULTMASK are cleared, the NVIC returns to its reset state, and peripheral plugins return to the state captured at construction. SRAM is not reloaded. The UART `tx` buffer is kept, because it is the host's copy of bytes that already left the wire; the RX queue is not. The run then continues at the reset PC. `run.halt_on_reset: true` stops instead, with status `halted` and the request in the detail line. `run.max_resets` (default 8, `0` disables it) stops a streak of resets that transmitted no new UART byte, so a silent reboot loop cannot spend `max_instructions`. That stop is `halted`, not a fault, and the fuzzer does not treat it as a crash. A reboot that prints again clears the streak.
 
 `run.svc_nop` is a list of SVC immediates (0 through 255) that retire as NOP instead of entering SVCall. Leave it empty unless the image uses an immediate as a harness hook. P2IM builds use `63` for `aflCall`. Other immediates still take the exception.
 
@@ -456,7 +477,7 @@ The class comes from the detail string `Machine.run` already records, plus the r
 | `usage_fault` | Unicorn rejected the instruction (`UC_ERR_INSN_INVALID`), stacked xPSR.T was clear on exception return (INVSTATE), or the model was entering exception 6. Unicorn does not enter UsageFault or HardFault for an undefined instruction. On a chip with UsageFault disabled, the reset default, that instruction escalates to HardFault. UFSR is not updated. |
 | `bkpt` | The guest executed `BKPT`. With `halt_on_bkpt` the status is `halted`, and the fuzzer keeps it when the PC is in `fuzz.crash_addresses`. With `halt_on_bkpt` off, the detail is `exception 7`. That 7 is Unicorn's breakpoint vector, not an IPSR number. |
 | `halt_crash` | The guest halted at a PC listed in `fuzz.crash_addresses`. The status stays `halted`. |
-| `other` | Anything else, including `AIRCR.SYSRESETREQ` and an Unicorn interrupt vector this classifier does not treat as a fault. The detail line is the raw record. |
+| `other` | Anything else, including a halt whose detail names `AIRCR.SYSRESETREQ` or `AIRCR.VECTRESET` (`halt_on_reset`, or the silent `max_resets` cap) and an Unicorn interrupt vector this classifier does not treat as a fault. The default reset path does not stop, so it is not classified. The detail line is the raw record. |
 
 `exception 6` with no further text is Unicorn's interrupt hook, and it stays in `other`. `exception 6 vector ...` is the NVIC model entering UsageFault, and that is `usage_fault`.
 
@@ -555,7 +576,7 @@ A pending exception runs when it is enabled, not already active, and its group p
 
 `WFI` and `WFE` do not suspend the emulator. If an exception can be taken, the stacked return PC is the instruction after the hint. Otherwise the hint retires in one instruction, including when PRIMASK or BASEPRI is holding a pending interrupt off, so `timeout_ms` and `max_instructions` still stop a wait loop.
 
-Not modeled: tail-chaining and late arrival (a new exception after a return is unstacked and stacked again), lazy floating-point frames (`EXC_RETURN` bit 4 clear stops the run), v8-M stack limits and security extensions, and `SLEEPONEXIT` / `SLEEPDEEP` (the bits are stored and do not change control). `AIRCR.SYSRESETREQ` stops the run as a fault instead of resetting the core.
+Not modeled: tail-chaining and late arrival (a new exception after a return is unstacked and stacked again), lazy floating-point frames (`EXC_RETURN` bit 4 clear stops the run), v8-M stack limits and security extensions, and `SLEEPONEXIT` / `SLEEPDEEP` (the bits are stored and do not change control). `AIRCR.SYSRESETREQ` and `VECTRESET` are modeled: see the boot paragraph above. A bad VECTKEY does not request a reset.
 
 ## Stack pointer, ready bits, and bit-band
 
@@ -882,7 +903,7 @@ jig-emu run -c examples/console-p2im.yaml -f Console \
   --serial-in 'help\n'
 ```
 
-The shell does not halt. Exit status 3 after 800000 instructions is the cap, with `pc` still in the shell poll. MCG is a handful of `follow` rules, not a clock model. UART0 is the byte stub (`S1` at `+4`, `D` at `+7`, level IRQ 31). `svc #63` is retired as a NOP because this P2IM build uses it as a fuzzer hook. SIM, PORT, OSC, and the other blocks in the bit-band window are sticky RAM. `reboot`, `ps`, `rtc`, and `saul` were not sent in that smoke. A UART-RX fuzz campaign from the banner snapshot, including what `reboot` does on this model, is in [`examples/console-p2im.md`](examples/console-p2im.md).
+The shell does not halt. Exit status 3 after 800000 instructions is the cap, with `pc` still in the shell poll. MCG is a handful of `follow` rules, not a clock model. UART0 is the byte stub (`S1` at `+4`, `D` at `+7`, level IRQ 31). `svc #63` is retired as a NOP because this P2IM build uses it as a fuzzer hook. SIM, PORT, OSC, and the other blocks in the bit-band window are sticky RAM. `ps`, `rtc`, and `saul` were not sent in that smoke. `reboot` writes `AIRCR.SYSRESETREQ`; the model resets and the banner is printed again. The transcript and the fuzz note are in [`examples/console-p2im.md`](examples/console-p2im.md).
 
 ## Roadmap
 
@@ -896,13 +917,14 @@ Done:
 - Grbl session on that image. GPIO BSRR, an instruction-paced `timer` on TIM2, and `rehost.serial` / `--serial-in` take the published CNC ELF from the banner through `$$`, `?`, `$X`, and `G91 G0 X1` to `<Idle,MPos:0.997,...>`. Asynchronous exceptions wait out an `IT` block. The binary is still not in this tree. See [Serial text](#serial-text) and [P2IM CNC](#p2im-cnc).
 - ELF32 and Intel HEX load. `PT_LOAD` bytes are written at `p_paddr`, and HEX spans are written at the record addresses. A segment outside the memory map is an error. The raw-bin path is unchanged. The published CNC ELF runs the Grbl session without a hand-extracted bin, and a HEX encoding of the same spans reaches the banner. See [Firmware image formats](#firmware-image-formats).
 - A second published image. P2IM Console (RIOT on an NXP FRDM-K64F) prints the RIOT banner and answers `help`. The map is declarative: MCG `follow` rules, a byte UART with `rx_level`, `svc_nop` for the P2IM `svc #63` hook, and sticky RAM for the blocks that are not decoded. The ELF is not in this tree. See [P2IM Console](#p2im-console).
-- UART fuzzing and a starter map. `fuzz.mode: uart` queues the testcase on a UART after a banner checkpoint, and `jig-emu map init` writes a starter YAML from an ELF or Intel HEX image. A recorded in-process campaign against the published CNC ELF is in [P2IM CNC](#p2im-cnc). The ELF is not in this tree, and CI does not run the campaign. See [Start a map from an ELF](#start-a-map-from-an-elf) and [Fuzzing](#fuzzing).
+- UART fuzzing and a starter map. `fuzz.mode: uart` queues the testcase on a UART after a banner checkpoint, and `jig-emu map init` writes a starter YAML from an ELF or Intel HEX image. `--aggressive` promotes recognized clock and UART constants. A recorded in-process campaign against the published CNC ELF is in [P2IM CNC](#p2im-cnc). The ELF is not in this tree, and CI does not run the campaign. See [Start a map from an ELF](#start-a-map-from-an-elf) and [Fuzzing](#fuzzing).
+- A modeled core reset. `AIRCR.SYSRESETREQ` and `VECTRESET` take the `boot(reset=True)` path and the run continues. `run.halt_on_reset` stops on the first request. `run.max_resets` stops a silent reboot streak before it spends the instruction cap. On the published Console ELF, `reboot` prints the RIOT banner a second time. See [P2IM Console](#p2im-console).
 
 Not in this version:
 
 - An authorized real Cortex-M industrial image in CI, or committed to the tree. The P2IM CNC and Console smokes are local runs of published research binaries you download yourself. See [P2IM CNC](#p2im-cnc), [P2IM Console](#p2im-console), and [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md). Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on.
 - HAL and RTOS call shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
-- A full rehost of one industrial image. The P2IM CNC session models the step timer and GPIO set/reset far enough for one unlocked `G0` to finish and report Idle. TIM4 (g540) is still unmapped, pulse timing is an instruction count, and the EEPROM checksum still fails on a cold boot because that storage is a RAM buffer inside the image. The Console session reaches the RIOT shell and one `help`, and leaves SIM, PORT, the real MCG clock, and the other shell commands unmodeled. See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console).
+- A full rehost of one industrial image. The P2IM CNC session models the step timer and GPIO set/reset far enough for one unlocked `G0` to finish and report Idle. TIM4 (g540) is still unmapped, pulse timing is an instruction count, and the EEPROM checksum still fails on a cold boot because that storage is a RAM buffer inside the image. The Console session reaches the RIOT shell, `help`, and `reboot`. SIM, PORT, the real MCG clock, and `ps` / `rtc` / `saul` are still unmodeled. An `--aggressive` starter map is not that session: see [Start a map from an ELF](#start-a-map-from-an-elf). See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console).
 - Phase 7: QEMU and Renode adapters on `CpuBackend`, and a RISC-V backend.
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
 - A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.
