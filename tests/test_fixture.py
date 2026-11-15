@@ -9,6 +9,18 @@ from rehost.fixtures import build_fixture
 from rehost.machine import Machine
 
 _BANNED = {".bin", ".rom", ".elf", ".hex", ".ihex", ".srec", ".fw"}
+_SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".eggs",
+    "dist",
+    "build",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
 
 
 def test_uart_gpio_fixture_contract():
@@ -38,9 +50,18 @@ def test_repository_ships_no_firmware_blobs():
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if ".git" in path.parts or "__pycache__" in path.parts:
+        if any(part in _SKIP_DIRS or part.endswith(".egg-info") for part in path.parts):
             continue
         if path.suffix.lower() in _BANNED:
+            found.append(str(path.relative_to(root)))
+            continue
+        # An extensionless ELF (the P2IM CNC file is named `CNC`) is still a
+        # firmware blob. The documented sample stays on the reader's machine.
+        try:
+            head = path.read_bytes()[:4]
+        except OSError:
+            continue
+        if head == b"\x7fELF":
             found.append(str(path.relative_to(root)))
     assert found == []
 

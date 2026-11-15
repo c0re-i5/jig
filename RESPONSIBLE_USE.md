@@ -10,11 +10,13 @@ The repository contains the framework, its tests, and small synthetic Cortex-M p
 
 The project does **not** distribute, mirror, download, or commit third-party firmware, ROMs, BIOS images, proprietary dumps, or a Zephyr or FreeRTOS build. A machine config names addresses and plugins. The image path is an argument you pass at runtime from a file you already have.
 
+The README documents one published research sample by name: P2IM CNC, grbl 0.8c on STM32F407VG, the precompiled ELF at `binary/CNC` in [RiS3-Lab/p2im-real_firmware](https://github.com/RiS3-Lab/p2im-real_firmware). That file is not in this repository, and CI does not run it. The collection's [LICENSE.md](https://github.com/RiS3-Lab/p2im-real_firmware/blob/master/LICENSE.md) does not relicense the binaries; it points at each firmware's upstream project. Grbl is GPLv3. Citing that sample is not permission to commit it, and it is not permission to analyze a different device. The collection's own note describes firmware gathered from public repositories and from private sources. The other images in that repository are outside the example.
+
 ## What you bring
 
 Use rehost on a target you are allowed to analyze. That means you hold the image under your own authorization: you own the device, you administer it, your employer or client engaged you to test it, a bug-bounty program covers it, or you are working from hardware in your lab under the same kind of permission. Keep the image on your machine. Do not add it to this repository, a fork, or a bug report.
 
-If you build a larger fixture yourself, prefer source you can rebuild: a Zephyr sample, a FreeRTOS demo, or your own bare-metal program. The README plant-floor section is the procedure: copy `examples/stm32f4_clock.yaml`, pass the raw image with `--firmware`, and keep that image on your machine. The framework will load the bytes you point it at. It will not fetch an image for you.
+If you build a larger fixture yourself, prefer source you can rebuild: a Zephyr sample, a FreeRTOS demo, or your own bare-metal program. The README plant-floor section is the procedure: copy `examples/stm32f4_clock.yaml`, pass the raw image with `--firmware`, and keep that image on your machine. The P2IM CNC section is the same rule applied to a published research ELF: you download it, you convert it to a raw bin, and you pass that path at runtime. The framework will load the bytes you point it at. It will not fetch an image for you.
 
 ## Disclosure
 
