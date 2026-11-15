@@ -187,5 +187,105 @@ assert b"<Idle,MPos:0.997," in tx
   `Grbl 0.8c` banner. 2400000 stops in the poll after the Idle line. The
   step timer had already gone idle; that later re-entry is not the move.
 - There is no interactive TTY. `--serial-in` and `rehost.serial.run_lines`
-  are the console. `jig-emu fuzz` still writes a RAM buffer, and this map
-  has no `fuzz:` section.
+  are the console. The fuzz path below queues bytes on USART2 RX after the
+  banner, instead of writing a RAM buffer.
+
+## Fuzz campaign
+
+`examples/cnc-p2im.yaml` has a `fuzz:` section. The sink is USART2 RX, up
+to 64 bytes. `jig-emu fuzz` boots, waits until TX contains `Grbl 0.8c` and
+has then been quiet for 8000 instructions, and snapshots that state. Each
+case restores the snapshot and queues the testcase. The case ends once RX
+is empty and TX has been quiet for 8000 instructions. That covers a reply
+and also a partial line Grbl is holding with no newline. A guest that
+never drains RX runs to 120000 instructions. That cap is a finished
+execution (`hang_on_limit: false`). `timeout_ms: 8000` is the hang. CI
+does not download the ELF and does not start this run.
+
+The seeds are text files under [`examples/seeds/cnc/`](seeds/cnc/). Each
+one ends in a newline:
+
+| File | Bytes |
+| --- | --- |
+| `00-empty.txt` | `\n` |
+| `01-status.txt` | `?\n` |
+| `02-help.txt` | `$\n` |
+| `03-unlock.txt` | `$X\n` |
+| `04-settings.txt` | `$$\n` |
+| `05-motion.txt` | `G91\n` |
+
+Names sort in that order, which is the order the deterministic byte walk
+uses. `G91` is the motion parser while the alarm lock is still on. A long
+`G0` is not a seed: the step ISR keeps going after `ok`, and this budget
+is sized for a line, not for a move.
+
+```bash
+curl -L -o CNC \
+  https://raw.githubusercontent.com/RiS3-Lab/p2im-real_firmware/master/binary/CNC
+
+jig-emu fuzz -c examples/cnc-p2im.yaml -f CNC \
+  --out ./cnc-campaign \
+  --seeds examples/seeds/cnc \
+  --max-execs 3000 \
+  --rng-seed 1
+```
+
+`--rng-seed 1` makes the havoc stage repeatable after the deterministic
+walk. The walk itself does not use the RNG. The same harness under
+afl-fuzz, with `-t` large enough for the one-time banner plus one line
+(the child warms up inside the first execution):
+
+```bash
+AFL_PERSISTENT=1 afl-fuzz -i examples/seeds/cnc -o afl-cnc -t 10000 -- \
+  jig-emu fuzz -c examples/cnc-p2im.yaml -f CNC --out ./cnc-campaign
+```
+
+Do not commit `CNC` or `cnc-campaign/`. A fault is triaged with the usual
+path: `crashes/`, `buckets/`, `reports/`. Replay is the `jig-emu run
+--input` line in the report. That queues the bytes before boot, which is
+not the banner snapshot. To replay against the snapshot, drive
+`PersistentHarness.exec_one` with the same machine file.
+
+On this machine a banner checkpoint was 79423 instructions and about 1.9
+seconds, and the TX ended in `Grbl 0.8c ['$' for help]`. A `$$` from that
+snapshot finished in about 49000 instructions; `?` and `$X` finished in
+about 10000 to 13000. The recorded campaign is below.
+
+### Recorded run
+
+15 Nov 2026, in-process campaign, `--max-execs 3000 --rng-seed 1`,
+against the published CNC ELF (not stored in this tree):
+
+```text
+execs: 3000
+corpus: 20
+crashes: 0
+buckets: 0
+hangs: 0
+edges: 1550
+execs/sec: 5.0
+seconds: 594.5
+rng-seed: 1
+```
+
+The banner checkpoint before that timer was 79423 instructions, 1.93
+seconds, PC `0x08004006`, 891 bytes of TX ending in the Grbl 0.8c banner.
+No fault and no hang in these 3000 executions. The budget was spent in
+the deterministic byte walk of the seeds and the new edges that walk
+opened; this is not an AFL havoc marathon and not a claim that Grbl has
+no bugs. The corpus past the six seeds is the realtime characters and
+short variants the walk found: `!` (feed hold), `~` (cycle start),
+`\x18` (ctrl-x, the soft reset named in the help text), CR, NUL, DEL,
+`(`, `/`, and a couple of two-byte combinations of those. ctrl-x from
+the snapshot did not fault. It printed a fresh `Grbl 0.8c` banner and
+stayed in the poll. On this model that hook does not write
+`AIRCR.SYSRESETREQ`.
+
+`?`, `$$`, and `$X` from the same snapshot still produce the alarm
+status, the settings list ending in `ok`, and `[Caution: Unlocked]`.
+
+`$H` produced no TX in a spot check and the case ended on the idle gap:
+homing does not answer inside 8000 instructions of the line being taken.
+A longer idle would be needed to follow that motion. The step timer is
+still an instruction count, so a move that does get planned does not take
+the microseconds in `$3`.

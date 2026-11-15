@@ -127,6 +127,202 @@ def test_crash_address_is_a_halt_the_fuzzer_keeps():
     assert is_fuzz_crash(result, machine.config.fuzz) is False
 
 
+_UART_POLL = """
+movw r2, #0x0000
+movt r2, #0x4000
+movs r0, #0x48
+str r0, [r2, #0]
+loop:
+ldr r1, [r2, #4]
+cmp r1, #0xA0
+bne loop
+ldrb r1, [r2, #0]
+str r1, [r2, #0]
+cmp r1, #0x58
+bne done
+movw r3, #0x0001
+movt r3, #0x6000
+bx r3
+done:
+bkpt #0
+"""
+
+
+def _uart_machine(**fuzz_extra):
+    fuzz = {
+        "mode": "uart",
+        "uart": {"name": "uart0", "max_size": 8},
+        "checkpoint": {
+            "mode": "banner",
+            "idle_instructions": 16,
+            "contains": "H",
+            "max_instructions": 5000,
+        },
+        "exec": {"max_instructions": 2000},
+        "hang_on_limit": False,
+    }
+    fuzz.update(fuzz_extra)
+    return machine_from_asm(
+        _UART_POLL,
+        regions=[
+            {
+                "name": "uart0",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "uart",
+                "config": {
+                    "data_offset": 0,
+                    "status_offset": 4,
+                    "tx_empty_mask": 0x80,
+                    "rx_ready_mask": 0x20,
+                },
+            }
+        ],
+        run={"timeout_ms": 1000, "max_instructions": 5000, "halt_on_bkpt": True},
+        fuzz=fuzz,
+    )
+
+
+def test_uart_banner_checkpoint_restores_rx_and_tx():
+    machine = _uart_machine()
+    harness = PersistentHarness(machine)
+    harness.checkpoint()
+    assert harness.checkpoint_mode == "banner"
+    assert harness.checkpoint_tx == b"H"
+    assert bytes(machine.peripheral("uart0").rx) == b""
+    first = harness.exec_one(b"A")
+    assert first.status == "halted", first.detail
+    assert bytes(machine.peripheral("uart0").tx) == b"HA"
+    second = harness.exec_one(b"X")
+    assert second.status == "fault"
+    assert bytes(machine.peripheral("uart0").tx) == b"HX"
+    # The crash must not stick to the next case.
+    third = harness.exec_one(b"B")
+    assert third.status == "halted"
+    assert bytes(machine.peripheral("uart0").tx) == b"HB"
+
+
+def test_exec_idle_ends_a_command_loop_before_the_cap():
+    source = _UART_POLL.replace("bkpt #0", "b loop")
+    fuzz = {
+        "mode": "uart",
+        "uart": {"name": "uart0", "max_size": 8},
+        "checkpoint": {
+            "mode": "banner",
+            "idle_instructions": 16,
+            "contains": "H",
+            "max_instructions": 5000,
+        },
+        "exec": {"max_instructions": 5000, "idle_instructions": 48},
+        "hang_on_limit": False,
+    }
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "uart0",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "uart",
+                "config": {
+                    "data_offset": 0,
+                    "status_offset": 4,
+                    "tx_empty_mask": 0x80,
+                    "rx_ready_mask": 0x20,
+                },
+            }
+        ],
+        run={"timeout_ms": 1000, "max_instructions": 5000, "halt_on_bkpt": True},
+        fuzz=fuzz,
+    )
+    harness = PersistentHarness(machine)
+    answered = harness.exec_one(b"A")
+    assert answered.status == "halted"
+    assert "tx quiet" in answered.detail
+    assert answered.instructions < 1000
+    assert bytes(machine.peripheral("uart0").tx) == b"HA"
+    fault = harness.exec_one(b"X")
+    assert fault.status == "fault"
+
+
+def test_banner_checkpoint_reports_a_marker_the_image_never_sends():
+    machine = _uart_machine(
+        checkpoint={
+            "mode": "banner",
+            "idle_instructions": 8,
+            "contains": "NOPE",
+            "max_instructions": 200,
+        }
+    )
+    with pytest.raises(FuzzInputError, match="did not see"):
+        PersistentHarness(machine).checkpoint()
+
+
+def test_instruction_limit_is_a_hang_only_when_configured(tmp_path):
+    from rehost.campaign import Campaign
+
+    spinning = machine_from_asm(
+        "spin:\n    b spin\n",
+        run={"timeout_ms": 1000, "max_instructions": 40, "halt_on_bkpt": True},
+        fuzz={
+            "mode": "buffer",
+            "buffer": {"address": 0x20000000, "max_size": 4},
+            "hang_on_limit": False,
+        },
+    )
+    finished = Campaign(
+        spinning,
+        out=tmp_path / "normal",
+        max_execs=8,
+        rng_seed=1,
+    ).run()
+    assert finished.hangs == 0
+    assert finished.corpus >= 1
+    assert finished.edges >= 1
+
+    hanging = machine_from_asm(
+        "spin:\n    b spin\n",
+        run={"timeout_ms": 1000, "max_instructions": 40, "halt_on_bkpt": True},
+        fuzz={
+            "mode": "buffer",
+            "buffer": {"address": 0x20000000, "max_size": 4},
+            "hang_on_limit": True,
+        },
+    )
+    stopped = Campaign(
+        hanging,
+        out=tmp_path / "hangs",
+        max_execs=8,
+        rng_seed=1,
+    ).run()
+    assert stopped.hangs >= 1
+    assert stopped.corpus == 0
+    assert "hangs: " in stopped.format()
+    assert "execs/sec: " in stopped.format()
+
+
+def test_uart_campaign_finds_the_planted_serial_fault(tmp_path):
+    from rehost.campaign import Campaign
+
+    machine = _uart_machine()
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    (seeds / "letter.txt").write_bytes(b"A")
+    result = Campaign(
+        machine,
+        out=tmp_path / "out",
+        seed_files=[seeds / "letter.txt"],
+        max_execs=400,
+        rng_seed=1,
+        stop_on_crash=True,
+    ).run()
+    assert result.crashes == 1
+    assert result.buckets == 1
+    assert result.crash_paths[0].read_bytes().startswith(b"X")
+
+
 def test_read_input_file_and_stdin(tmp_path, monkeypatch):
     monkeypatch.delenv("__AFL_SHM_FUZZ_ID", raising=False)
     monkeypatch.delenv("__AFL_SHM_FUZZ_FD", raising=False)

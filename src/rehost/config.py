@@ -55,8 +55,19 @@ _RUN_KEYS = {
     "svc_nop",
 }
 _UNMAPPED_KEYS = {"action", "read_default", "log"}
-_FUZZ_KEYS = {"mode", "buffer", "crash_addresses"}
+_FUZZ_KEYS = {
+    "mode",
+    "buffer",
+    "uart",
+    "crash_addresses",
+    "checkpoint",
+    "exec",
+    "hang_on_limit",
+}
 _BUFFER_KEYS = {"address", "max_size", "length_address"}
+_UART_FUZZ_KEYS = {"name", "max_size"}
+_CHECKPOINT_KEYS = {"mode", "idle_instructions", "max_instructions", "contains"}
+_EXEC_KEYS = {"max_instructions", "timeout_ms", "idle_instructions"}
 _LOAD_KEYS = {"base"}
 
 
@@ -135,13 +146,61 @@ class FuzzBufferConfig:
 
 
 @dataclass
+class FuzzUartConfig:
+    """UART RX is the testcase. ``name`` None means the machine's only UART."""
+
+    max_size: int
+    name: str | None = None
+
+
+@dataclass
+class FuzzCheckpointConfig:
+    """Where ``PersistentHarness`` snapshots before the first testcase.
+
+    ``boot`` is the reset state, before any guest instruction. ``banner``
+    runs until the fuzz UART has transmitted and then gone quiet, and
+    snapshots that state. Each later case restores it and queues RX, so
+    the fuzzer does not pay for reset on every input.
+    """
+
+    mode: str = "boot"
+    idle_instructions: int | None = None
+    max_instructions: int | None = None
+    # When set, a quiet gap counts only after the UART TX buffer contains
+    # this ASCII text. That skips a pause in the middle of the banner.
+    contains: str | None = None
+
+
+@dataclass
+class FuzzExecConfig:
+    """Per-testcase limits. Unset fields keep ``run.*``.
+
+    ``idle_instructions`` is UART-only. After the guest has drained RX, the
+    case stops once TX has been quiet for that many instructions. A guest
+    that never drains RX, or never pauses, still runs until the cap or the
+    wall-clock timeout.
+    """
+
+    max_instructions: int | None = None
+    timeout_ms: int | None = None
+    idle_instructions: int | None = None
+
+
+@dataclass
 class FuzzConfig:
     mode: str
     buffer: FuzzBufferConfig | None = None
+    uart: FuzzUartConfig | None = None
     # Halt PCs that the fuzzer should treat as crashes. A fault is always a
     # crash; these addresses cover a clean BKPT (or other halt) that the
     # program uses as a bug oracle. Compared with the low bit cleared.
     crash_addresses: tuple[int, ...] = ()
+    checkpoint: FuzzCheckpointConfig = field(default_factory=FuzzCheckpointConfig)
+    exec: FuzzExecConfig = field(default_factory=FuzzExecConfig)
+    # An instruction-limit stop is a hang for a buffer or MMIO sink, which
+    # is expected to halt. A UART command loop does not halt, so the default
+    # there is to treat the cap as a finished execution and keep coverage.
+    hang_on_limit: bool = True
 
 
 @dataclass
@@ -230,6 +289,8 @@ def parse_config(data: Any) -> MachineConfig:
     run = _parse_run(root.get("run"))
     unmapped = _parse_unmapped(root.get("unmapped"))
     fuzz = _parse_fuzz(root.get("fuzz")) if "fuzz" in root and root.get("fuzz") is not None else None
+    if fuzz is not None:
+        _check_exec_limits(run, fuzz)
     load_base = 0
     if "load" in root and root.get("load") is not None:
         load = _mapping(root["load"], "load")
@@ -391,28 +452,146 @@ def _parse_fuzz(value: Any) -> FuzzConfig:
     raw = _mapping(value, "fuzz")
     _check_keys(raw, _FUZZ_KEYS, "fuzz")
     mode = raw.get("mode")
-    if mode not in {"buffer", "mmio"}:
-        raise ConfigError("fuzz.mode must be 'buffer' or 'mmio'")
-    if mode == "mmio" and "buffer" in raw:
-        raise ConfigError("fuzz.mode mmio does not use fuzz.buffer")
-    buffer = None
-    if mode == "buffer":
-        if "buffer" not in raw:
-            raise ConfigError("fuzz.mode buffer requires fuzz.buffer")
-        spec = _mapping(raw["buffer"], "fuzz.buffer")
-        _check_keys(spec, _BUFFER_KEYS, "fuzz.buffer")
-        address = parse_u32(spec.get("address"), what="fuzz.buffer.address")
-        max_size = parse_int(spec.get("max_size"), what="fuzz.buffer.max_size")
-        if not 1 <= max_size <= _MAX_FUZZ_BUFFER:
-            raise ConfigError("fuzz.buffer.max_size must be between 1 and 16 MiB")
-        if address + max_size > _ADDRESS_SPACE:
-            raise ConfigError("fuzz buffer extends past the 32-bit address space")
-        length_address = None
-        if "length_address" in spec and spec["length_address"] is not None:
-            length_address = parse_u32(spec["length_address"], what="fuzz.buffer.length_address")
-        buffer = FuzzBufferConfig(address=address, max_size=max_size, length_address=length_address)
+    if mode not in {"buffer", "mmio", "uart"}:
+        raise ConfigError("fuzz.mode must be 'buffer', 'mmio', or 'uart'")
+    if mode != "buffer" and "buffer" in raw:
+        raise ConfigError(f"fuzz.mode {mode} does not use fuzz.buffer")
+    if mode != "uart" and "uart" in raw:
+        raise ConfigError(f"fuzz.mode {mode} does not use fuzz.uart")
+    buffer = _parse_fuzz_buffer(raw) if mode == "buffer" else None
+    uart = _parse_fuzz_uart(raw) if mode == "uart" else None
     addresses = raw.get("crash_addresses", [])
     if not isinstance(addresses, list):
         raise ConfigError("fuzz.crash_addresses must be a list")
     crash_addresses = tuple(parse_u32(item, what="fuzz.crash_addresses") for item in addresses)
-    return FuzzConfig(mode=mode, buffer=buffer, crash_addresses=crash_addresses)
+    checkpoint = _parse_checkpoint(raw.get("checkpoint"), mode=mode)
+    exec_limits = _parse_exec(raw.get("exec"), mode=mode)
+    if "hang_on_limit" in raw and raw["hang_on_limit"] is not None:
+        hang_on_limit = _bool(raw["hang_on_limit"], "fuzz.hang_on_limit")
+    else:
+        # A serial command loop runs until the cap. That stop is the end of
+        # the case, not a hang, unless the file says otherwise.
+        hang_on_limit = mode != "uart"
+    return FuzzConfig(
+        mode=mode,
+        buffer=buffer,
+        uart=uart,
+        crash_addresses=crash_addresses,
+        checkpoint=checkpoint,
+        exec=exec_limits,
+        hang_on_limit=hang_on_limit,
+    )
+
+
+def _parse_fuzz_buffer(raw: dict[str, Any]) -> FuzzBufferConfig:
+    if "buffer" not in raw:
+        raise ConfigError("fuzz.mode buffer requires fuzz.buffer")
+    spec = _mapping(raw["buffer"], "fuzz.buffer")
+    _check_keys(spec, _BUFFER_KEYS, "fuzz.buffer")
+    address = parse_u32(spec.get("address"), what="fuzz.buffer.address")
+    max_size = parse_int(spec.get("max_size"), what="fuzz.buffer.max_size")
+    if not 1 <= max_size <= _MAX_FUZZ_BUFFER:
+        raise ConfigError("fuzz.buffer.max_size must be between 1 and 16 MiB")
+    if address + max_size > _ADDRESS_SPACE:
+        raise ConfigError("fuzz buffer extends past the 32-bit address space")
+    length_address = None
+    if "length_address" in spec and spec["length_address"] is not None:
+        length_address = parse_u32(spec["length_address"], what="fuzz.buffer.length_address")
+    return FuzzBufferConfig(address=address, max_size=max_size, length_address=length_address)
+
+
+def _parse_fuzz_uart(raw: dict[str, Any]) -> FuzzUartConfig:
+    if "uart" not in raw:
+        raise ConfigError("fuzz.mode uart requires fuzz.uart")
+    spec = _mapping(raw["uart"], "fuzz.uart")
+    _check_keys(spec, _UART_FUZZ_KEYS, "fuzz.uart")
+    name = spec.get("name")
+    if name is not None and (not isinstance(name, str) or not name):
+        raise ConfigError("fuzz.uart.name must be a peripheral name")
+    max_size = parse_int(spec.get("max_size"), what="fuzz.uart.max_size")
+    if not 1 <= max_size <= _MAX_FUZZ_BUFFER:
+        raise ConfigError("fuzz.uart.max_size must be between 1 and 16 MiB")
+    return FuzzUartConfig(max_size=max_size, name=name)
+
+
+def _parse_checkpoint(value: Any, *, mode: str) -> FuzzCheckpointConfig:
+    if value is None:
+        return FuzzCheckpointConfig()
+    raw = _mapping(value, "fuzz.checkpoint")
+    _check_keys(raw, _CHECKPOINT_KEYS, "fuzz.checkpoint")
+    checkpoint_mode = raw.get("mode", "boot")
+    if checkpoint_mode not in {"boot", "banner"}:
+        raise ConfigError("fuzz.checkpoint.mode must be 'boot' or 'banner'")
+    if checkpoint_mode == "banner" and mode != "uart":
+        raise ConfigError("fuzz.checkpoint mode banner requires fuzz.mode uart")
+    idle = None
+    if "idle_instructions" in raw and raw["idle_instructions"] is not None:
+        idle = parse_int(raw["idle_instructions"], what="fuzz.checkpoint.idle_instructions")
+        if idle < 1:
+            raise ConfigError("fuzz.checkpoint.idle_instructions must be >= 1")
+    if checkpoint_mode == "banner" and idle is None:
+        raise ConfigError("fuzz.checkpoint mode banner requires idle_instructions")
+    if checkpoint_mode == "boot" and idle is not None:
+        raise ConfigError("fuzz.checkpoint mode boot does not use idle_instructions")
+    cap = None
+    if "max_instructions" in raw and raw["max_instructions"] is not None:
+        cap = parse_int(raw["max_instructions"], what="fuzz.checkpoint.max_instructions")
+        if cap < 1:
+            raise ConfigError("fuzz.checkpoint.max_instructions must be >= 1")
+    if checkpoint_mode == "boot" and cap is not None:
+        raise ConfigError("fuzz.checkpoint mode boot does not use max_instructions")
+    contains = raw.get("contains")
+    if contains is not None:
+        if checkpoint_mode != "banner":
+            raise ConfigError("fuzz.checkpoint.contains requires mode banner")
+        if not isinstance(contains, str) or not contains:
+            raise ConfigError("fuzz.checkpoint.contains must be a non-empty string")
+        try:
+            contains.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ConfigError("fuzz.checkpoint.contains must be ASCII") from exc
+    return FuzzCheckpointConfig(
+        mode=checkpoint_mode,
+        idle_instructions=idle,
+        max_instructions=cap,
+        contains=contains,
+    )
+
+
+def _parse_exec(value: Any, *, mode: str) -> FuzzExecConfig:
+    if value is None:
+        return FuzzExecConfig()
+    raw = _mapping(value, "fuzz.exec")
+    _check_keys(raw, _EXEC_KEYS, "fuzz.exec")
+    max_instructions = None
+    if "max_instructions" in raw and raw["max_instructions"] is not None:
+        max_instructions = parse_int(raw["max_instructions"], what="fuzz.exec.max_instructions")
+        if max_instructions < 0:
+            raise ConfigError("fuzz.exec.max_instructions must be >= 0")
+    timeout_ms = None
+    if "timeout_ms" in raw and raw["timeout_ms"] is not None:
+        timeout_ms = parse_int(raw["timeout_ms"], what="fuzz.exec.timeout_ms")
+        if timeout_ms < 0:
+            raise ConfigError("fuzz.exec.timeout_ms must be >= 0")
+    idle = None
+    if "idle_instructions" in raw and raw["idle_instructions"] is not None:
+        if mode != "uart":
+            raise ConfigError("fuzz.exec.idle_instructions requires fuzz.mode uart")
+        idle = parse_int(raw["idle_instructions"], what="fuzz.exec.idle_instructions")
+        if idle < 1:
+            raise ConfigError("fuzz.exec.idle_instructions must be >= 1")
+    return FuzzExecConfig(
+        max_instructions=max_instructions,
+        timeout_ms=timeout_ms,
+        idle_instructions=idle,
+    )
+
+
+def _check_exec_limits(run: RunConfig, fuzz: FuzzConfig) -> None:
+    """A testcase still needs a stop, including after ``fuzz.exec`` overrides."""
+    timeout_ms = run.timeout_ms if fuzz.exec.timeout_ms is None else fuzz.exec.timeout_ms
+    max_instructions = (
+        run.max_instructions if fuzz.exec.max_instructions is None else fuzz.exec.max_instructions
+    )
+    if timeout_ms == 0 and max_instructions == 0:
+        raise ConfigError("fuzz.exec leaves the run with no timeout and no instruction limit")

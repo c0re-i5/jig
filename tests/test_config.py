@@ -116,3 +116,71 @@ def test_entry_boot_requires_sp_and_entry():
 def test_unlimited_run_is_rejected():
     with pytest.raises(ConfigError, match="cannot hang"):
         parse_config(_minimal(run={"timeout_ms": 0, "max_instructions": 0}))
+
+
+def _uart_region():
+    return {
+        "name": "uart0",
+        "base": 0x40000000,
+        "size": 0x100,
+        "perms": "rw",
+        "peripheral": "uart",
+        "config": {"data_offset": 0, "status_offset": 4},
+    }
+
+
+def test_uart_fuzz_mode_and_banner_checkpoint():
+    config = parse_config(
+        _minimal(
+            memory=[
+                {"name": "flash", "base": 0, "size": 0x1000, "perms": "rx"},
+                {"name": "sram", "base": 0x20000000, "size": 0x1000, "perms": "rw"},
+                _uart_region(),
+            ],
+            fuzz={
+                "mode": "uart",
+                "uart": {"name": "uart0", "max_size": 32},
+                "checkpoint": {
+                    "mode": "banner",
+                    "idle_instructions": 8,
+                    "contains": "Grbl",
+                    "max_instructions": 1000,
+                },
+                "exec": {"max_instructions": 100, "timeout_ms": 50},
+            },
+        )
+    )
+    assert config.fuzz is not None
+    assert config.fuzz.mode == "uart"
+    assert config.fuzz.hang_on_limit is False
+    assert config.fuzz.checkpoint.contains == "Grbl"
+    assert config.fuzz.exec.max_instructions == 100
+    buffer = parse_config(
+        _minimal(
+            fuzz={
+                "mode": "buffer",
+                "buffer": {"address": 0x20000000, "max_size": 4},
+            }
+        )
+    )
+    assert buffer.fuzz is not None and buffer.fuzz.hang_on_limit is True
+    with pytest.raises(ConfigError, match="idle_instructions"):
+        parse_config(
+            _minimal(
+                fuzz={
+                    "mode": "uart",
+                    "uart": {"max_size": 4},
+                    "checkpoint": {"mode": "banner"},
+                }
+            )
+        )
+    with pytest.raises(ConfigError, match="does not use fuzz.buffer"):
+        parse_config(
+            _minimal(
+                fuzz={
+                    "mode": "uart",
+                    "uart": {"max_size": 4},
+                    "buffer": {"address": 0x20000000, "max_size": 4},
+                }
+            )
+        )

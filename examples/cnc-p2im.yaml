@@ -430,3 +430,30 @@ unmapped:
   action: log
   read_default: 0
   log: true
+
+# USART2 RX is the fuzz input. The checkpoint is taken after the Grbl banner
+# has been printed and TX has gone quiet, so each case does not re-run reset.
+# The instruction cap is a finished command loop, not a hang. A wall-clock
+# timeout still is. CI does not download the ELF or start this campaign.
+# examples/cnc-p2im.md has the seeds and the recorded run.
+fuzz:
+  mode: uart
+  uart:
+    name: usart2
+    max_size: 64
+  checkpoint:
+    mode: banner
+    idle_instructions: 8000
+    contains: "Grbl 0.8c"
+    max_instructions: 2000000
+  # A short Grbl line finishes in well under 120000 instructions ($$ is
+  # about 50000 including the reply). idle_instructions ends the case once
+  # RX is empty and TX has been quiet for that long, including a partial
+  # line that Grbl is still holding. A guest that never drains RX still
+  # runs to the cap. That cap is a finished execution (hang_on_limit:
+  # false). A wall-clock timeout is a hang.
+  exec:
+    max_instructions: 120000
+    timeout_ms: 8000
+    idle_instructions: 8000
+  hang_on_limit: false

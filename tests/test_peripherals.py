@@ -757,7 +757,13 @@ def test_cnc_p2im_map_extends_the_clock_template():
     assert cnc.load_base == clock.load_base == 0x08000000
     assert cnc.boot == clock.boot
     assert cnc.unmapped == clock.unmapped
-    assert cnc.fuzz is None and clock.fuzz is None
+    assert clock.fuzz is None
+    # USART2 RX, snapshotted after the Grbl banner. The ELF is still not in the tree.
+    assert cnc.fuzz is not None and cnc.fuzz.mode == "uart"
+    assert cnc.fuzz.uart is not None and cnc.fuzz.uart.name == "usart2"
+    assert cnc.fuzz.checkpoint.mode == "banner"
+    assert cnc.fuzz.checkpoint.contains == "Grbl 0.8c"
+    assert cnc.fuzz.hang_on_limit is False
     assert cnc.run.timeout_ms == 0
     assert cnc.run.max_instructions == 2_400_000
     assert cnc.run.trace_limit == 128

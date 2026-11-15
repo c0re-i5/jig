@@ -44,8 +44,9 @@ src/rehost/
   serial.py         line-oriented UART RX injection
   config.py         YAML/TOML machine loader
   image.py          raw bin, ELF32, and Intel HEX loaders
+  mapinit.py        starter machine YAML from an ELF or Intel HEX image
   machine.py        map, load, boot, run, snapshot
-  fuzz.py           RAM-buffer and MMIO-script sinks, AFL++ input map
+  fuzz.py           RAM-buffer, MMIO-script, and UART-RX sinks, AFL++ input map
   coverage.py       AFL++ edge bitmap
   campaign.py       in-process coverage-guided campaign
   forkserver.py     AFL++ persistent-mode forkserver
@@ -99,6 +100,8 @@ jig-emu run --fixture uart-gpio -v
 jig-emu run --fixture fuzz-echo --input case.bin --snapshot-out after.json
 jig-emu plugins
 jig-emu fixtures
+jig-emu inspect /path/to/image.elf
+jig-emu map init /path/to/image.elf -o board.yaml
 ```
 
 `--firmware` is a file you supply. `--config` is required with it, because the tool will not guess a memory map. `--fixture` selects one of the synthetic programs and, if you omit `--config`, its packaged machine file. The file may be a raw bin, an ELF, or Intel HEX. [Firmware image formats](#firmware-image-formats) is how each one is placed.
@@ -116,6 +119,29 @@ jig-emu fixtures
 `load.base` applies only to a raw image. ELF and HEX already name their addresses, so `load_image(..., base=...)` is rejected for those two.
 
 The published P2IM CNC file is an ELF with two loadable segments. `jig-emu run -f CNC` places both at `p_paddr`. You do not run `objcopy` first. See [P2IM CNC](#p2im-cnc).
+
+## Start a map from an ELF
+
+`jig-emu` will not guess a map for `--firmware`. `jig-emu inspect` and `jig-emu map init` read an ELF32 or Intel HEX image you already have and suggest one. They do not emulate it, and they do not download it. A raw bin has no addresses and is rejected.
+
+```bash
+jig-emu inspect firmware.elf
+jig-emu map init firmware.elf -o board.yaml
+jig-emu map init firmware.elf --name my-part -o board.yaml --force
+```
+
+`inspect` prints the program headers, the vector table at the lowest file-backed address (initial SP and reset), and the suggested regions. `map init` writes YAML. Omit `-o` to print that YAML on stdout. `--force` overwrites an existing file. `--name` overrides the machine name; the default is the file stem.
+
+What the file contains, and what it is not:
+
+- **Flash** covers the file bytes. A `.data` image whose `p_vaddr` is SRAM is still counted in flash at `p_paddr`, which is where the reset copy loop reads it. The size is the next power of two. It is `rx`: a store to that window faults. Grow or shrink it to the part.
+- **SRAM** covers the ELF's RAM segments. If the initial SP is the top of that RAM (including an odd `_estack` such as `0x2001FFFF`, which the CPU model word-aligns), the window ends there. If the SP sits inside the loaded RAM, the ELF does not say how big the part's SRAM is, and the window adds 64 KiB of slack. The comment says so.
+- **SysTick** is the real plugin at `0xE000E010`. The rest of the system control block stays with the CPU backend. Do not map over `0xE000E000`.
+- **`mmio_*` windows** are 1 KiB-aligned constants in `0x40000000..0x40100000` or `0x50000000..0x51000000`. Each is `unimplemented`: the access is logged once and the read returns 0. That is not a decoded peripheral. Thumb encodings can look like addresses; the alignment filter drops most of them, and a hit is still only a constant. If the image reads back a value it stored, delete `peripheral:` and the window is sticky RAM. If it spins on a ready bit, replace the offset with a `register_block` `follow` or `read_set`.
+- **`unmapped.action: log`** covers every other address. `-v` prints those accesses. A fetch of an unmapped address still faults.
+- Boot is `vector` at the vector table address. `run.max_instructions` is 1000000. A firmware loop will hit that cap.
+
+The comments at the top of the YAML are the TODOs. A bit-band constant is mentioned and not turned into a 32 MiB alias. After the file loads, the next step is the same one as the beachhead template: run with `-v`, and promote the offsets the image actually polls. [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console) are hand-written maps that have already done that for two images. `map init` is how you start a third.
 
 ## Machine file
 
@@ -281,7 +307,7 @@ libAFL is not a dependency. Its Python bindings (`pylibafl`) are a PyO3 extensio
 jig-emu fuzz --fixture fuzz-crash --out ./fuzz-out --max-execs 3000 --stop-on-crash
 ```
 
-A successful run prints `crashes: 1` and `buckets: 1`, writes the bytes `JIG!` under `fuzz-out/crashes/`, and writes one report under `fuzz-out/reports/`. The exit status of `jig-emu fuzz` is 0 when the campaign finishes; the crash count is in the summary and in that directory. `queue/` holds inputs that grew the edge map. `hangs/` holds guest timeouts and instruction-limit stops, which are not crashes. The report names the fault and gives the command that replays that one input. See [Crash triage](#crash-triage).
+A successful run prints `crashes: 1` and `buckets: 1`, writes the bytes `JIG!` under `fuzz-out/crashes/`, and writes one report under `fuzz-out/reports/`. The exit status of `jig-emu fuzz` is 0 when the campaign finishes; the crash count is in the summary and in that directory. `queue/` holds inputs that grew the edge map. `hangs/` holds stops the campaign classified as hangs. For a buffer or MMIO sink that is a guest timeout or the instruction cap. For a UART sink the cap is a finished command loop unless `hang_on_limit` is set, and only the wall-clock timeout is a hang. The summary also prints `edges`, `execs/sec`, and `seconds`. The report names the fault and gives the command that replays that one input. See [Crash triage](#crash-triage).
 
 ```text
 jig-emu fuzz --fixture fuzz-crash --out DIR [options]
@@ -291,7 +317,7 @@ jig-emu fuzz --config machine.yaml --firmware image.bin --out DIR --seeds DIR
 | Flag | Meaning |
 | --- | --- |
 | `--out DIR` | Corpus, crashes, and hangs. Required for the in-process campaign. |
-| `--seeds DIR` | Seed files, in sorted name order. The default seed is four zero bytes (or shorter, if the buffer is). |
+| `--seeds DIR` | Seed files, in sorted name order. The default buffer seed is four zero bytes (or shorter, if the buffer is). A UART sink with no seeds starts from one newline. |
 | `--input FILE` | One extra seed. `-` reads stdin. |
 | `--max-execs N` | Stop after N executions. Default 1000000. |
 | `--stop-on-crash` | Return after the first crash. The input is still written to `--out`. |
@@ -320,7 +346,7 @@ That is AFL's edge update. AFL QEMU mode hashes a translation-block address; thi
 
 The forkserver implements AFL++'s version-1 handshake (`0x41464c00 + 1`, map size, shared-memory fuzzing when the fuzz region is present) and the persistent loop: the child raises `SIGSTOP` between cases, and a crash is `SIGSEGV` so `waitpid` reports `WIFSIGNALED`. `FS_NEW_OPT_FUTEX` is not offered; current AFL++ still accepts this `SIGSTOP` path. A guest fault and a PC listed in `fuzz.crash_addresses` are both crashes. A timeout or an instruction limit is not: afl-fuzz has its own `-t` timeout, and a `BKPT` is a normal exit unless that PC is configured as a crash.
 
-The forkserver process does not create a Unicorn engine. The child does, after `fork`, and checkpoints at boot before the first case.
+The forkserver process does not create a Unicorn engine. The child does, after `fork`, and checkpoints before the first case. A banner checkpoint runs inside that child, so the first `-t` has to cover warmup plus one command. Later cases restore the snapshot. `AFL_FORKSRV_INIT_TMOUT` is the handshake, not that warmup.
 
 ```bash
 mkdir -p seeds
@@ -350,6 +376,12 @@ You can still drive one case yourself. `fuzz.mode: buffer` zeroes `buffer.max_si
 
 `fuzz.mode: mmio` treats the testcase as a script of 12-byte records: `u32` address, `u32` value, `u8` size (1, 2, or 4), three padding bytes. Each record becomes a plugin write. The campaign trims a mutated script to a whole number of records.
 
+`fuzz.mode: uart` replaces the named UART's RX queue with the testcase (truncated to `fuzz.uart.max_size`). Omit `fuzz.uart.name` when the machine has one UART. This is the input surface for a shell or a Grbl parser. `jig-emu run --input` queues those bytes before boot. `jig-emu fuzz` does not: with `fuzz.checkpoint.mode: banner` it boots, runs until that UART has transmitted and then gone quiet, snapshots, and applies each case to the snapshot. `fuzz.checkpoint.contains` is optional ASCII that must already be in TX before a quiet gap counts, so a pause in the middle of the banner is not the checkpoint. `fuzz.checkpoint.max_instructions` is the warmup cap. If the marker never shows up, the campaign stops with an error instead of fuzzing a half-booted image.
+
+`fuzz.exec.max_instructions` and `fuzz.exec.timeout_ms` override `run.*` for each case and are restored afterward. `fuzz.exec.idle_instructions` (UART only) ends the case once RX is empty and TX has been quiet for that many instructions. A reply resets the quiet count while it is still printing. A partial line that the guest has already taken, and a command that does not answer, end on that gap instead of the instruction cap. A guest that never drains RX still runs to the cap. The status of that early stop is `halted`, and the detail names the UART. It is not a crash.
+
+`fuzz.hang_on_limit` defaults to true for `buffer` and `mmio`, and false for `uart`. A true value means the instruction cap is a hang and does not join the corpus. A false value means the cap is a normal end: the edges still count. A wall-clock timeout is always a hang. afl-fuzz does not read this flag; its `-t` is the hang detector, and the forkserver reports a crash only for a fault or a `fuzz.crash_addresses` PC.
+
 `fuzz.crash_addresses` is a list of PCs. A halt there is a crash even though the status is `halted`. The low bit is ignored. A fault is always a crash.
 
 ```yaml
@@ -373,7 +405,7 @@ for testcase in inputs:
         machine.snapshot().write_json(result_path)
 ```
 
-`exec_one` restores a checkpoint taken at boot, applies the testcase, and runs. Peripheral logs, RAM, UART RX/TX (including the RX IRQ latch), SysTick, and NVIC pending bits from the previous case are gone. `PersistentHarness.reset_to_checkpoint` is that restore without applying a testcase. Queue a Modbus frame after it; bytes queued before the restore are dropped with the previous case.
+`exec_one` restores the checkpoint, applies the testcase, and runs. The checkpoint is boot, unless the machine file asks for the banner. Peripheral logs, RAM, UART RX/TX (including the RX IRQ latch), SysTick, and NVIC pending bits from the previous case are gone. `PersistentHarness.reset_to_checkpoint` is that restore without applying a testcase. Queue a Modbus frame after it; bytes queued before the restore are dropped with the previous case. A recorded UART campaign against the published P2IM images is in [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console). CI does not run it.
 
 Input sources, in order:
 
@@ -829,6 +861,8 @@ jig-emu run -c examples/cnc-p2im.yaml -f CNC \
 
 Exit status 3 is the instruction cap. Exit status 1 is a fault. The recorded session exited 3 after 2400000 instructions, with `pc` still in the USART2 poll (`0x08007e66`), SysTick `load: 0x2903f`, and TIM2 stopped (`events: 158`, `cr: 0x0`). The snapshot text contains, in order, the EEPROM fallback and the banner, `ok` after `$$`, `<Alarm,MPos:0.000,0.000,0.000,...>`, `[Caution: Unlocked]`, `ok` for `G91 G0 X1`, and `<Idle,MPos:0.997,0.000,0.000,WPos:0.997,0.000,0.000>`.
 
+The same map's `fuzz:` section is a USART2 RX campaign from a snapshot taken after that banner. The procedure, the seeds, and the recorded execs are in [`examples/cnc-p2im.md`](examples/cnc-p2im.md). CI does not run it.
+
 ```bash
 python3 -c 'import json; tx=json.load(open("cnc.snapshot.json"))["peripherals"]["usart2"]["tx"]["__bytes__"]; print(bytes.fromhex(tx).decode())'
 ```
@@ -848,7 +882,7 @@ jig-emu run -c examples/console-p2im.yaml -f Console \
   --serial-in 'help\n'
 ```
 
-The shell does not halt. Exit status 3 after 800000 instructions is the cap, with `pc` still in the shell poll. MCG is a handful of `follow` rules, not a clock model. UART0 is the byte stub (`S1` at `+4`, `D` at `+7`, level IRQ 31). `svc #63` is retired as a NOP because this P2IM build uses it as a fuzzer hook. SIM, PORT, OSC, and the other blocks in the bit-band window are sticky RAM. `reboot`, `ps`, `rtc`, and `saul` were not sent.
+The shell does not halt. Exit status 3 after 800000 instructions is the cap, with `pc` still in the shell poll. MCG is a handful of `follow` rules, not a clock model. UART0 is the byte stub (`S1` at `+4`, `D` at `+7`, level IRQ 31). `svc #63` is retired as a NOP because this P2IM build uses it as a fuzzer hook. SIM, PORT, OSC, and the other blocks in the bit-band window are sticky RAM. `reboot`, `ps`, `rtc`, and `saul` were not sent in that smoke. A UART-RX fuzz campaign from the banner snapshot, including what `reboot` does on this model, is in [`examples/console-p2im.md`](examples/console-p2im.md).
 
 ## Roadmap
 
@@ -862,6 +896,7 @@ Done:
 - Grbl session on that image. GPIO BSRR, an instruction-paced `timer` on TIM2, and `rehost.serial` / `--serial-in` take the published CNC ELF from the banner through `$$`, `?`, `$X`, and `G91 G0 X1` to `<Idle,MPos:0.997,...>`. Asynchronous exceptions wait out an `IT` block. The binary is still not in this tree. See [Serial text](#serial-text) and [P2IM CNC](#p2im-cnc).
 - ELF32 and Intel HEX load. `PT_LOAD` bytes are written at `p_paddr`, and HEX spans are written at the record addresses. A segment outside the memory map is an error. The raw-bin path is unchanged. The published CNC ELF runs the Grbl session without a hand-extracted bin, and a HEX encoding of the same spans reaches the banner. See [Firmware image formats](#firmware-image-formats).
 - A second published image. P2IM Console (RIOT on an NXP FRDM-K64F) prints the RIOT banner and answers `help`. The map is declarative: MCG `follow` rules, a byte UART with `rx_level`, `svc_nop` for the P2IM `svc #63` hook, and sticky RAM for the blocks that are not decoded. The ELF is not in this tree. See [P2IM Console](#p2im-console).
+- UART fuzzing and a starter map. `fuzz.mode: uart` queues the testcase on a UART after a banner checkpoint, and `jig-emu map init` writes a starter YAML from an ELF or Intel HEX image. A recorded in-process campaign against the published CNC ELF is in [P2IM CNC](#p2im-cnc). The ELF is not in this tree, and CI does not run the campaign. See [Start a map from an ELF](#start-a-map-from-an-elf) and [Fuzzing](#fuzzing).
 
 Not in this version:
 

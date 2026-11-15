@@ -122,6 +122,9 @@ class Machine:
         self._coverage: set[int] = set()
         self._coverage_map = None
         self._rx_feed = None
+        # Optional callable(instructions) after each retired instruction.
+        # The banner checkpoint uses it. A serial feed is separate.
+        self._retire_hook = None
         self._recent_pcs: deque[int] = deque(maxlen=_RECENT_LIMIT)
         self._recent_edges: deque[int] = deque(maxlen=_RECENT_LIMIT)
         self._edge_prev = 0
@@ -387,6 +390,17 @@ class Machine:
         """Pend external IRQ ``irq``. Enable, priority, and masks still apply."""
         self.backend.inject_irq(irq)
 
+    def request_stop(self, status: str, detail: str) -> None:
+        """Stop at the next instruction boundary with ``status`` and ``detail``.
+
+        A reason that is already set (a fault, a halt address) is kept.
+        Used by the banner checkpoint, which is not a guest halt address.
+        """
+        if self._reason is None:
+            self._reason = status
+            self._detail = detail
+        self.backend.stop()
+
     def read_memory(self, address: int, size: int) -> bytes:
         self.memory.regions_covering(address, size)
         try:
@@ -536,6 +550,9 @@ class Machine:
         feed = self._rx_feed
         if feed is not None:
             feed.on_retired(self._instructions)
+        hook = self._retire_hook
+        if hook is not None:
+            hook(self._instructions)
         if self.config.run.collect_coverage:
             self._coverage.add(address)
         coverage_map = self._coverage_map

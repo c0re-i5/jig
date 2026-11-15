@@ -16,13 +16,13 @@ from __future__ import annotations
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError
-from rehost.fuzz import PersistentHarness, is_fuzz_crash
-from rehost.result import STATUS_LIMIT, STATUS_TIMEOUT
+from rehost.fuzz import PersistentHarness, is_fuzz_crash, is_fuzz_hang
 from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 # Byte-walk inputs longer than this only in havoc. The planted fixture's
@@ -43,9 +43,17 @@ class CampaignResult:
     crashes: int
     hangs: int
     rng_seed: int
+    edges: int = 0
+    seconds: float = 0.0
     crash_paths: list[Path] = field(default_factory=list)
     buckets: int = 0
     report_paths: list[Path] = field(default_factory=list)
+
+    @property
+    def execs_per_sec(self) -> float:
+        if self.seconds <= 0:
+            return 0.0
+        return self.execs / self.seconds
 
     def format(self) -> str:
         lines = [
@@ -54,6 +62,9 @@ class CampaignResult:
             f"crashes: {self.crashes}",
             f"buckets: {self.buckets}",
             f"hangs: {self.hangs}",
+            f"edges: {self.edges}",
+            f"execs/sec: {self.execs_per_sec:.1f}",
+            f"seconds: {self.seconds:.1f}",
             f"rng-seed: {self.rng_seed}",
         ]
         if self.crash_paths:
@@ -89,6 +100,8 @@ class Campaign:
         fuzz = machine.config.fuzz
         if fuzz is not None and fuzz.mode == "buffer" and fuzz.buffer is not None:
             self.max_len = fuzz.buffer.max_size
+        elif fuzz is not None and fuzz.mode == "uart" and fuzz.uart is not None:
+            self.max_len = fuzz.uart.max_size
         else:
             self.max_len = 4096
         self.machine = machine
@@ -109,10 +122,15 @@ class Campaign:
         self.hang_count = 0
         self.crash_paths: list[Path] = []
         self._stopped = False
+        self._started = 0.0
         self.triage = TriageStore(out, replay=replay)
 
     def run(self) -> CampaignResult:
         self.out.mkdir(parents=True, exist_ok=True)
+        # Banner mode runs the guest once here, before any testcase, so a
+        # missing banner fails the campaign instead of looking like a hang.
+        self.harness.checkpoint()
+        self._started = time.perf_counter()
         for seed in self._initial_seeds():
             self._consider(seed)
             if self._stopped:
@@ -133,12 +151,15 @@ class Campaign:
         return self._result()
 
     def _result(self) -> CampaignResult:
+        elapsed = time.perf_counter() - self._started if self._started else 0.0
         return CampaignResult(
             execs=self.execs,
             corpus=len(self.queue),
             crashes=self.crash_count,
             hangs=self.hang_count,
             rng_seed=self.rng_seed,
+            edges=sum(1 for value in self.best if value),
+            seconds=elapsed,
             crash_paths=list(self.crash_paths),
             buckets=self.triage.bucket_count(),
             report_paths=self.triage.report_paths(),
@@ -151,8 +172,11 @@ class Campaign:
         seeds.extend(self._clip(blob) for blob in self.extra_inputs)
         if seeds:
             return seeds
-        width = 4
         fuzz = self.machine.config.fuzz
+        if fuzz is not None and fuzz.mode == "uart":
+            # A NUL is a poor serial seed. One newline is an empty line.
+            return [b"\n"]
+        width = 4
         if fuzz is not None and fuzz.buffer is not None:
             width = min(4, fuzz.buffer.max_size)
         return [bytes(width)]
@@ -181,7 +205,7 @@ class Campaign:
                 self._stopped = True
             self._progress()
             return "crash"
-        if result.status in (STATUS_TIMEOUT, STATUS_LIMIT):
+        if is_fuzz_hang(result, fuzz):
             self._save_hang(data, result)
             self._progress()
             return "hang"
@@ -196,8 +220,10 @@ class Campaign:
     def _progress(self) -> None:
         if self.execs == 1 or self.execs % 1000 == 0:
             print(
-                f"execs: {self.execs} corpus: {len(self.queue)} crashes: {self.crash_count}",
+                f"execs: {self.execs} corpus: {len(self.queue)} "
+                f"crashes: {self.crash_count} hangs: {self.hang_count}",
                 file=sys.stderr,
+                flush=True,
             )
 
     def _deterministic(self, base: bytes, depth: int = 0) -> None:

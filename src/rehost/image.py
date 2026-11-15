@@ -37,6 +37,43 @@ class LoadSegment:
     label: str
 
 
+@dataclass(frozen=True)
+class ProgramHeader:
+    """One ELF32 program header.
+
+    ``parse_elf`` keeps only ``PT_LOAD`` entries that have file bytes.
+    ``read_elf`` keeps every header, including BSS (``p_filesz`` 0), so a
+    map scaffold can see the RAM the image reserved.
+    """
+
+    index: int
+    p_type: int
+    p_offset: int
+    p_vaddr: int
+    p_paddr: int
+    p_filesz: int
+    p_memsz: int
+    p_flags: int
+    p_align: int
+
+    @property
+    def load_address(self) -> int:
+        """Guest address of the file bytes. Same rule as ``parse_elf``."""
+        if self.p_paddr == 0 and self.p_vaddr != 0:
+            return self.p_vaddr
+        return self.p_paddr
+
+
+@dataclass(frozen=True)
+class ElfFile:
+    """The ELF32 fields a map scaffold reads. This does not load the image."""
+
+    e_type: int
+    e_machine: int
+    e_entry: int
+    headers: tuple[ProgramHeader, ...]
+
+
 def parse_firmware(data: bytes) -> tuple[str, list[LoadSegment]]:
     """Classify ``data`` and return ``("raw", [])`` or the loadable spans.
 
@@ -68,17 +105,13 @@ def looks_like_ihex(data: bytes) -> bool:
     return (len(line) - 1) % 2 == 0
 
 
-def parse_elf(data: bytes) -> list[LoadSegment]:
-    """PT_LOAD segments of a little-endian ARM ELF32, written at ``p_paddr``.
+def read_elf(data: bytes) -> ElfFile:
+    """Parse a little-endian ARM ELF32 header and its program headers.
 
-    ``p_paddr`` is the load memory address (where ``objcopy -O binary`` and
-    the reset handler's copy loop expect the bytes). ``p_vaddr`` is where
-    the firmware runs after that copy, so a ``.data`` segment whose virtual
-    address is SRAM is still stored at its physical address in flash.
-
-    A toolchain that leaves ``p_paddr`` at 0 and puts the only address in
-    ``p_vaddr`` is loaded at ``p_vaddr``. Segments with no file bytes (BSS)
-    are omitted; guest RAM is already zero.
+    The same checks as ``parse_elf``. BSS and non-load headers are kept.
+    A segment whose file bytes run past the end of ``data`` is still
+    returned; ``parse_elf`` is what rejects that, because a header with
+    ``p_filesz`` 0 is a valid BSS entry and has nothing to read.
     """
     if len(data) < _ELF32_HEADER:
         raise MachineError(
@@ -96,6 +129,7 @@ def parse_elf(data: bytes) -> list[LoadSegment]:
 
     e_type, e_machine = struct.unpack_from("<HH", data, 16)
     e_version = struct.unpack_from("<I", data, 20)[0]
+    e_entry = struct.unpack_from("<I", data, 24)[0]
     e_phoff = struct.unpack_from("<I", data, 28)[0]
     e_phentsize, e_phnum = struct.unpack_from("<HH", data, 42)
     if e_version != 1:
@@ -118,32 +152,63 @@ def parse_elf(data: bytes) -> list[LoadSegment]:
             f"ELF program headers at {e_phoff:#x} ({e_phnum} entries) extend past the end of the file"
         )
 
-    segments: list[LoadSegment] = []
+    headers: list[ProgramHeader] = []
     for index in range(e_phnum):
         off = e_phoff + index * e_phentsize
-        p_type, p_offset, p_vaddr, p_paddr, p_filesz, _memsz, _flags, _align = struct.unpack_from(
+        p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = struct.unpack_from(
             "<IIIIIIII", data, off
         )
-        if p_type != _PT_LOAD or p_filesz == 0:
+        headers.append(
+            ProgramHeader(
+                index=index,
+                p_type=p_type,
+                p_offset=p_offset,
+                p_vaddr=p_vaddr,
+                p_paddr=p_paddr,
+                p_filesz=p_filesz,
+                p_memsz=p_memsz,
+                p_flags=p_flags,
+                p_align=p_align,
+            )
+        )
+    return ElfFile(e_type=e_type, e_machine=e_machine, e_entry=e_entry, headers=tuple(headers))
+
+
+def parse_elf(data: bytes) -> list[LoadSegment]:
+    """PT_LOAD segments of a little-endian ARM ELF32, written at ``p_paddr``.
+
+    ``p_paddr`` is the load memory address (where ``objcopy -O binary`` and
+    the reset handler's copy loop expect the bytes). ``p_vaddr`` is where
+    the firmware runs after that copy, so a ``.data`` segment whose virtual
+    address is SRAM is still stored at its physical address in flash.
+
+    A toolchain that leaves ``p_paddr`` at 0 and puts the only address in
+    ``p_vaddr`` is loaded at ``p_vaddr``. Segments with no file bytes (BSS)
+    are omitted; guest RAM is already zero.
+    """
+    elf = read_elf(data)
+    segments: list[LoadSegment] = []
+    for ph in elf.headers:
+        if ph.p_type != _PT_LOAD or ph.p_filesz == 0:
             continue
-        if p_offset > len(data) or p_filesz > len(data) - p_offset:
+        if ph.p_offset > len(data) or ph.p_filesz > len(data) - ph.p_offset:
             raise MachineError(
-                f"ELF PT_LOAD segment {index} file offset {p_offset:#x} size {p_filesz:#x} "
+                f"ELF PT_LOAD segment {ph.index} file offset {ph.p_offset:#x} size {ph.p_filesz:#x} "
                 "extends past the end of the file"
             )
-        address = p_vaddr if p_paddr == 0 and p_vaddr != 0 else p_paddr
-        if address + p_filesz > _ADDRESS_SPACE:
+        address = ph.load_address
+        if address + ph.p_filesz > _ADDRESS_SPACE:
             raise MachineError(
-                f"ELF PT_LOAD segment {index} at {address:#x} size {p_filesz:#x} "
+                f"ELF PT_LOAD segment {ph.index} at {address:#x} size {ph.p_filesz:#x} "
                 "does not fit in the 32-bit address space"
             )
         segments.append(
             LoadSegment(
                 address=address,
-                data=data[p_offset : p_offset + p_filesz],
+                data=data[ph.p_offset : ph.p_offset + ph.p_filesz],
                 label=(
-                    f"ELF PT_LOAD segment {index} "
-                    f"(p_paddr {p_paddr:#x}, p_vaddr {p_vaddr:#x})"
+                    f"ELF PT_LOAD segment {ph.index} "
+                    f"(p_paddr {ph.p_paddr:#x}, p_vaddr {ph.p_vaddr:#x})"
                 ),
             )
         )

@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: MIT
 """Fuzz-harness input sinks.
 
-Two sinks are configured per machine:
+Three sinks are configured per machine:
 
 * ``buffer`` copies bytes into a RAM window (and optionally stores the length).
 * ``mmio`` replays a sequence of writes into peripheral plugins.
+* ``uart`` replaces the UART RX queue with the testcase. That is the serial
+  line a shell or a Grbl parser reads.
 
 Input can come from a file, stdin, or an AFL++ shared-memory fuzz region
 (``__AFL_SHM_FUZZ_ID`` / ``__AFL_SHM_FUZZ_FD``). The region layout matches
 AFL++: a little-endian ``u32`` length followed by the testcase bytes.
 
-``PersistentHarness.exec_one`` restores a boot checkpoint, applies one
-testcase, and runs. ``jig-emu fuzz`` drives that hook from an in-process
-campaign (``rehost.campaign``) or, when spawned by afl-fuzz, from an AFL++
-persistent-mode forkserver (``rehost.forkserver``).
+``PersistentHarness.exec_one`` restores a checkpoint, applies one testcase,
+and runs. The checkpoint is the reset state, or, when
+``fuzz.checkpoint.mode`` is ``banner``, the state after the UART has
+transmitted and gone quiet. ``jig-emu fuzz`` drives that hook from an
+in-process campaign (``rehost.campaign``) or, when spawned by afl-fuzz,
+from an AFL++ persistent-mode forkserver (``rehost.forkserver``).
 """
 
 from __future__ import annotations
@@ -23,12 +27,14 @@ import logging
 import mmap
 import os
 import struct
+import sys
+import time
 from pathlib import Path
 from typing import BinaryIO
 
 from rehost.errors import ConfigError, FuzzInputError
 from rehost.memory import access_mask
-from rehost.result import RunResult
+from rehost.result import STATUS_HALTED, STATUS_LIMIT, STATUS_TIMEOUT, RunResult
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +161,8 @@ class FuzzHarness:
         elif self.config.mode == "mmio":
             for address, value, size in parse_mmio_script(blob):
                 self.machine.write_mmio(address, value, size)
+        elif self.config.mode == "uart":
+            self._apply_uart(blob)
         else:
             raise ConfigError(f"unknown fuzz mode {self.config.mode!r}")
 
@@ -174,6 +182,24 @@ class FuzzHarness:
         if window.length_address is not None:
             self.machine.write_u32(window.length_address, len(data))
 
+    def _apply_uart(self, data: bytes) -> None:
+        """Replace UART RX with the testcase. A restored queue is cleared first."""
+        window = self.config.uart
+        if window is None:
+            raise ConfigError("fuzz.mode uart requires fuzz.uart")
+        if len(data) > window.max_size:
+            logger.warning(
+                "fuzz input truncated from %d to %d bytes", len(data), window.max_size
+            )
+            data = data[: window.max_size]
+        from rehost.serial import resolve_uart
+
+        uart = resolve_uart(self.machine, window.name)
+        uart.rx.clear()
+        uart.rx_irq_armed = False
+        if data:
+            uart.queue_rx(data)
+
 
 def is_fuzz_crash(result: RunResult, fuzz) -> bool:
     """True when the fuzzer should keep this input and signal a crash.
@@ -192,6 +218,102 @@ def is_fuzz_crash(result: RunResult, fuzz) -> bool:
     return any((address & ~1) == pc for address in fuzz.crash_addresses)
 
 
+def is_fuzz_hang(result: RunResult, fuzz) -> bool:
+    """True when this stop should be saved as a hang and kept out of the corpus.
+
+    A wall-clock timeout is always a hang. The instruction cap is a hang
+    for a buffer or MMIO sink, which is expected to reach ``BKPT`` or a
+    halt address. ``fuzz.hang_on_limit: false`` (the UART default) means
+    the guest is a command loop: hitting the cap is a finished execution,
+    and the campaign still records its edges. afl-fuzz has its own ``-t``
+    and does not use this helper.
+    """
+    if result.status == STATUS_TIMEOUT:
+        return True
+    if result.status == STATUS_LIMIT:
+        if fuzz is None:
+            return True
+        return bool(fuzz.hang_on_limit)
+    return False
+
+
+class _BannerWatch:
+    """Stop once the UART has transmitted and then stayed quiet.
+
+    Quiet time before the first transmitted byte does not count, so reset
+    is not mistaken for the banner. When ``contains`` is set, quiet time
+    also waits until that ASCII text is already in TX.
+    """
+
+    def __init__(self, machine, uart, idle: int, contains: bytes) -> None:
+        self.machine = machine
+        self.uart = uart
+        self.idle = idle
+        self.contains = contains
+        self.tx_len = len(uart.tx)
+        self.quiet = 0
+        self.seen = self.tx_len > 0
+        self.reached = False
+
+    def on_retired(self, _instructions: int) -> None:
+        if self.reached:
+            return
+        tx_len = len(self.uart.tx)
+        if tx_len != self.tx_len:
+            self.tx_len = tx_len
+            self.quiet = 0
+            self.seen = True
+            return
+        if not self.seen:
+            return
+        if self.contains and self.contains not in self.uart.tx:
+            self.quiet = 0
+            return
+        self.quiet += 1
+        if self.quiet >= self.idle:
+            self.reached = True
+            self.machine.request_stop(
+                STATUS_HALTED,
+                f"uart {self.uart.name} tx quiet for {self.idle} instructions",
+            )
+
+
+class _ExecQuiet:
+    """End one UART case once RX is empty and TX has settled.
+
+    Quiet time does not accumulate while RX still holds bytes, so a pause
+    before the guest has taken the line is not the end of the case. TX
+    growth resets the counter, so a long reply is not cut off. A line the
+    guest accepts and then does not answer (a partial line with no newline,
+    or homing with no prompt yet) ends after ``idle`` quiet instructions
+    instead of burning the instruction cap. A guest that never drains RX
+    still runs to the cap.
+    """
+
+    def __init__(self, machine, uart, idle: int) -> None:
+        self.machine = machine
+        self.uart = uart
+        self.idle = idle
+        self.tx_len = len(uart.tx)
+        self.quiet = 0
+
+    def on_retired(self, _instructions: int) -> None:
+        tx_len = len(self.uart.tx)
+        if tx_len != self.tx_len:
+            self.tx_len = tx_len
+            self.quiet = 0
+            return
+        if self.uart.rx:
+            self.quiet = 0
+            return
+        self.quiet += 1
+        if self.quiet >= self.idle:
+            self.machine.request_stop(
+                STATUS_HALTED,
+                f"uart {self.uart.name} rx empty and tx quiet for {self.idle} instructions",
+            )
+
+
 class PersistentHarness:
     """Snapshot, apply one input, run, and restore on the next call.
 
@@ -207,6 +329,12 @@ class PersistentHarness:
         self.machine = machine
         self._fuzz = None
         self._snapshot = None
+        self.checkpoint_mode = "boot"
+        self.checkpoint_instructions = 0
+        self.checkpoint_pc = 0
+        self.checkpoint_tx = b""
+        self.checkpoint_uart: str | None = None
+        self.checkpoint_seconds = 0.0
 
     @property
     def fuzz(self):
@@ -216,10 +344,88 @@ class PersistentHarness:
         return self._fuzz
 
     def checkpoint(self):
-        if not self.machine.booted:
+        """Snapshot the baseline. Banner mode runs the guest once to get there.
+
+        A second call returns the same snapshot. It does not run again, so
+        a testcase cannot move the baseline.
+        """
+        if self._snapshot is not None:
+            return self._snapshot
+        started = time.perf_counter()
+        fuzz = self.machine.config.fuzz
+        if fuzz is not None and fuzz.checkpoint.mode == "banner":
+            self._reach_banner(fuzz)
+        elif not self.machine.booted:
             self.machine.boot()
         self._snapshot = self.machine.snapshot()
+        self.checkpoint_seconds = time.perf_counter() - started
+        self._remember_checkpoint(fuzz)
         return self._snapshot
+
+    def _reach_banner(self, fuzz) -> None:
+        """Boot, run until TX goes quiet, and leave the machine there."""
+        from rehost.serial import resolve_uart
+
+        spec = fuzz.checkpoint
+        if spec.idle_instructions is None:
+            raise ConfigError("fuzz.checkpoint mode banner requires idle_instructions")
+        uart_name = None if fuzz.uart is None else fuzz.uart.name
+        uart = resolve_uart(self.machine, uart_name)
+        if not self.machine.booted:
+            self.machine.boot()
+        contains = b"" if spec.contains is None else spec.contains.encode("ascii")
+        watch = _BannerWatch(self.machine, uart, spec.idle_instructions, contains)
+        run = self.machine.config.run
+        saved = run.max_instructions
+        if spec.max_instructions is not None:
+            run.max_instructions = spec.max_instructions
+        self.machine._retire_hook = watch.on_retired
+        try:
+            result = self.machine.run()
+        finally:
+            self.machine._retire_hook = None
+            run.max_instructions = saved
+        if not watch.reached:
+            marker = f" containing {spec.contains!r}" if spec.contains else ""
+            raise FuzzInputError(
+                f"banner checkpoint did not see {uart.name} go quiet{marker} "
+                f"({result.status}: {result.detail}; tx {len(uart.tx)} bytes). "
+                "Raise fuzz.checkpoint.max_instructions, or lower idle_instructions "
+                "if the banner never pauses."
+            )
+
+    def _remember_checkpoint(self, fuzz) -> None:
+        registers = self.machine.backend.read_registers()
+        self.checkpoint_pc = int(registers.get("pc", 0))
+        self.checkpoint_mode = "boot" if fuzz is None else fuzz.checkpoint.mode
+        self.checkpoint_uart = None
+        self.checkpoint_tx = b""
+        if fuzz is None or fuzz.checkpoint.mode != "banner":
+            self.checkpoint_instructions = 0
+            return
+        from rehost.serial import resolve_uart
+
+        uart_name = None if fuzz.uart is None else fuzz.uart.name
+        uart = resolve_uart(self.machine, uart_name)
+        self.checkpoint_uart = uart.name
+        self.checkpoint_tx = bytes(uart.tx)
+        # The warmup run's instruction count is not guest state. Read it
+        # back from the last result by asking the machine, which still
+        # holds the counter until the next run() clears it.
+        self.checkpoint_instructions = self.machine._instructions
+        preview = self.checkpoint_tx[:80].decode("ascii", errors="replace")
+        preview = preview.replace("\r", "\\r").replace("\n", "\\n")
+        print(
+            "checkpoint: banner "
+            f"pc: {self.checkpoint_pc:#010x} "
+            f"instructions: {self.checkpoint_instructions} "
+            f"uart: {uart.name} "
+            f"tx: {len(self.checkpoint_tx)} bytes "
+            f"warmup: {self.checkpoint_seconds:.2f}s "
+            f"preview: {preview!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def reset_to_checkpoint(self) -> None:
         """Restore the boot checkpoint, taking it on the first call.
@@ -236,7 +442,30 @@ class PersistentHarness:
     def exec_one(self, data: bytes):
         self.reset_to_checkpoint()
         self.fuzz.apply(data)
-        return self.machine.run()
+        run = self.machine.config.run
+        limits = self.fuzz.config.exec
+        saved = (run.max_instructions, run.timeout_ms)
+        if limits.max_instructions is not None:
+            run.max_instructions = limits.max_instructions
+        if limits.timeout_ms is not None:
+            run.timeout_ms = limits.timeout_ms
+        watch = self._arm_exec_quiet(limits.idle_instructions)
+        try:
+            return self.machine.run()
+        finally:
+            if watch is not None:
+                self.machine._retire_hook = None
+            run.max_instructions, run.timeout_ms = saved
+
+    def _arm_exec_quiet(self, idle: int | None):
+        if not idle or self.fuzz.config.mode != "uart":
+            return None
+        from rehost.serial import resolve_uart
+
+        uart = resolve_uart(self.machine, self.fuzz.config.uart.name if self.fuzz.config.uart else None)
+        watch = _ExecQuiet(self.machine, uart, idle)
+        self.machine._retire_hook = watch.on_retired
+        return watch
 
 
 def _read_path(path: Path, what: str) -> bytes:

@@ -156,4 +156,69 @@ assert b"reboot" in tx and b"Reboot the node" in tx
 - The instruction cap ends the run in the shell poll. The shell does not
   halt, and nothing here reboots the core on the `reboot` command.
 - There is no interactive TTY. `--serial-in` and `rehost.serial.run_lines`
-  are the console.
+  are the console. The fuzz path below queues bytes on UART0 RX after the
+  banner.
+
+## Fuzz campaign
+
+`examples/console-p2im.yaml` uses the same UART sink as the CNC map.
+UART0 RX, 64 bytes, checkpoint after TX contains `Welcome to RIOT` and has
+been quiet for 8000 instructions. The case ends once RX is empty and TX
+has been quiet for another 8000 instructions. A guest that never drains
+RX runs to 120000 instructions, and that cap is not a hang.
+`timeout_ms: 8000` is the hang. CI does not run this.
+
+Seeds in [`examples/seeds/console/`](seeds/console/), each ending in a newline:
+
+| File | Bytes |
+| --- | --- |
+| `00-empty.txt` | `\n` |
+| `01-help.txt` | `help\n` |
+| `02-ps.txt` | `ps\n` |
+| `03-saul.txt` | `saul\n` |
+
+`reboot` is not a seed. On this model it echoes the line and writes
+`AIRCR.SYSRESETREQ`. Jig stops that as a fault (`other` / `reset`) instead
+of resetting the core. A campaign that mutates its way to `reboot` will
+bucket that stop. It is the missing reset, not a RIOT memory bug.
+
+```bash
+curl -L -o Console \
+  https://raw.githubusercontent.com/RiS3-Lab/p2im-real_firmware/master/binary/Console
+
+jig-emu fuzz -c examples/console-p2im.yaml -f Console \
+  --out ./console-campaign \
+  --seeds examples/seeds/console \
+  --max-execs 1000 \
+  --rng-seed 1
+```
+
+A banner checkpoint on the machine used for this note was 34159
+instructions and under a second. TX was the `2018.04-vm-HEAD` line,
+`Welcome to RIOT!`, and the `>` prompt. `help` from that snapshot printed
+the four commands and returned to the prompt in about 33000 instructions.
+
+### Recorded run
+
+15 Nov 2026, in-process campaign, `--max-execs 1000 --rng-seed 1`,
+against the published Console ELF (not stored in this tree):
+
+```text
+execs: 1000
+corpus: 13
+crashes: 0
+buckets: 0
+hangs: 0
+edges: 1810
+execs/sec: 4.7
+seconds: 215.0
+rng-seed: 1
+```
+
+The banner checkpoint before that timer was 34159 instructions, 0.77
+seconds, PC `0x00000f88`, TX `main(): This is RIOT! (Version: 2018.04-vm-HEAD)`,
+`Welcome to RIOT!`, and the `>` prompt. No fault and no hang in these
+1000 executions. The corpus past the four seeds is shell editing
+(`\x08` backspace, DEL) and a few one-byte edits of `help`. `reboot` was
+not reached. The separate `reboot` probe above is still the model stop
+on `AIRCR.SYSRESETREQ`, not something this budget tripped.

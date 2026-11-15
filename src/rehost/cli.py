@@ -160,6 +160,43 @@ def main(argv: list[str] | None = None) -> int:
     fixtures = sub.add_parser("fixtures", help="List built-in synthetic fixtures")
     fixtures.add_argument("-v", "--verbose", action="store_true")
 
+    inspect = sub.add_parser(
+        "inspect",
+        help="Read an ELF or Intel HEX image and print a suggested memory map",
+    )
+    inspect.add_argument(
+        "firmware",
+        help="ELF32 or Intel HEX you already have. Not executed, and not fetched.",
+    )
+
+    map_parser = sub.add_parser(
+        "map",
+        help="Write a starter machine file from an ELF or Intel HEX image",
+    )
+    map_sub = map_parser.add_subparsers(dest="map_cmd", required=True)
+    init = map_sub.add_parser(
+        "init",
+        help="Write starter YAML. Does not emulate the image.",
+    )
+    init.add_argument(
+        "firmware",
+        help="ELF32 or Intel HEX you already have. Not executed, and not fetched.",
+    )
+    init.add_argument(
+        "-o",
+        "--output",
+        help="YAML path to write. Omit to print the YAML on stdout.",
+    )
+    init.add_argument(
+        "--name",
+        help="Machine name. Default: the firmware file's stem.",
+    )
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite --output if it already exists.",
+    )
+
     args = parser.parse_args(argv)
     configure_logging(getattr(args, "verbose", False))
     try:
@@ -167,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
             return _plugins()
         if args.cmd == "fixtures":
             return _fixtures()
+        if args.cmd == "inspect":
+            return _inspect(args)
+        if args.cmd == "map":
+            return _map_init(args)
         if args.cmd == "fuzz":
             return _fuzz(args)
         if args.cmd == "triage":
@@ -203,6 +244,43 @@ def _plugins() -> int:
     print("backends:")
     for name in available_backends():
         print(f"  {name}")
+    return 0
+
+
+def _read_user_image(path: str) -> bytes:
+    """Bytes of an image the caller already has. Nothing is downloaded."""
+    file = Path(path)
+    if not file.is_file():
+        raise RehostError(f"firmware image not found: {file}")
+    data = file.read_bytes()
+    if not data:
+        raise RehostError(f"firmware image is empty: {file}")
+    return data
+
+
+def _inspect(args: argparse.Namespace) -> int:
+    from rehost.mapinit import format_inspection, inspect_image
+
+    info = inspect_image(_read_user_image(args.firmware))
+    print(format_inspection(info))
+    return 0
+
+
+def _map_init(args: argparse.Namespace) -> int:
+    from rehost.mapinit import inspect_image, machine_name_from_stem, render_machine_yaml
+
+    blob = _read_user_image(args.firmware)
+    info = inspect_image(blob)
+    name = args.name or machine_name_from_stem(Path(args.firmware).stem)
+    text = render_machine_yaml(info, name=name)
+    if args.output:
+        dest = Path(args.output)
+        if dest.exists() and not args.force:
+            raise RehostError(f"{dest} already exists; pass --force to overwrite")
+        dest.write_text(text, encoding="utf-8")
+        print(f"wrote {dest}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
     return 0
 
 
