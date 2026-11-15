@@ -2,10 +2,13 @@
 #
 # This is the machine file to copy when you point jig-emu at an image you
 # built yourself (a Zephyr sample or a FreeRTOS UART program). It is not a
-# vendor HAL, and it does not boot a binary that this repository does not
-# contain. The synthetic proof that the same addresses tick and answer Modbus
-# is the plant-floor fixture. The procedure for swapping in your image is in
-# the README section "Plant-floor beachhead".
+# vendor HAL. The file contains no firmware. The synthetic proof that the
+# same addresses tick and answer Modbus is the plant-floor fixture. A
+# recorded smoke of the published P2IM CNC image (grbl 0.8c) uses this map
+# with a longer timeout; that binary is not in this repository. See
+# examples/cnc-p2im.yaml and the README section "P2IM CNC". The procedure
+# for swapping in your own image is in the README section "Plant-floor
+# beachhead".
 #
 # Layout follows RM0090. Flash is the 1 MiB window at 0x08000000. The alias at
 # 0x00000000 is not mapped, so a null fetch still faults. SRAM is 128 KiB at

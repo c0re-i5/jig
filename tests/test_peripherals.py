@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from rehost.config import load_config
 from rehost.errors import ConfigError
 from rehost.fuzz import FuzzHarness, encode_mmio_script
 from rehost.machine import Machine
@@ -547,6 +548,33 @@ def test_stm32f4_clock_template_returns_ready_bits():
     assert sram.base == 0x20000000
     assert machine.config.boot.vector_base == 0x08000000
     assert not any(region.base == 0xE000E000 for region in machine.config.memory)
+
+
+def test_cnc_p2im_map_is_the_clock_template_with_smoke_limits():
+    """The CNC example is the F4 map plus the recorded run limits.
+
+    The firmware binary stays out of the tree. This only locks the machine
+    file so a later edit of the template cannot silently diverge.
+    """
+    root = Path(__file__).resolve().parents[1]
+    clock = load_config(root / "examples" / "stm32f4_clock.yaml")
+    cnc = load_config(root / "examples" / "cnc-p2im.yaml")
+    assert cnc.name == "p2im-cnc"
+    assert "not in this repository" in cnc.description
+    assert cnc.arch == clock.arch
+    assert cnc.endian == clock.endian
+    assert cnc.load_base == clock.load_base == 0x08000000
+    assert cnc.memory == clock.memory
+    assert cnc.boot == clock.boot
+    assert cnc.unmapped == clock.unmapped
+    assert cnc.fuzz is None and clock.fuzz is None
+    assert cnc.run.timeout_ms == 15000
+    assert cnc.run.max_instructions == 2_000_000
+    assert cnc.run.trace_limit == 128
+    assert cnc.run.halt_on_bkpt == clock.run.halt_on_bkpt
+    assert cnc.run.halt_addresses == clock.run.halt_addresses
+    assert cnc.run.collect_coverage == clock.run.collect_coverage
+    assert clock.run.timeout_ms == 2000
 
 
 def test_ready_bits_load_from_toml(tmp_path: Path):
