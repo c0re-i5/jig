@@ -52,8 +52,9 @@ memory:
     read_default: 0
     config:
       registers:
-        # CR. HSIRDY (bit 1) stays set, along with the other ready bits the
-        # full template forces. See examples/stm32f4_clock.yaml for the rest.
+        # CR. Ready bits stay set so this fixture's poll exits. The copy-me
+        # template (examples/stm32f4_clock.yaml) uses follow instead, so a
+        # ready bit tracks its enable bit. This fixture does not.
         0x00:
           reset: 0x00000083
           writable: true

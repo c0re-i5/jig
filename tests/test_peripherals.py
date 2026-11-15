@@ -290,18 +290,247 @@ def test_register_block_ready_bits_survive_writes_and_unknown_fields_fail():
         )
 
 
+def test_follow_bits_track_enable_and_clear_when_disabled():
+    block = RegisterBlock(
+        name="rcc",
+        base=0x40023800,
+        size=0x100,
+        config={
+            "registers": {
+                "0x0": {
+                    "reset": 0x83,
+                    "follow": [
+                        {"src": 0, "dst": 1},
+                        {"src": 16, "dst": 17},
+                        {"src": 24, "dst": 25},
+                    ],
+                },
+                "0x8": {
+                    "reset": 0,
+                    "follow": [{"src": 0, "dst": 2, "width": 2}],
+                },
+            }
+        },
+    )
+    # Reset HSION is set, so HSIRDY reads set. HSE and PLL are not.
+    assert block.read(0, 4) & 0x3 == 0x3
+    assert block.read(0, 4) & 0x02020000 == 0
+    block.write(0, 4, 0)
+    assert block.read(0, 4) & 0x02020002 == 0
+    # Writing the ready bit alone does not stick while the enable is clear.
+    block.write(0, 4, 1 << 17)
+    assert block.read(0, 4) & (1 << 17) == 0
+    block.write(0, 4, 1 << 16)
+    assert block.read(0, 4) & (1 << 17)
+    block.write(0, 4, 0)
+    assert block.read(0, 4) & (1 << 17) == 0
+    block.write(8, 4, 0)
+    assert block.read(8, 4) & 0xC == 0
+    block.write(8, 4, 0x2)
+    assert block.read(8, 4) & 0xC == 0x8
+    block.write(8, 4, 0x1)
+    assert block.read(8, 4) & 0xC == 0x4
+    state = block.snapshot_state()
+    block.write(0, 4, 0)
+    block.restore_state(state)
+    assert block.read(8, 4) & 0xC == 0x4
+    with pytest.raises(ConfigError, match="overlap"):
+        RegisterBlock(
+            name="rcc",
+            base=0x40023800,
+            size=0x100,
+            config={"registers": {"0x0": {"follow": [{"src": 0, "dst": 1}, {"src": 2, "dst": 1}]}}},
+        )
+    with pytest.raises(ConfigError, match="follow must be a list"):
+        RegisterBlock(
+            name="rcc",
+            base=0x40023800,
+            size=0x100,
+            config={"registers": {"0x0": {"follow": {"src": 0, "dst": 1}}}},
+        )
+
+
+def test_guest_poll_sees_ready_follow_enable():
+    """The HAL off-then-on wait, and SWS following SW, as the CPU observes them."""
+    source = """
+        movw r0, #0x3800
+        movt r0, #0x4002
+        movs r1, #0
+        str r1, [r0]
+    hse_off:
+        ldr r1, [r0]
+        lsrs r1, r1, #17
+        movs r2, #1
+        ands r1, r2
+        bne hse_off
+        movs r1, #1
+        lsls r1, r1, #16
+        str r1, [r0]
+    hse_on:
+        ldr r1, [r0]
+        lsrs r1, r1, #17
+        movs r2, #1
+        ands r1, r2
+        beq hse_on
+        movw r3, #0x3808
+        movt r3, #0x4002
+        movs r1, #0
+        str r1, [r3]
+    sws_hsi:
+        ldr r1, [r3]
+        lsrs r1, r1, #2
+        movs r2, #3
+        ands r1, r2
+        bne sws_hsi
+        movs r1, #2
+        str r1, [r3]
+    sws_pll:
+        ldr r1, [r3]
+        lsrs r1, r1, #2
+        movs r2, #3
+        ands r1, r2
+        cmp r1, #2
+        bne sws_pll
+        bkpt #0
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "rcc",
+                "base": 0x40023800,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "register_block",
+                "config": {
+                    "registers": {
+                        "0x0": {
+                            "reset": 0x83,
+                            "follow": [{"src": 16, "dst": 17}],
+                        },
+                        "0x8": {"follow": [{"src": 0, "dst": 2, "width": 2}]},
+                    }
+                },
+            }
+        ],
+    )
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.instructions < 80
+    assert machine.read_mmio(0x40023800, 4) & (1 << 17)
+    assert machine.read_mmio(0x40023808, 4) & 0xC == 0x8
+
+
+def test_bitband_round_trip_updates_register_block_and_sram():
+    source = """
+        movw r0, #0x60
+        movt r0, #0x4200
+        movs r1, #1
+        str r1, [r0]
+        movw r2, #0
+        movt r2, #0x4000
+        ldr r3, [r2]
+        ldr r4, [r0]
+        movs r1, #0
+        str r1, [r0]
+        ldr r5, [r2]
+        ldr r6, [r0]
+        movw r0, #0x200
+        movt r0, #0x2200
+        movs r1, #1
+        str r1, [r0]
+        movw r2, #0x10
+        movt r2, #0x2000
+        ldrb r7, [r2]
+        bkpt #0
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "rcc",
+                "base": 0x40000000,
+                "size": 0x100,
+                "perms": "rw",
+                "peripheral": "register_block",
+                "config": {
+                    "registers": {
+                        "0x0": {"reset": 0, "follow": [{"src": 24, "dst": 25}]},
+                    }
+                },
+            },
+            {
+                "name": "peripheral_bitband",
+                "base": 0x42000000,
+                "size": 0x1000,
+                "perms": "rw",
+                "peripheral": "bitband",
+                "config": {"target": 0x40000000},
+            },
+            {
+                "name": "sram_bitband",
+                "base": 0x22000000,
+                "size": 0x1000,
+                "perms": "rw",
+                "peripheral": "bitband",
+                "config": {"target": 0x20000000},
+            },
+        ],
+    )
+    # Alias of bit 24 (byte 3, bit 0) before the guest runs.
+    machine.write_mmio(0x42000060, 1, 4)
+    shown = machine.read_mmio(0x40000000, 4)
+    assert shown & (1 << 24)
+    assert shown & (1 << 25)
+    assert machine.read_mmio(0x42000060, 4) == 1
+    machine.write_mmio(0x42000060, 0, 4)
+    assert machine.read_mmio(0x40000000, 4) & (1 << 25) == 0
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.registers["r4"] == 1
+    assert result.registers["r3"] & (1 << 24)
+    assert result.registers["r3"] & (1 << 25)
+    assert result.registers["r6"] == 0
+    assert result.registers["r5"] & (1 << 25) == 0
+    # Bit 0 of SRAM byte 0x20000010. The alias word is base + 0x10 * 32.
+    assert result.registers["r7"] == 1
+    assert machine.read_u32(0x20000010) & 1 == 1
+    with pytest.raises(ConfigError, match="overlaps its target"):
+        from rehost.peripherals.bitband import Bitband
+
+        Bitband(name="bb", base=0x20000000, size=0x1000, config={"target": 0x20000000})
+
+
 def test_stm32f4_clock_template_returns_ready_bits():
     root = Path(__file__).resolve().parents[1]
     machine = Machine.from_path(root / "examples" / "stm32f4_clock.yaml")
     cr = 0x40023800
     cfgr = 0x40023808
     sr = 0x40023C0C
+    # Reset HSION implies HSIRDY. The other ready bits follow disabled clocks.
+    assert machine.read_mmio(cr, 4) & 0x3 == 0x3
+    assert machine.read_mmio(cr, 4) & 0x0A020000 == 0
     machine.write_mmio(cr, 0, 4)
-    assert machine.read_mmio(cr, 4) & 0x0A020002 == 0x0A020002
+    assert machine.read_mmio(cr, 4) & 0x0A020002 == 0
+    machine.write_mmio(cr, 1 << 16, 4)
+    assert machine.read_mmio(cr, 4) & (1 << 17)
     machine.write_mmio(cfgr, 0, 4)
+    assert machine.read_mmio(cfgr, 4) & 0xC == 0
+    machine.write_mmio(cfgr, 0x2, 4)
     assert machine.read_mmio(cfgr, 4) & 0xC == 0x8
+    # __HAL_RCC_PLL_ENABLE() stores 1 at the PLLON bit-band alias.
+    pllon = 0x42470060
+    machine.write_mmio(pllon, 1, 4)
+    enabled = machine.read_mmio(cr, 4)
+    assert enabled & (1 << 24)
+    assert enabled & (1 << 25)
+    assert machine.read_mmio(pllon, 4) == 1
+    machine.write_mmio(pllon, 0, 4)
+    assert machine.read_mmio(cr, 4) & (1 << 25) == 0
     machine.write_mmio(sr, 0xFFFFFFFF, 4)
     assert machine.read_mmio(sr, 4) & 0x00010000 == 0
+    assert machine.peripheral("peripheral_bitband").target == 0x40000000
+    assert machine.peripheral("sram_bitband").target == 0x20000000
     usart = machine.peripheral("usart2")
     assert usart.rx_irq == 38
     assert usart.tx_empty_mask == 0xC0
@@ -338,9 +567,20 @@ def test_ready_bits_load_from_toml(tmp_path: Path):
         reset = 0x83
         writable = true
         read_set = 0x20000
+
+        [memory.config.registers."0x08"]
+        reset = 0
+        writable = true
+
+        [[memory.config.registers."0x08".follow]]
+        src = 0
+        dst = 2
+        width = 2
         """,
         encoding="utf-8",
     )
     machine = Machine.from_path(path)
     machine.write_mmio(0x40023800, 0, 4)
     assert machine.read_mmio(0x40023800, 4) & 0x20000 == 0x20000
+    machine.write_mmio(0x40023808, 1, 4)
+    assert machine.read_mmio(0x40023808, 4) & 0xC == 0x4

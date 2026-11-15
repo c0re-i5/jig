@@ -155,7 +155,8 @@ def _plugins() -> int:
         "uart": "TX byte log, RX queue, status flags, optional RX IRQ",
         "gpio": "output latch and sampled input",
         "systick": "per-instruction CTRL/LOAD/VAL/CALIB",
-        "register_block": "config-defined 32-bit registers",
+        "register_block": "config-defined 32-bit registers, with optional follow bits",
+        "bitband": "Cortex-M bit-band alias onto a target address",
         "unimplemented": "log the access and return read_default",
     }
     for name in available_plugins():

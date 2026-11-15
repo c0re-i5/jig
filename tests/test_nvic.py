@@ -65,9 +65,9 @@ class FakeCore:
         return int.from_bytes(self.read_mem(address, 4), "little")
 
 
-def _vector_table(*handlers: tuple[int, str]) -> str:
+def _vector_table(*handlers: tuple[int, str], sp: int = 0x20001000) -> str:
     by_exc = dict(handlers)
-    lines = [".word 0x20001000", ".thumb_word reset"]
+    lines = [f".word {sp:#x}", ".thumb_word reset"]
     for exc in range(2, 18):
         handler = by_exc.get(exc)
         lines.append(f".thumb_word {handler}" if handler else ".word 0")
@@ -114,6 +114,33 @@ def test_entry_stacks_frame_aligns_and_returns():
     assert core.regs["sp"] == 0x20001000
     assert (core.regs["xpsr"] & 0x1FF) == 0
     assert EXC_SYSTICK not in nvic.active
+
+
+def test_entry_clears_sp_low_bits_before_stkalign():
+    """Odd MSP/PSP still enter. RAZ happens before the 8-byte adjust."""
+    core = FakeCore()
+    nvic = Nvic(core)
+    core.regs["msp"] = core.regs["sp"] = 0x20001003
+    core.w32(EXC_SYSTICK * 4, 0x81)
+    nvic.enter(EXC_SYSTICK, 0x40)
+    assert nvic.fault is None
+    frame = 0x20001000 - 32
+    assert core.regs["sp"] == frame
+    assert core.regs["msp"] == frame
+    assert core.r32(frame + 28) & (1 << 9) == 0
+
+    core = FakeCore()
+    nvic = Nvic(core)
+    core.regs["msp"] = 0x20002000
+    core.regs["psp"] = core.regs["sp"] = 0x20000807
+    core.regs["control"] = 2
+    core.w32(EXC_SYSTICK * 4, 0x101)
+    nvic.enter(EXC_SYSTICK, 0x20)
+    assert nvic.fault is None
+    frame = 0x20000804 - 4 - 32
+    assert core.regs["psp"] == frame
+    assert core.regs["sp"] == 0x20002000
+    assert core.r32(frame + 28) & (1 << 9)
 
 
 def test_stkalign_sets_stacked_xpsr_bit9_and_psp_uses_thread_stack():
@@ -297,6 +324,97 @@ def test_snapshot_round_trip_of_nvic_state():
     assert restored.systick_pending is True
     assert EXC_SYSTICK in restored.active
     assert len(restored.external_priority) == NUM_EXTERNAL
+
+
+def test_odd_vector_stack_pointer_enters_systick():
+    """Atollic-style ``_estack`` with SP[1:0] set still takes exception 15."""
+    source = _vector_table((EXC_SYSTICK, "systick"), sp=0x20001003) + """
+        reset:
+            movw r3, #0xe010
+            movt r3, #0xe000
+            movs r1, #0xff
+            str r1, [r3, #4]
+            movs r1, #7
+            str r1, [r3, #0]
+        after:
+            nop
+            bkpt #0
+        systick:
+            add r0, sp, #0
+            movw r2, #0
+            movt r2, #0x2000
+            str r0, [r2, #0]
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[_SYSTICK],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    machine.boot()
+    assert machine.backend.read_register("sp") == 0x20001000
+    assert machine.backend.read_register("msp") == 0x20001000
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000000) == 0x20001000 - 32
+    assert result.sp == 0x20001000
+
+
+def test_msr_and_mov_to_sp_clear_low_bits():
+    source = """
+        movw r0, #0x1003
+        movt r0, #0x2000
+        msr msp, r0
+        mrs r1, msp
+        movw r2, #0x1007
+        movt r2, #0x2000
+        mov sp, r2
+        mov r3, sp
+        movw r4, #0
+        movt r4, #0x2000
+        str r1, [r4, #0]
+        str r3, [r4, #4]
+        bkpt #0
+    """
+    machine = machine_from_asm(source)
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000000) == 0x20001000
+    assert machine.read_u32(0x20000004) == 0x20001004
+    assert result.registers["sp"] == 0x20001004
+    assert result.registers["msp"] == 0x20001004
+
+
+def test_ldr_into_sp_clears_low_bits():
+    """``ldr.w sp, [rn]`` is what a Reset_Handler does with an odd ``_estack`` literal."""
+    source = """
+        movw r0, #0
+        movt r0, #0x2000
+        .word 0xD000F8D0
+        mrs r1, msp
+        str r1, [r0, #4]
+        bkpt #0
+    """
+    machine = machine_from_asm(source)
+    machine.write_u32(0x20000000, 0x20001003)
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert machine.read_u32(0x20000004) == 0x20001000
+    assert result.registers["sp"] == 0x20001000
+    assert result.registers["msp"] == 0x20001000
+
+
+def test_entry_boot_masks_stack_pointer():
+    machine = machine_from_asm(
+        "bkpt #0",
+        boot={"mode": "entry", "sp": 0x20001003, "entry": 0},
+    )
+    machine.boot()
+    assert machine.backend.read_register("sp") == 0x20001000
+    assert machine.backend.read_register("msp") == 0x20001000
+    result = machine.run()
+    assert result.status == "halted", result.detail
+    assert result.sp == 0x20001000
 
 
 def test_systick_tickint_runs_the_handler_and_unstacks():

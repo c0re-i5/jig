@@ -109,6 +109,8 @@ _TITLES = {
     "other": "Unclassified fault",
 }
 
+# Kept so reports recorded before SP[1:0] RAZ still classify. The CPU model
+# now forces those bits clear, so a new run does not produce this detail.
 _MISALIGNED_ENTRY = re.compile(
     r"^exception (\d+) entry with misaligned stack pointer (0x[0-9a-fA-F]+)$"
 )

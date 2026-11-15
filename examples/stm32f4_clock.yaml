@@ -23,8 +23,13 @@
 #             writes are logged and ignored. Copy the block for another port
 #             and change base and rx_irq (USART1 37, USART3 39, UART4 52,
 #             UART5 53, USART6 71).
-#   rcc       register_block ready-bit stub. Not an RCC state machine.
+#   rcc       register_block. Ready bits follow the enable bits in the same
+#             word (follow). Not an RCC state machine: no lock delay, and
+#             CFGR.SWS copies SW on the next read.
 #   flash_if  register_block. ACR reads back. FLASH_SR.BSY reads as 0.
+#   sram_bitband / peripheral_bitband
+#             Cortex-M alias windows. A word store sets or clears one bit
+#             of the target. The peripheral window is how HAL enables PLLON.
 #   systick   The per-instruction SysTick plugin.
 #   NVIC/SCB  Not a region in this file. The Cortex-M backend owns the system
 #             control page at 0xE000E000 (ISER, ICER, ISPR, ICPR, IPR, VTOR,
@@ -33,11 +38,13 @@
 #             plugin that sits inside it; the NVIC model does not claim those
 #             16 bytes.
 #
-# Ready bits are stuck on (or, for FLASH_SR.BSY and RCC_CFGR.SWS, forced to a
-# fixed pattern) so a poll loop exits. The stub does not follow enable bits,
-# it does not implement clear-on-write-1, and it does not update SWS when
-# firmware writes SW. SWS always reads as PLL (0b10). A wait for SWS == HSI
-# or HSE will not pass. Unknown register fields are errors.
+# Ready bits follow the enable bit in the same register: clear when the
+# enable is clear, set when it is set. That is the HAL sequence that waits
+# for HSERDY == 0, sets HSEON, then waits for HSERDY == 1. CFGR.SWS copies
+# SW, so a wait for HSI, HSE, or PLL completes as soon as SW is written.
+# There is still no lock delay and no clock-tree math. FLASH_SR.BSY stays 0
+# because nothing here programs flash. Unknown register fields are errors.
+# read_set is still available when a bit should stay stuck high.
 #
 # Filling in the rest
 #   1. Run with -v. "unhandled MMIO" lines are offsets inside a window below.
@@ -45,9 +52,10 @@
 #      unmapped.action is log, so those reads return 0 and the run continues.
 #      A fetch of an unmapped address still faults.
 #   2. When the image spins on a bit, add a register_block cell at that
-#      offset. read_set ORs bits on every read (ready flags). read_mask and
-#      read_bits force a field (SWS). writable: false ignores stores (a pure
-#      status register). Copy the pattern from RCC_CR and FLASH_SR.
+#      offset. follow copies an enable bit onto a ready bit (and clears it
+#      again when the enable clears). read_set ORs bits on every read.
+#      read_mask and read_bits force a field. writable: false ignores stores.
+#      Copy the pattern from RCC_CR and FLASH_SR.
 #   3. Prefer an unimplemented window for a peripheral you have not looked at
 #      yet, and register_block for the few offsets the image actually polls.
 #      Do not transcribe the reference manual into a HAL.
@@ -76,8 +84,9 @@
 name: stm32f4
 description: >
   STM32F405/407-class map: flash, SRAM, CCM, GPIOA, USART2 with RX IRQ 38,
-  RCC and FLASH ready-bit stubs, SysTick, and unimplemented windows for the
-  GPIO and serial-line tail. Starting point for an image you build yourself.
+  RCC ready bits that follow their enables, peripheral and SRAM bit-band
+  aliases, SysTick, and unimplemented windows for the GPIO and serial-line
+  tail. Starting point for an image you build yourself.
 arch: cortex-m
 endian: little
 
@@ -97,6 +106,16 @@ memory:
     base: 0x20000000
     size: 0x20000
     perms: rw
+  # SRAM bit-band alias, 0x22000000-0x23FFFFFF, onto 0x20000000-0x200FFFFF.
+  # The window is 32 MiB because each target bit occupies a word. Only the
+  # first 128 KiB of the target is this file's SRAM; the rest reads as 0.
+  - name: sram_bitband
+    base: 0x22000000
+    size: 0x02000000
+    perms: rw
+    peripheral: bitband
+    config:
+      target: 0x20000000
   - name: tim2
     base: 0x40000000
     size: 0x400
@@ -250,21 +269,26 @@ memory:
     read_default: 0
     config:
       registers:
-        # CR. HSIRDY, HSERDY, PLLRDY, and PLLI2SRDY stay set across writes.
+        # CR. HSIRDY, HSERDY, PLLRDY, and PLLI2SRDY follow the ON bits.
+        # Reset leaves HSION set, so HSIRDY reads set until firmware clears it.
         0x00:
           reset: 0x00000083
           writable: true
-          read_set: 0x0A020002
+          follow:
+            - {src: 0, dst: 1}        # HSIRDY follows HSION
+            - {src: 16, dst: 17}      # HSERDY follows HSEON
+            - {src: 24, dst: 25}      # PLLRDY follows PLLON
+            - {src: 26, dst: 27}      # PLLI2SRDY follows PLLI2SON
         # PLLCFGR. Published reset (RM0090). Not decoded.
         0x04:
           reset: 0x24003010
           writable: true
-        # CFGR. SWS (bits 3:2) always reads as PLL (0b10).
+        # CFGR. SWS (bits 3:2) copies SW (bits 1:0) on read.
         0x08:
           reset: 0
           writable: true
-          read_mask: 0xC
-          read_bits: 0x8
+          follow:
+            - {src: 0, dst: 2, width: 2}
         0x0C: {reset: 0, writable: true}
         0x10: {reset: 0, writable: true}
         0x14: {reset: 0, writable: true}
@@ -281,16 +305,18 @@ memory:
         0x58: {reset: 0, writable: true}
         0x60: {reset: 0, writable: true}
         0x64: {reset: 0, writable: true}
-        # BDCR. LSERDY (bit 1) stuck 1.
+        # BDCR. LSERDY (bit 1) follows LSEON (bit 0).
         0x70:
           reset: 0
           writable: true
-          read_set: 0x2
-        # CSR. LSIRDY (bit 1) stuck 1.
+          follow:
+            - {src: 0, dst: 1}
+        # CSR. LSIRDY (bit 1) follows LSION (bit 0).
         0x74:
           reset: 0
           writable: true
-          read_set: 0x2
+          follow:
+            - {src: 0, dst: 1}
         0x80: {reset: 0, writable: true}
         0x84: {reset: 0, writable: true}
   - name: flash_if
@@ -329,6 +355,16 @@ memory:
     perms: rw
     peripheral: unimplemented
     read_default: 0
+  # Peripheral bit-band alias, 0x42000000-0x43FFFFFF, onto
+  # 0x40000000-0x400FFFFF. __HAL_RCC_PLL_ENABLE() stores 1 at 0x42470060,
+  # which is RCC_CR bit 24 (PLLON). PLLRDY then follows that bit.
+  - name: peripheral_bitband
+    base: 0x42000000
+    size: 0x02000000
+    perms: rw
+    peripheral: bitband
+    config:
+      target: 0x40000000
   - name: systick
     base: 0xE000E010
     size: 0x10

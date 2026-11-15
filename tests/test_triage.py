@@ -224,16 +224,32 @@ def test_live_stops_use_the_hook_and_the_nvic_model():
     assert classify(masked).fault_class == "hardfault"
     assert classify(masked).reason == "lockup"
 
+    # MSR of 1 is RAZ'd to 0. SVCall is a real vector, so entry tries to
+    # stack at the top of memory and fails because that frame is not RAM.
+    # The old misaligned-SP detail is still classified for reports written
+    # before that change.
     crooked = machine_from_asm(
-        """
-        movs r0, #1
-        msr msp, r0
-        svc #1
-        bkpt #0
-        """
+        _vectors((11, "handler"))
+        + """
+        reset:
+            movs r0, #1
+            msr msp, r0
+            svc #1
+            bkpt #0
+        handler:
+            bkpt #1
+        """,
+        boot={"mode": "vector", "vector_base": 0},
     ).run()
-    assert classify(crooked).fault_class == "bad_sp"
-    assert classify(crooked).reason == "misaligned"
+    crooked_class = classify(crooked)
+    assert crooked_class.fault_class == "bad_sp"
+    assert crooked_class.reason == "frame"
+    assert "could not stack" in crooked.detail
+    assert crooked.registers["msp"] == 0
+    legacy = classify(_result("exception 15 entry with misaligned stack pointer 0x2001ffcf"))
+    assert legacy.fault_class == "bad_sp"
+    assert legacy.reason == "misaligned"
+    assert legacy.fault_address == 0x2001FFCF
 
     overflow_machine = machine_from_asm(
         _vectors((11, "handler"))

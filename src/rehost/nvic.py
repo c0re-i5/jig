@@ -13,6 +13,10 @@ Modeled
     and writes LR with EXC_RETURN. On return it unstacks that frame.
     ``0xFFFFFFF1`` returns to Handler mode on MSP, ``0xFFFFFFF9`` to Thread
     mode on MSP, and ``0xFFFFFFFD`` to Thread mode on PSP.
+    SP[1:0] are RAZ/WI. Entry and return force those bits clear before using
+    the pointer, then apply CCR.STKALIGN to bit 2. An odd value loaded from
+    the vector table, or written later by MSR, MOV, or LDR into SP, does not
+    fault exception entry.
 
     Priority uses all eight implemented bits. AIRCR.PRIGROUP splits group
     priority from subpriority. A pending exception is taken only when it is
@@ -51,6 +55,12 @@ RETIRE = "retire"
 SKIP = "skip"
 REDIRECT = "redirect"
 STOP = "stop"
+
+
+def raz_sp(value: int) -> int:
+    """Clear SP[1:0]. Cortex-M ignores writes to those bits."""
+    return value & 0xFFFFFFFC
+
 
 _FIXED_PRIORITY = {EXC_NMI: -2, EXC_HARDFAULT: -1}
 _SHPR_EXCEPTIONS = (4, 5, 6, 11, 12, 14, 15)
@@ -280,10 +290,7 @@ class Nvic:
         else:
             exc_return = 0xFFFFFFF9
         bank = "psp" if use_psp else "msp"
-        sp = self.core.read_reg(bank) & 0xFFFFFFFF
-        if sp & 0x3:
-            self.fault = f"exception {exc} entry with misaligned stack pointer {sp:#x}"
-            return
+        sp = self._align_bank(bank)
         vector = self._read_vector(exc)
         if vector is None:
             return
@@ -342,10 +349,7 @@ class Nvic:
                 )
                 return
         bank = "psp" if to_psp else "msp"
-        sp = self.core.read_reg(bank) & 0xFFFFFFFF
-        if sp & 0x3:
-            self.fault = f"exception return with misaligned stack pointer {sp:#x}"
-            return
+        sp = self._align_bank(bank)
         try:
             blob = self.core.read_mem(sp, 32)
         except BackendError as exc:
@@ -661,6 +665,7 @@ class Nvic:
         self.core.write_reg(f"r{index}", value)
 
     def _write_sp(self, value: int) -> None:
+        value = raz_sp(value)
         ipsr = self.core.read_reg("xpsr") & 0x1FF
         control = self.core.read_reg("control")
         self.core.write_reg("sp", value)
@@ -668,6 +673,23 @@ class Nvic:
             self.core.write_reg("psp", value)
         else:
             self.core.write_reg("msp", value)
+
+    def _active_stack(self) -> str:
+        ipsr = self.core.read_reg("xpsr") & 0x1FF
+        control = self.core.read_reg("control") & 0xFFFFFFFF
+        if ipsr == 0 and (control & 0x2):
+            return "psp"
+        return "msp"
+
+    def _align_bank(self, bank: str) -> int:
+        """Force SP[1:0] clear on ``bank`` and on SP when that bank is current."""
+        raw = self.core.read_reg(bank) & 0xFFFFFFFF
+        aligned = raz_sp(raw)
+        if aligned != raw:
+            self.core.write_reg(bank, aligned)
+            if bank == self._active_stack():
+                self.core.write_reg("sp", aligned)
+        return aligned
 
     def _half(self, address: int) -> int:
         blob = self.core.read_mem(address & 0xFFFFFFFF, 2)
