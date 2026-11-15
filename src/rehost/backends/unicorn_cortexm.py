@@ -65,7 +65,7 @@ from rehost.backends.base import CpuBackend, MemAccess
 from rehost.backends.registry import register_backend
 from rehost.errors import BackendError
 from rehost.memory import PERM_EXEC, PERM_READ, PERM_WRITE
-from rehost.nvic import EXC_SVCALL, Nvic
+from rehost.nvic import EXC_SVCALL, Nvic, raz_sp
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,7 @@ _REGISTERS: tuple[tuple[str, int], ...] = (
     ("faultmask", UC_ARM_REG_FAULTMASK),
 )
 _REG_INDEX = {name: ident for name, ident in _REGISTERS}
+_STACK_REGS = frozenset({"sp", "msp", "psp"})
 
 _UNMAPPED = {
     UC_MEM_READ_UNMAPPED: "read_unmapped",
@@ -163,8 +164,11 @@ class UnicornCortexM(CpuBackend):
 
     def write_register(self, name: str, value: int) -> None:
         ident = self._ident(name)
+        # Cortex-M ignores writes to SP[1:0]. Mask here so boot, snapshots,
+        # and the per-instruction aligner cannot put an odd pointer back.
+        stored = raz_sp(value) if name in _STACK_REGS else value & 0xFFFFFFFF
         try:
-            self.uc.reg_write(ident, value & 0xFFFFFFFF)
+            self.uc.reg_write(ident, stored)
         except UcError as exc:
             raise BackendError(f"cannot write {name}: {exc}") from exc
 
@@ -201,9 +205,20 @@ class UnicornCortexM(CpuBackend):
 
     def hook_code(self, callback) -> None:
         def inner(_uc, address, size, _user) -> None:
+            # Guest MSR/MOV/LDR into SP happen inside Unicorn and skip
+            # write_register. Clear the bits before the instruction, and
+            # before exception entry, so the next use sees hardware RAZ.
+            self.align_stack_pointers()
             callback(address, size)
 
         self.uc.hook_add(UC_HOOK_CODE, inner)
+
+    def align_stack_pointers(self) -> None:
+        """Force SP, MSP, and PSP to word alignment if a guest write left them odd."""
+        for name in ("msp", "psp", "sp"):
+            value = self.read_register(name)
+            if value & 0x3:
+                self.write_register(name, value)
 
     def hook_interrupt(self, callback) -> None:
         def inner(_uc, vector, _user) -> None:

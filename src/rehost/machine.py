@@ -27,6 +27,7 @@ from rehost.errors import BackendError, ConfigError, MachineError
 from rehost.memory import PERM_READ, PERM_WRITE, MemoryMap, access_mask, pages_touched
 from rehost.nvic import EXC_SYSTICK, REDIRECT, STOP
 from rehost.peripherals import create_peripheral
+from rehost.peripherals.bitband import Bitband
 from rehost.peripherals.systick import SysTick
 from rehost.peripherals.uart import Uart
 from rehost.result import (
@@ -45,6 +46,23 @@ logger = logging.getLogger(__name__)
 # CoverageMap.on_instruction for a 65536-byte map, including when no bitmap
 # is attached, so a fuzz run and a later replay hash the same tail.
 _RECENT_LIMIT = 8
+
+
+def _contiguous_spans(pages: dict[int, int], page_size: int) -> list[tuple[int, int, int]]:
+    """Merge neighboring pages that share a permission value.
+
+    Returns ``(address, size, perms)`` in address order. ``pages`` maps a
+    page start to the permission bits recorded for that page.
+    """
+    spans: list[tuple[int, int, int]] = []
+    for start in sorted(pages):
+        perms = pages[start]
+        if spans and spans[-1][0] + spans[-1][1] == start and spans[-1][2] == perms:
+            base, size, old = spans[-1]
+            spans[-1] = (base, size + page_size, old)
+        else:
+            spans.append((start, page_size, perms))
+    return spans
 
 
 class Machine:
@@ -82,6 +100,8 @@ class Machine:
                 # After the init snapshot, so boot(reset) restores a clear latch
                 # and raises again below.
                 plugin.bind_rx_irq(self.inject_irq)
+            elif isinstance(plugin, Bitband):
+                plugin.bind(self._bitband_load_byte, self._bitband_store_byte)
         self._final_perms: dict[int, int] = {}
         self._hook_pages: set[int] = set()
         self._map_pages()
@@ -178,6 +198,9 @@ class Machine:
                 raise ConfigError("boot.mode entry requires boot.sp and boot.entry")
             sp = boot.sp
             entry = boot.entry
+        # write_register clears SP[1:0]. An odd vector word or boot.sp
+        # (Atollic ``_estack = ...FFFF``) becomes the word-aligned pointer
+        # hardware would have loaded.
         self.backend.write_register("sp", sp)
         self.backend.write_register("msp", sp)
         self.backend.write_register("lr", 0xFFFFFFFF)
@@ -369,9 +392,12 @@ class Machine:
                 self._final_perms[start] = self._final_perms.get(start, 0) | region.perms
                 if region.peripheral is not None:
                     self._hook_pages.add(start)
-        for start, perms in self._final_perms.items():
+        # A bit-band alias is 32 MiB. Map and hook each contiguous run once
+        # instead of once per page.
+        self._spans = _contiguous_spans(self._final_perms, page)
+        for start, size, perms in self._spans:
             # Writable until the image is loaded; ``run`` tightens this.
-            self.backend.map_memory(start, page, perms | PERM_WRITE)
+            self.backend.map_memory(start, size, perms | PERM_WRITE)
 
     def _install_hooks(self) -> None:
         self.backend.hook_code(self._on_code)
@@ -379,8 +405,9 @@ class Machine:
         self.backend.hook_unmapped(self._on_unmapped)
         self.backend.hook_prot(self._on_prot)
         page = self.backend.page_size
-        for start in sorted(self._hook_pages):
-            end = start + page - 1
+        hooked = {start: 0 for start in self._hook_pages}
+        for start, size, _perms in _contiguous_spans(hooked, page):
+            end = start + size - 1
             self.backend.hook_memory_read(self._on_read, start, end)
             self.backend.hook_memory_write(self._on_write, start, end)
 
@@ -391,11 +418,41 @@ class Machine:
         self._protected = True
 
     def _reprotect(self, *, writable: bool) -> None:
-        page = self.backend.page_size
-        for start, perms in self._final_perms.items():
+        for start, size, perms in self._spans:
             # Image load needs a temporary write window on execute-only flash.
             effective = perms | PERM_WRITE if writable else perms
-            self.backend.protect_memory(start, page, effective)
+            self.backend.protect_memory(start, size, effective)
+
+    def _bitband_load_byte(self, address: int) -> int:
+        """Byte a bit-band alias reads. Plugins win over plain RAM."""
+        region = self.memory.region_at(address)
+        if region is None:
+            return self.config.unmapped.read_default & 0xFF
+        peripheral = region.peripheral
+        if peripheral is None:
+            try:
+                return self.backend.read_memory(address, 1)[0]
+            except BackendError:
+                return 0
+        if isinstance(peripheral, Bitband):
+            return 0
+        return peripheral.read(address - region.base, 1) & 0xFF
+
+    def _bitband_store_byte(self, address: int, value: int) -> None:
+        """Read-modify-write one target byte for a bit-band store."""
+        value &= 0xFF
+        region = self.memory.region_at(address)
+        if region is None:
+            return
+        peripheral = region.peripheral
+        if isinstance(peripheral, Bitband):
+            return
+        if peripheral is not None:
+            peripheral.write(address - region.base, 1, value)
+        try:
+            self.backend.write_memory(address, bytes([value]))
+        except BackendError:
+            return
 
     def _on_code(self, address: int, size: int) -> None:
         if address in self._halt_addresses:

@@ -38,7 +38,7 @@ Exit status is `0` for a halt (`BKPT` or a configured halt address), `1` for a f
 ```text
 src/rehost/
   backends/         CpuBackend and the Unicorn Cortex-M adapter
-  peripherals/      plugin registry plus UART, GPIO, SysTick, register block
+  peripherals/      plugin registry plus UART, GPIO, SysTick, register block, bit-band
   fixtures/         Thumb assembler and the synthetic programs
   modbus.py         Modbus RTU framing on the existing UART plugin
   config.py         YAML/TOML machine loader
@@ -158,7 +158,7 @@ unmapped:
 
 Regions must not overlap. The backend maps whole pages; two regions may share a page, and the page's permissions are the union. At least one of `timeout_ms` and `max_instructions` must be non-zero so a run cannot hang. `endian: big` is rejected.
 
-`boot.mode: vector` reads the initial stack pointer and reset vector from `vector_base`, and sets the Thumb bit. `boot.mode: entry` starts at `entry` with `sp`.
+`boot.mode: vector` reads the initial stack pointer and reset vector from `vector_base`, and sets the Thumb bit. `boot.mode: entry` starts at `entry` with `sp`. Cortex-M ignores bits [1:0] of SP, MSP, and PSP (they read as zero). An odd word in the vector table, or a later `MSR` / `MOV` / `LDR` into SP, is word-aligned before the next instruction and before exception entry. A firmware image whose `_estack` is `0x2001FFFF` can take SysTick without a patched binary.
 
 ### Plugins
 
@@ -167,7 +167,8 @@ Regions must not overlap. The backend maps whole pages; two regions may share a 
 | `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Other offsets are logged. Optional `rx_irq` (alias `irq`) latches that NVIC line when RX goes from empty to non-empty. Omit it and the line stays quiet. |
 | `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. |
 | `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. Firmware that never reads VAL still gets that step; there is no `tick_every_n_instructions` divider. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
-| `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable, read_set, read_mask, read_bits}`. Unlisted offsets log and return `read_default`. `read_set` is ORed on read. `read_mask` / `read_bits` then force those bits (`read_bits` must be a subset of `read_mask`). Unknown fields are errors. |
+| `register_block` | `registers` maps a 4-byte-aligned offset to `{reset, writable, read_set, read_mask, read_bits, follow}`. Unlisted offsets log and return `read_default`. On read, `follow` copies bits from the stored value (`{src, dst, width}`, `width` defaults to 1) so a ready bit tracks an enable and clears when the enable clears. `read_set` is then ORed. `read_mask` / `read_bits` replace those bits last (`read_bits` must be a subset of `read_mask`). Unknown fields are errors. |
+| `bitband` | Cortex-M bit-band alias. `config.target` is the first real address. A word at `base + byte*32 + bit*4` reads or writes that one bit of `target`. Bit 0 of the stored word is the bit. The target may be a plugin or RAM. |
 | `unimplemented` | Every access is logged once at INFO and reads return `read_default`. `mmio: true` selects this plugin when `peripheral` is omitted. |
 
 Unknown config keys are errors, so a typo does not silently do nothing.
@@ -397,7 +398,7 @@ The class comes from the detail string `Machine.run` already records, plus the r
 | `unmapped_read`, `unmapped_write` | Data access outside the machine map. Same hook, same limit: this is not entered as BusFault, and BFAR is not set. |
 | `prot_fetch`, `prot_read`, `prot_write` | The address is mapped, and the machine file's permissions reject the access. This is the rehost map, not an MPU MemManage fault. A write below `0x100` is `null_deref` instead. |
 | `stack_overflow` | Exception entry could not write the integer frame, SP still points into writable RAM, and the frame sits within 64 bytes below that region's base. That is a descending stack walking off the bottom of RAM. |
-| `bad_sp` | The stack pointer is not 4-byte aligned, or the frame is not the overflow case above (the pointer has left RAM, or exception return could not unstack). |
+| `bad_sp` | The frame is not writable RAM, exception return could not unstack, or a saved detail line still names a misaligned stack pointer. The CPU model forces SP[1:0] to zero, so a current run does not stop only because the vector table pointer was odd. |
 | `hardfault` | Lockup (the original exception and HardFault both could not be taken), a HardFault vector that is missing or not Thumb, or an exception return that failed an integrity check. The model stops. It does not nest another fault. |
 | `memmanage` | The NVIC model was entering exception 4. Ordinary unmapped accesses are not this class. MMFSR is not implemented. |
 | `bus_fault` | The NVIC model was entering exception 5. An unmapped access is classified above, because the hook stops the run before a BusFault is taken. |
@@ -497,13 +498,37 @@ To study a real RTOS image, build it yourself and pass the raw binary with `--fi
 
 The Unicorn backend delivers ARMv7-M exceptions before each instruction. SysTick is exception 15. External IRQ `n` is exception `16 + n`. The vector address is `VTOR + exception * 4`, and bit 0 of that word must be set. `boot.mode: vector` initializes VTOR from `vector_base`.
 
-On entry the model stacks `r0`, `r1`, `r2`, `r3`, `r12`, `lr`, the return PC, and `xPSR` on MSP or PSP (PSP only from Thread mode with `CONTROL.SPSEL`). `CCR.STKALIGN` (set at reset) forces 8-byte alignment and records the adjustment in stacked `xPSR` bit 9. `lr` becomes `0xFFFFFFF1` (back to Handler mode on MSP), `0xFFFFFFF9` (Thread mode, MSP), or `0xFFFFFFFD` (Thread mode, PSP). The handler runs on MSP with IPSR set to the exception number. Return is recognized on `BX`/`BLX`, `MOV PC`, and 16-bit or Thumb-2 `POP`/`LDM` that load an `EXC_RETURN` value; the frame is unstacked and `FAULTMASK` is cleared except on the way out of NMI.
+On entry the model stacks `r0`, `r1`, `r2`, `r3`, `r12`, `lr`, the return PC, and `xPSR` on MSP or PSP (PSP only from Thread mode with `CONTROL.SPSEL`). Bits [1:0] of the stack pointer are forced clear first. `CCR.STKALIGN` (set at reset) then forces 8-byte alignment and records the adjustment in stacked `xPSR` bit 9. `lr` becomes `0xFFFFFFF1` (back to Handler mode on MSP), `0xFFFFFFF9` (Thread mode, MSP), or `0xFFFFFFFD` (Thread mode, PSP). The handler runs on MSP with IPSR set to the exception number. Return is recognized on `BX`/`BLX`, `MOV PC`, and 16-bit or Thumb-2 `POP`/`LDM` that load an `EXC_RETURN` value; the frame is unstacked and `FAULTMASK` is cleared except on the way out of NMI.
 
 A pending exception runs when it is enabled, not already active, and its group priority is strictly more urgent than the execution priority. All eight priority bits are implemented. `AIRCR.PRIGROUP` splits group priority from subpriority. PRIMASK boosts execution priority to 0, FAULTMASK to -1, and BASEPRI masks on the group field (a zero group field disables BASEPRI). NMI is fixed at -2 and HardFault at -1. `inject_irq`, `ISPR`/`STIR`, and `ICSR` (`PENDSVSET`, `PENDSTSET`, `NMIPENDSET`) latch pending bits. Taking the exception clears the pending bit. `SVC` enters SVCall, or HardFault if the current priority or a mask blocks it.
 
 `WFI` and `WFE` do not suspend the emulator. If an exception can be taken, the stacked return PC is the instruction after the hint. Otherwise the hint retires in one instruction, including when PRIMASK or BASEPRI is holding a pending interrupt off, so `timeout_ms` and `max_instructions` still stop a wait loop.
 
 Not modeled: tail-chaining and late arrival (a new exception after a return is unstacked and stacked again), lazy floating-point frames (`EXC_RETURN` bit 4 clear stops the run), v8-M stack limits and security extensions, and `SLEEPONEXIT` / `SLEEPDEEP` (the bits are stored and do not change control). `AIRCR.SYSRESETREQ` stops the run as a fault instead of resetting the core.
+
+## Stack pointer, ready bits, and bit-band
+
+Three behaviors that show up in STM32 HAL startup are part of the model, not of one board file.
+
+**Stack pointer.** Writes to SP, MSP, and PSP clear bits [1:0]. The vector-table load does this, and so does a guest `MSR`, `MOV`, or `LDR` into SP: the bits are clear before the next instruction and before exception entry. `CCR.STKALIGN` still looks at bit 2 after that.
+
+**Ready bits.** A `register_block` cell may list `follow`. Each entry copies `width` bits from `src` onto `dst` at read time, using the value firmware stored. HSERDY can follow HSEON, including the wait for the bit to read 0 after a disable. A two-bit field is the same mechanism: `src: 0`, `dst: 2`, `width: 2` makes SWS a copy of SW. `read_set` still forces bits high when that is what you want. `read_mask` still wins last.
+
+**Bit-band.** The architecture aliases each bit of a 1 MiB region to its own word. A `bitband` region declares the alias window and `target`:
+
+```yaml
+- name: peripheral_bitband
+  base: 0x42000000
+  size: 0x02000000
+  perms: rw
+  peripheral: bitband
+  config:
+    target: 0x40000000
+```
+
+A store of 1 at `0x42470060` sets bit 0 of byte `0x40023803`, which is `RCC_CR.PLLON` on an STM32F4. If that cell's `follow` maps bit 24 onto bit 25, the next read of `RCC_CR` has PLLRDY set. A store of 0 clears it. The same plugin covers the SRAM alias at `0x22000000` with `target: 0x20000000`. The alias windows are 32 MiB because each target bit is a word. They are not a copy of the peripheral; reads and writes touch the real byte.
+
+`examples/stm32f4_clock.yaml` is a map that uses all three. It does not decode PLLCFGR or insert a lock delay. SWS changes on the read after SW is written.
 
 ## UART RX interrupt
 
@@ -642,14 +667,16 @@ fuzz:
 | Backup SRAM | `0x40024000` | 4 KiB, read/write. |
 | GPIOA | `0x40020000` | `IDR` at `0x10`, `ODR` at `0x14`. `MODER`, `BSRR`, and `AFR` are logged and read as 0. GPIOB through GPIOI are `unimplemented` windows. |
 | USART2 | `0x40004400` | Jig UART, RX IRQ 38. `TXE` and `TC` read as set. `RXNE` tracks the RX queue. |
-| RCC | `0x40023800` | `CR` keeps `HSIRDY`, `HSERDY`, `PLLRDY`, and `PLLI2SRDY` set (`read_set: 0x0A020002`) even if firmware writes the register. `CFGR.SWS` always reads as PLL (`0b10`). `LSERDY` and `LSIRDY` stay set. Enable-bit registers are ordinary writable cells. |
+| RCC | `0x40023800` | `CR` ready bits follow the ON bits (`HSIRDY`/`HSION`, `HSERDY`/`HSEON`, `PLLRDY`/`PLLON`, `PLLI2SRDY`/`PLLI2SON`). They clear when the enable clears. `CFGR.SWS` copies `SW`. `LSERDY` follows `LSEON` and `LSIRDY` follows `LSION`. There is no lock delay. |
 | FLASH | `0x40023C00` | `ACR` is writable, so a latency write reads back. `SR` ignores writes and `BSY` (bit 16) reads as 0. |
+| Peripheral bit-band | `0x42000000` | 32 MiB alias onto `0x40000000`. A word store sets or clears one bit. `0x42470060` is `RCC_CR.PLLON`. |
+| SRAM bit-band | `0x22000000` | 32 MiB alias onto `0x20000000`. |
 | SysTick | `0xE000E010` | The per-instruction counter above. |
 | NVIC / SCB | `0xE000E000` | Not a region. The Cortex-M backend owns this page. Do not map a plugin over it. SysTick is the one plugin inside the page; the NVIC model does not claim those 16 bytes. |
 
 USART1, USART3, UART4, UART5, USART6, TIM2, I2C1, SPI1, ADC, SYSCFG, EXTI, PWR, CRC, and DMA1/DMA2 are `unimplemented` 1 KiB windows: a read returns 0 and is logged once. A poll of a ready bit in one of those windows does not finish until you promote that offset to `register_block`. The file header lists the bases that are not mapped (other timers, CAN, DAC, Ethernet, USB) so you can paste a window when the trace names it.
 
-Unlisted RCC or FLASH offsets log and return 0. `unmapped.action` is `log`, so an address the file does not mention returns 0 instead of faulting. A fetch of an unmapped address still faults. A typo in a register field (`ready:` instead of `read_set:`) is still a config error. SWS does not follow SW. A loop that waits for HSI or HSE as the system clock will not finish. This is not a model of the RCC state machine, and it is not a GPIO or USART HAL.
+Unlisted RCC or FLASH offsets log and return 0. `unmapped.action` is `log`, so an address the file does not mention returns 0 instead of faulting. A fetch of an unmapped address still faults. A typo in a register field (`ready:` instead of `follow:`) is still a config error. SWS follows SW with no lock wait. This is not a model of the RCC state machine, and it is not a GPIO or USART HAL. The `plant-floor` fixture keeps the older stuck-ready `read_set` cells; the synthetic program only waits for bits that are already 1.
 
 The same keys load from TOML.
 
@@ -657,7 +684,7 @@ The same keys load from TOML.
 
 1. Run `jig-emu run -v --config examples/stm32f4_clock.yaml --firmware /path/to/image.bin`. `--firmware` is a raw image whose first word is the initial stack pointer. An ELF does not boot: the tool copies bytes to `load.base` and does not parse program headers. `arm-none-eabi-objcopy -O binary firmware.elf firmware.bin` is the usual conversion.
 2. `unhandled MMIO` names an offset inside a window the file already lists. `unmapped read` or `unmapped write` names an address to add. An instruction limit with the PC sitting in a compare/branch is a poll of a bit that still reads as 0.
-3. For that bit, add a `register_block` cell. `read_set` ORs bits on every read. `read_mask` and `read_bits` force a field. `writable: false` ignores stores. Copy `RCC_CR` and `FLASH_SR` in the template.
+3. For that bit, add a `register_block` cell. `follow` copies an enable bit onto a ready bit and clears it when the enable clears. `read_set` ORs bits on every read. `read_mask` and `read_bits` force a field. `writable: false` ignores stores. Copy `RCC_CR` and `FLASH_SR` in the template. A bit-band store shows up as an access in `0x42000000`–`0x43FFFFFF` or `0x22000000`–`0x23FFFFFF`; those windows are already in the template.
 4. Leave a peripheral you have not read yet as `unimplemented`. Promote the offsets the image actually spins on. Do not transcribe RM0090 into a HAL.
 5. In Ghidra, import the raw bin as ARM Cortex little-endian at `0x08000000`. Constants in `0x40000000`–`0x5FFFFFFF` and `0xE0000000`–`0xE00FFFFF` are the MMIO sites. Cross-check them against RM0090. The vector table in the startup file is where `rx_irq` comes from: USART1 is 37, USART2 is 38, USART3 is 39, UART4 is 52, UART5 is 53, USART6 is 71 on the F405/407.
 
@@ -716,11 +743,13 @@ Done:
 - Crash triage. Each crash is classified, deduplicated into a bucket, and written up with the `jig-emu run` command that replays it. `jig-emu triage` rebuilds the reports from an existing `--out` directory. See [Crash triage](#crash-triage).
 - Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt) and [Modbus RTU](#modbus-rtu).
 - Phase 5 beachhead. The `plant-floor` fixture boots from a vector table, takes one SysTick interrupt, answers one Modbus RTU read, and a short fuzz campaign writes a triage bucket for a planted fetch. `examples/stm32f4_clock.yaml` is the map and the procedure for an image you build. See [Plant-floor beachhead](#plant-floor-beachhead).
+- Phase 6. SP[1:0] are RAZ/WI, `register_block` `follow` tracks enable bits, and a `bitband` region maps the Cortex-M alias windows. A P2IM CNC (grbl 0.8c on STM32F407) smoke test stopped on an odd `_estack`, on HSERDY stuck high across a disable, and on `__HAL_RCC_PLL_ENABLE()` writing the PLLON bit-band alias. Those three are what this phase covers. See [Stack pointer, ready bits, and bit-band](#stack-pointer-ready-bits-and-bit-band).
 
 Not in this version:
 
 - An authorized real Cortex-M industrial image in CI, or committed to the tree. That image stays on your machine. Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
-- Phase 6: HAL and RTOS shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
+- HAL and RTOS call shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
+- A full rehost of one industrial image: timer compare, GPIO BSRR, and the EEPROM path that image uses are target-specific and are not in this tree.
 - Phase 7: QEMU and Renode adapters on `CpuBackend`, and a RISC-V backend.
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
 - A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.
