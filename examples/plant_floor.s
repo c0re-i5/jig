@@ -1,5 +1,6 @@
 ; Synthetic plant-floor controller. Not a third-party firmware image.
-; Assembled by rehost.fixtures at base 0x08000000 for `jig-emu --fixture plant-floor`.
+; Assembled by Jig at base 0x08000000 for `jig-emu --fixture plant-floor`.
+; The import package is still rehost (`rehost.fixtures`).
 ;
 ; The machine file is a small sibling of examples/stm32f4_clock.yaml:
 ;   flash   0x08000000   vector table and code

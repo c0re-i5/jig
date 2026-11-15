@@ -29,6 +29,7 @@ from rehost.nvic import EXC_SYSTICK, REDIRECT, STOP
 from rehost.peripherals import create_peripheral
 from rehost.peripherals.bitband import Bitband
 from rehost.peripherals.systick import SysTick
+from rehost.peripherals.timer import Timer
 from rehost.peripherals.uart import Uart
 from rehost.result import (
     STATUS_FAULT,
@@ -96,6 +97,8 @@ class Machine:
             if isinstance(plugin, SysTick):
                 # Instruction hooks are the clock. VAL reads must not also step.
                 plugin.cpu_clock = True
+            elif isinstance(plugin, Timer):
+                plugin.cpu_clock = True
             elif isinstance(plugin, Uart):
                 # After the init snapshot, so boot(reset) restores a clear latch
                 # and raises again below.
@@ -117,6 +120,7 @@ class Machine:
         self._trace_total = 0
         self._coverage: set[int] = set()
         self._coverage_map = None
+        self._rx_feed = None
         self._recent_pcs: deque[int] = deque(maxlen=_RECENT_LIMIT)
         self._recent_edges: deque[int] = deque(maxlen=_RECENT_LIMIT)
         self._edge_prev = 0
@@ -477,6 +481,9 @@ class Machine:
             return
         self._instructions += 1
         self._note_retired(address)
+        feed = self._rx_feed
+        if feed is not None:
+            feed.on_retired(self._instructions)
         if self.config.run.collect_coverage:
             self._coverage.add(address)
         coverage_map = self._coverage_map
@@ -484,15 +491,20 @@ class Machine:
             coverage_map.on_instruction(address)
 
     def _clock_peripherals(self) -> None:
-        """Step SysTick and latch a UART RX edge before this instruction retires.
+        """Step SysTick and timers, and latch a UART RX edge, before this instruction.
 
-        Both use the NVIC pending bits Phase 1 already delivers. A UART with
-        no ``rx_irq`` contributes nothing.
+        They use the NVIC pending bits the backend already delivers. A UART
+        with no ``rx_irq``, and a timer that is stopped or still inside its
+        period, contribute nothing.
         """
         for plugin in self._peripherals:
             if isinstance(plugin, SysTick):
                 if plugin.consume_cpu_tick():
                     self.backend.pend_exception(EXC_SYSTICK)
+            elif isinstance(plugin, Timer):
+                irq = plugin.consume_cpu_tick()
+                if irq is not None:
+                    self.inject_irq(irq)
             elif isinstance(plugin, Uart):
                 irq = plugin.take_rx_irq_edge()
                 if irq is not None:

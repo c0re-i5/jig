@@ -1,10 +1,13 @@
 # P2IM CNC (grbl 0.8c on STM32F407VG), on the Phase 6 STM32F4 map.
 #
-# This file is examples/stm32f4_clock.yaml with a name, a description, and
-# the run limits from the recorded smoke: timeout_ms 15000, max_instructions
-# 2000000, trace_limit 128. RCC follow bits and both bit-band windows are
-# the template's. TIM2, GPIO BSRR, and EEPROM are still unmodeled; the
-# banner did not need them.
+# This file is examples/stm32f4_clock.yaml with a name, a description, the
+# run limits for a USART2 command session, and the peripherals that session
+# needs. RCC follow bits and both bit-band windows are the template's.
+# TIM2 is the instruction-paced timer plugin (IRQ 28). GPIOA through GPIOE
+# are gpio plugins with BSRR at 0x18. The image's EEPROM is a RAM buffer in
+# the firmware, not a peripheral: a cold boot reports the failed checksum
+# and then uses compiled defaults for the rest of the run. TIM4 (the g540
+# timer at 0x40000800) is still unmapped.
 #
 # The firmware binary is not in this repository, and CI does not run it.
 # Download the published ELF yourself from
@@ -28,8 +31,10 @@
 # example, has 2 MiB of flash and 192 KiB of system SRAM plus the 64 KiB CCM.
 #
 # What is modeled
-#   gpioa     STM32 GPIO offsets: IDR 0x10, ODR 0x14. MODER, BSRR, and AFR
-#             are not cells. A write there is logged and a read returns 0.
+#   gpioa-e   STM32 GPIO offsets: IDR 0x10, ODR 0x14, BSRR 0x18. A 1 in the
+#             low half of BSRR sets ODR, a 1 in the high half clears it.
+#             IDR reads 0xFFFF so idle-high inputs look released. MODER and
+#             AFR are not cells. A write there is logged and a read returns 0.
 #   usart2    Jig byte UART at the USART2 address. Status at +0, data at +4.
 #             TXE (bit 7) and TC (bit 6) read as set, because this stub has no
 #             shift register. RXNE (bit 5) is set while RX is non-empty.
@@ -97,9 +102,10 @@
 
 name: p2im-cnc
 description: >
-  P2IM CNC (grbl 0.8c on STM32F407VG). Same regions as stm32f4_clock.yaml,
-  with a 15 second timeout so a local smoke can reach the USART2 banner.
-  The firmware binary is not in this repository.
+  P2IM CNC (grbl 0.8c on STM32F407VG). STM32F4 regions, a TIM2 step timer,
+  and GPIO BSRR on ports A through E, so a local smoke can pass the USART2
+  banner and answer a short Grbl session. The firmware binary is not in
+  this repository.
 arch: cortex-m
 endian: little
 
@@ -129,12 +135,17 @@ memory:
     peripheral: bitband
     config:
       target: 0x20000000
+  # Stepper timer. tick_every is instructions per update event, not a
+  # prescaler. IRQ 28 is TIM2 in the RM0090 vector table. CEN is CR1 bit 0,
+  # UIE/UIF are DIER/SR bit 0, and CC1/CC2 follow when CCR1/CCR2 are non-zero.
   - name: tim2
     base: 0x40000000
     size: 0x400
     perms: rw
-    peripheral: unimplemented
-    read_default: 0
+    peripheral: timer
+    config:
+      irq: 28
+      tick_every: 1500
   - name: usart2
     base: 0x40004400
     size: 0x400
@@ -220,30 +231,48 @@ memory:
     config:
       idr_offset: 0x10
       odr_offset: 0x14
+      bsrr_offset: 0x18
+      idr: 0xFFFF
   - name: gpiob
     base: 0x40020400
     size: 0x400
     perms: rw
-    peripheral: unimplemented
-    read_default: 0
+    peripheral: gpio
+    config:
+      idr_offset: 0x10
+      odr_offset: 0x14
+      bsrr_offset: 0x18
+      idr: 0xFFFF
   - name: gpioc
     base: 0x40020800
     size: 0x400
     perms: rw
-    peripheral: unimplemented
-    read_default: 0
+    peripheral: gpio
+    config:
+      idr_offset: 0x10
+      odr_offset: 0x14
+      bsrr_offset: 0x18
+      idr: 0xFFFF
   - name: gpiod
     base: 0x40020C00
     size: 0x400
     perms: rw
-    peripheral: unimplemented
-    read_default: 0
+    peripheral: gpio
+    config:
+      idr_offset: 0x10
+      odr_offset: 0x14
+      bsrr_offset: 0x18
+      idr: 0xFFFF
   - name: gpioe
     base: 0x40021000
     size: 0x400
     perms: rw
-    peripheral: unimplemented
-    read_default: 0
+    peripheral: gpio
+    config:
+      idr_offset: 0x10
+      odr_offset: 0x14
+      bsrr_offset: 0x18
+      idr: 0xFFFF
   - name: gpiof
     base: 0x40021400
     size: 0x400
@@ -389,8 +418,10 @@ boot:
   vector_base: 0x08000000
 
 run:
-  timeout_ms: 15000
-  max_instructions: 2000000
+  # 0 disables the wall clock. The Grbl loop does not halt; the instruction
+  # cap stops a session after the banner, the replies, and a short move.
+  timeout_ms: 0
+  max_instructions: 2400000
   halt_on_bkpt: true
   trace_limit: 128
 

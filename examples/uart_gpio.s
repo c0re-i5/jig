@@ -1,5 +1,6 @@
 ; Synthetic Cortex-M Thumb-2 fixture. Not a third-party firmware image.
-; Assembled by rehost.fixtures for tests and `jig-emu run --fixture uart-gpio`.
+; Assembled by Jig for tests and `jig-emu run --fixture uart-gpio`.
+; The import package is still rehost (`rehost.fixtures`).
 ;
 ; Contract (see uart_gpio.yaml):
 ;   SRAM    0x20000000  +0 magic 0x00c0ffee, +4 SysTick VAL, +8 UART status

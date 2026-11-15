@@ -1,5 +1,6 @@
 ; Synthetic Cortex-M fixture. Not a third-party firmware image.
-; Assembled by rehost.fixtures for tests and `jig-emu run --fixture modbus-rtu`.
+; Assembled by Jig for tests and `jig-emu run --fixture modbus-rtu`.
+; The import package is still rehost (`rehost.fixtures`).
 ;
 ; Contract (see modbus_rtu.yaml):
 ;   UART 0x40000000  data +0, status +4, rx_irq 0

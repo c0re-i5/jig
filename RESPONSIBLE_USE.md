@@ -1,6 +1,6 @@
 # Responsible use
 
-rehost is a firmware-agnostic rehosting toolkit for **authorized security research**. It is in the same category of tooling as QEMU, Unicorn, Renode, and Ghidra: engines, memory maps, peripheral models, snapshots, and harnesses.
+Jig is a machine shop for plant-controller firmware: emulate, instrument, fuzz, and triage, for **authorized security research**. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost`. It is in the same category of tooling as QEMU, Unicorn, Renode, and Ghidra: engines, memory maps, peripheral models, snapshots, and harnesses.
 
 This is not legal advice.
 
@@ -14,7 +14,7 @@ The README documents one published research sample by name: P2IM CNC, grbl 0.8c 
 
 ## What you bring
 
-Use rehost on a target you are allowed to analyze. That means you hold the image under your own authorization: you own the device, you administer it, your employer or client engaged you to test it, a bug-bounty program covers it, or you are working from hardware in your lab under the same kind of permission. Keep the image on your machine. Do not add it to this repository, a fork, or a bug report.
+Use Jig on a target you are allowed to analyze. That means you hold the image under your own authorization: you own the device, you administer it, your employer or client engaged you to test it, a bug-bounty program covers it, or you are working from hardware in your lab under the same kind of permission. Keep the image on your machine. Do not add it to this repository, a fork, or a bug report.
 
 If you build a larger fixture yourself, prefer source you can rebuild: a Zephyr sample, a FreeRTOS demo, or your own bare-metal program. The README plant-floor section is the procedure: copy `examples/stm32f4_clock.yaml`, pass the raw image with `--firmware`, and keep that image on your machine. The P2IM CNC section is the same rule applied to a published research ELF: you download it, you convert it to a raw bin, and you pass that path at runtime. The framework will load the bytes you point it at. It will not fetch an image for you.
 

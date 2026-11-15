@@ -7,6 +7,7 @@ from rehost.peripherals.gpio import Gpio
 from rehost.peripherals.register_block import RegisterBlock
 from rehost.peripherals.registry import available_plugins, create_peripheral, register
 from rehost.peripherals.systick import SysTick
+from rehost.peripherals.timer import Timer
 from rehost.peripherals.uart import Uart
 from rehost.peripherals.unimplemented import Unimplemented
 
@@ -16,6 +17,7 @@ __all__ = [
     "Peripheral",
     "RegisterBlock",
     "SysTick",
+    "Timer",
     "Uart",
     "Unimplemented",
     "available_plugins",

@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rehost"
+name = "jigfw"
 version = "0.1.0"
-description = "Firmware-agnostic embedded rehosting for authorized security research"
+description = "Jig is a machine shop for plant-controller firmware: emulate, instrument, fuzz, and triage"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "rehost contributors" }]
-keywords = ["emulation", "firmware", "rehosting", "cortex-m", "security"]
+authors = [{ name = "Jig contributors" }]
+keywords = ["jig", "emulation", "firmware", "rehosting", "cortex-m", "security"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -28,6 +28,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/c0re-i5/jig"
+Repository = "https://github.com/c0re-i5/jig"
+Issues = "https://github.com/c0re-i5/jig/issues"
 
 [project.scripts]
 jig-emu = "rehost.cli:cli"
