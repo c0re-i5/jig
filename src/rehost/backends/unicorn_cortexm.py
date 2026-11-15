@@ -280,6 +280,12 @@ class UnicornCortexM(CpuBackend):
     def prepare_run(self) -> None:
         super().prepare_run()
         self.nvic.fault = None
+        self.nvic.reset_request = None
+
+    def take_reset_request(self) -> str | None:
+        request = self.nvic.reset_request
+        self.nvic.reset_request = None
+        return request
 
     def reset_cpu_state(self) -> None:
         self.nvic.reset()

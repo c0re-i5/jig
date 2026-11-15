@@ -19,9 +19,12 @@ Modeled
     fault exception entry.
 
     Priority uses all eight implemented bits. AIRCR.PRIGROUP splits group
-    priority from subpriority. A pending exception is taken only when it is
-    enabled, not already active, and its group priority is strictly more urgent
-    than the execution priority. Execution priority is the most urgent of the
+    priority from subpriority. A write of SYSRESETREQ or VECTRESET with the
+    vector key latches ``reset_request`` instead of faulting. The machine
+    applies that request before the next instruction. A pending exception is
+    taken only when it is enabled, not already active, and its group priority
+    is strictly more urgent than the execution priority. Execution priority
+    is the most urgent of the
     active exceptions, PRIMASK (boost to 0), FAULTMASK (boost to -1), and
     BASEPRI. BASEPRI compares group priority and is disabled when its group
     field is 0. NMI is -2, HardFault is -1, and both are fixed.
@@ -155,6 +158,10 @@ class Nvic:
         self.scr = 0
         self.shcsr = 0
         self.fault = None
+        # AIRCR.SYSRESETREQ or VECTRESET, consumed by the machine on the next
+        # instruction. Not a fault: the core resets and execution continues
+        # unless the machine file asked to halt.
+        self.reset_request: str | None = None
         # Instructions still inside an IT block. Asynchronous entry waits.
         self.it_remaining = 0
 
@@ -843,8 +850,14 @@ class Nvic:
         if owner == "aircr":
             if address == _AIRCR and size == 4 and ((value >> 16) & 0xFFFF) == 0x05FA:
                 self.prigroup = (value >> 8) & 7
+                # Both bits request a modeled reset. SYSRESETREQ is the
+                # architectural system reset; VECTRESET is the local one.
+                # The machine applies it before the next instruction. A bad
+                # VECTKEY leaves the register unchanged, including these bits.
                 if value & (1 << 2):
-                    self.fault = "AIRCR.SYSRESETREQ"
+                    self.reset_request = "AIRCR.SYSRESETREQ"
+                elif value & (1 << 0):
+                    self.reset_request = "AIRCR.VECTRESET"
             return
         if owner == "scr":
             self._write_masked(_SCR, address, size, value, self._apply_scr)

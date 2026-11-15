@@ -49,6 +49,8 @@ _RUN_KEYS = {
     "timeout_ms",
     "max_instructions",
     "halt_on_bkpt",
+    "halt_on_reset",
+    "max_resets",
     "halt_addresses",
     "trace_limit",
     "collect_coverage",
@@ -123,6 +125,13 @@ class RunConfig:
     timeout_ms: int = 1000
     max_instructions: int = 1_000_000
     halt_on_bkpt: bool = True
+    # Architectural default: SYSRESETREQ and VECTRESET reboot the core and
+    # the run continues. Set this to stop the run on the first request.
+    halt_on_reset: bool = False
+    # Consecutive resets that transmitted no new UART byte. The next silent
+    # request stops the run. 0 means only the instruction cap or the timeout
+    # can end a reboot loop, which can spend the whole cap with no output.
+    max_resets: int = 8
     halt_addresses: tuple[int, ...] = ()
     trace_limit: int = 256
     collect_coverage: bool = False
@@ -401,6 +410,10 @@ def _parse_run(value: Any) -> RunConfig:
     if timeout_ms < 0 or max_instructions < 0:
         raise ConfigError("run limits must be >= 0 (0 means unlimited for that limit)")
     halt_on_bkpt = _bool(raw.get("halt_on_bkpt", True), "run.halt_on_bkpt")
+    halt_on_reset = _bool(raw.get("halt_on_reset", False), "run.halt_on_reset")
+    max_resets = parse_int(raw.get("max_resets", 8), what="run.max_resets")
+    if max_resets < 0:
+        raise ConfigError("run.max_resets must be >= 0 (0 means no silent-reset cap)")
     addresses = raw.get("halt_addresses", [])
     if not isinstance(addresses, list):
         raise ConfigError("run.halt_addresses must be a list")
@@ -414,6 +427,8 @@ def _parse_run(value: Any) -> RunConfig:
         timeout_ms=timeout_ms,
         max_instructions=max_instructions,
         halt_on_bkpt=halt_on_bkpt,
+        halt_on_reset=halt_on_reset,
+        max_resets=max_resets,
         halt_addresses=halt_addresses,
         trace_limit=trace_limit,
         collect_coverage=collect_coverage,

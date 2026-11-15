@@ -81,6 +81,19 @@ def test_overlap_unknown_field_and_big_endian_are_rejected():
         parse_config(_minimal(endian="big"))
 
 
+def test_halt_on_reset_and_max_resets_parse():
+    configured = parse_config(_minimal(run={"halt_on_reset": True, "max_resets": 2}))
+    assert configured.run.halt_on_reset is True
+    assert configured.run.max_resets == 2
+    default = parse_config(_minimal())
+    assert default.run.halt_on_reset is False
+    assert default.run.max_resets == 8
+    with pytest.raises(ConfigError, match="max_resets"):
+        parse_config(_minimal(run={"max_resets": -1}))
+    with pytest.raises(ConfigError, match="halt_on_reset"):
+        parse_config(_minimal(run={"halt_on_reset": "yes"}))
+
+
 def test_permission_flags_and_page_span():
     assert parse_perms("rx") == PERM_READ | PERM_EXEC
     assert parse_perms("rw") == PERM_READ | PERM_WRITE

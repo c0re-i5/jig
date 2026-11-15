@@ -129,6 +129,11 @@ class Machine:
         self._recent_edges: deque[int] = deque(maxlen=_RECENT_LIMIT)
         self._edge_prev = 0
         self._halt_addresses = set(config.run.halt_addresses)
+        self._resets = 0
+        self._silent_resets = 0
+        # UART tx bytes observed at the previous reset. A later request with
+        # no new byte is part of a silent streak.
+        self._reset_tx_mark = 0
 
     @classmethod
     def from_path(cls, path: str | Path, backend: CpuBackend | None = None) -> Machine:
@@ -230,8 +235,11 @@ class Machine:
         """Set SP and PC from the vector table or from ``boot.entry``.
 
         A second call is a no-op unless ``reset`` is true. Reset restores
-        peripheral state captured at construction and re-reads the boot PC.
-        It does not reload the image.
+        peripheral state captured at construction, clears NVIC and the core
+        mode bits, and re-reads the boot PC. It does not reload the image,
+        so SRAM keeps whatever the guest left there. ``boot.mode vector``
+        uses ``vector_base``. ``boot.mode entry`` uses ``boot.sp`` and
+        ``boot.entry``.
         """
         if not self._image_loaded:
             raise MachineError("load an image before boot")
@@ -253,11 +261,19 @@ class Machine:
                 raise ConfigError("boot.mode entry requires boot.sp and boot.entry")
             sp = boot.sp
             entry = boot.entry
+        # Thread mode, privileged, MSP selected, masks clear. Writing CONTROL
+        # first makes the following SP write land in MSP when a thread had
+        # PSP selected.
+        self.backend.write_register("control", 0)
+        self.backend.write_register("primask", 0)
+        self.backend.write_register("basepri", 0)
+        self.backend.write_register("faultmask", 0)
         # write_register clears SP[1:0]. An odd vector word or boot.sp
         # (Atollic ``_estack = ...FFFF``) becomes the word-aligned pointer
         # hardware would have loaded.
-        self.backend.write_register("sp", sp)
         self.backend.write_register("msp", sp)
+        self.backend.write_register("sp", sp)
+        self.backend.write_register("psp", 0)
         self.backend.write_register("lr", 0xFFFFFFFF)
         # EPSR.T. ``start`` also forces the Thumb bit on the entry address.
         self.backend.write_register("xpsr", 1 << 24)
@@ -293,6 +309,9 @@ class Machine:
         self._recent_pcs.clear()
         self._recent_edges.clear()
         self._edge_prev = 0
+        self._resets = 0
+        self._silent_resets = 0
+        self._reset_tx_mark = self._uart_tx_len()
         if self._coverage_map is not None:
             self._coverage_map.begin_run()
         self.backend.prepare_run()
@@ -532,6 +551,8 @@ class Machine:
             self._detail = f"stopped after {self._instructions} instructions"
             self.backend.stop()
             return
+        if self._consume_reset_request():
+            return
         self._clock_peripherals()
         effect = self.backend.service_interrupts(address, size)
         if effect == STOP or self.backend.cpu_fault:
@@ -558,6 +579,69 @@ class Machine:
         coverage_map = self._coverage_map
         if coverage_map is not None:
             coverage_map.on_instruction(address)
+
+    def _consume_reset_request(self) -> bool:
+        """Apply a pending AIRCR reset before this instruction retires.
+
+        Returns True when the instruction should not execute. The request is
+        raised from the store that wrote AIRCR, which has already retired.
+        """
+        request = self.backend.take_reset_request()
+        if not request:
+            return False
+        if self.config.run.halt_on_reset:
+            self._reason = STATUS_HALTED
+            self._detail = request
+            self.backend.stop()
+            return True
+        tx_len = self._uart_tx_len()
+        if tx_len > self._reset_tx_mark:
+            self._silent_resets = 0
+        self._reset_tx_mark = tx_len
+        self._silent_resets += 1
+        cap = self.config.run.max_resets
+        if cap and self._silent_resets > cap:
+            self._reason = STATUS_HALTED
+            self._detail = f"stopped after {cap} silent core resets ({request})"
+            self.backend.stop()
+            return True
+        self._resets += 1
+        self._apply_core_reset()
+        logger.info(
+            "core reset via %s; reset %d, continuing at %#010x",
+            request,
+            self._resets,
+            self.backend.read_register("pc") & ~1,
+        )
+        return True
+
+    def _apply_core_reset(self) -> None:
+        """Same path as ``boot(reset=True)``, keeping the UART transcript.
+
+        Peripheral registers, the RX queue, and the NVIC return to the
+        construction snapshot. Bytes already accepted into ``tx`` stay: that
+        buffer is the host's copy of what left the wire, not the shift
+        register. SRAM is not reloaded.
+        """
+        kept = [
+            (plugin, bytes(plugin.tx), plugin.tx_dropped)
+            for plugin in self._peripherals
+            if isinstance(plugin, Uart)
+        ]
+        self.boot(reset=True)
+        for plugin, tx, dropped in kept:
+            plugin.tx = bytearray(tx)
+            plugin.tx_dropped = dropped
+        # ``boot`` stores an even PC. ``start`` sets the Thumb bit for the
+        # initial entry. A redirect from this hook has to set it itself,
+        # matching exception entry.
+        pc = self.backend.read_register("pc")
+        self.backend.write_register("pc", pc | 1)
+        xpsr = self.backend.read_register("xpsr")
+        self.backend.write_register("xpsr", xpsr | (1 << 24))
+
+    def _uart_tx_len(self) -> int:
+        return sum(len(plugin.tx) for plugin in self._peripherals if isinstance(plugin, Uart))
 
     def _svc_nop(self, address: int) -> bool:
         """True when this halfword is an SVC immediate listed in ``run.svc_nop``."""
@@ -724,4 +808,5 @@ class Machine:
             coverage=coverage,
             recent_pcs=tuple(self._recent_pcs),
             recent_edges=tuple(self._recent_edges),
+            resets=self._resets,
         )

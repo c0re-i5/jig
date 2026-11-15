@@ -118,6 +118,9 @@ boot:
 
 run:
   # The shell does not halt. The cap stops a boot plus one help command.
+  # AIRCR.SYSRESETREQ resets the core and continues. The UART tx log is
+  # kept, so reboot shows the banner, the command, and the banner again.
+  # halt_on_reset: true would end the run on that write.
   timeout_ms: 0
   max_instructions: 800000
   halt_on_bkpt: true

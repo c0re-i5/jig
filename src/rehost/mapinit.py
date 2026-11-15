@@ -8,6 +8,15 @@ starter: flash and SRAM cover what the file actually occupies, SysTick is
 the real plugin, and other MMIO is an ``unimplemented`` window per constant
 plus ``unmapped.action: log``. A ready bit the image polls will not move
 until someone replaces that window.
+
+``aggressive=True`` is the opt-in guess. A constant at a well-known RCC or
+MCG address becomes a ``register_block`` whose ready bits follow the enable
+bits, and a UART-like constant becomes a ``uart`` stub. Both are marked
+TODO. The default leaves those windows unimplemented.
+
+Cortex-M bit-band aliases are emitted whenever the target window is present.
+That part is architectural for M3/M4, not a vendor guess. Delete the windows
+for an M0 or M0+.
 """
 
 from __future__ import annotations
@@ -66,6 +75,8 @@ class SuggestedRegion:
     perms: str
     comment: str
     peripheral: str | None = None
+    # Extra YAML lines, already indented to sit under the region mapping.
+    extra: tuple[str, ...] = ()
 
 
 @dataclass
@@ -79,14 +90,19 @@ class ImageInspection:
     regions: tuple[SuggestedRegion, ...]
     notes: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    aggressive: bool = False
 
 
-def inspect_image(data: bytes) -> ImageInspection:
-    """Classify ``data`` and suggest regions. A raw bin has no addresses."""
+def inspect_image(data: bytes, *, aggressive: bool = False) -> ImageInspection:
+    """Classify ``data`` and suggest regions. A raw bin has no addresses.
+
+    ``aggressive`` promotes recognized clock and UART constants. The default
+    leaves them unimplemented.
+    """
     if data.startswith(_ELF_MAGIC):
-        return _inspect_elf(data)
+        return _inspect_elf(data, aggressive=aggressive)
     if looks_like_ihex(data):
-        return _inspect_ihex(data)
+        return _inspect_ihex(data, aggressive=aggressive)
     raise MachineError(
         "map init reads an ELF32 or Intel HEX image. A raw bin has no load "
         "addresses; pass the ELF, or write the memory map yourself."
@@ -96,6 +112,8 @@ def inspect_image(data: bytes) -> ImageInspection:
 def format_inspection(info: ImageInspection) -> str:
     """Plain-text report for ``jig-emu inspect``. The YAML is separate."""
     lines: list[str] = []
+    if info.aggressive:
+        lines.append("aggressive: yes")
     if info.kind == "elf":
         lines.append("format: ELF32")
         lines.append(f"type: {_elf_type_name(info.e_type)}")
@@ -158,15 +176,30 @@ def render_machine_yaml(info: ImageInspection, *, name: str) -> str:
         "# This is a starter, not a chip model. Flash and SRAM cover the loadable",
         "# image and the vector table's stack pointer. SysTick is the real plugin.",
         "# Each mmio_* window is an aligned constant from the file, logged and",
-        "# read as 0. It is not a decoded peripheral. unmapped.action is log, so",
-        "# an address with no window still returns 0 and is printed with -v.",
+        "# read as 0, unless --aggressive promoted it. It is not a decoded",
+        "# peripheral. unmapped.action is log, so an address with no window still",
+        "# returns 0 and is printed with -v.",
+        "#",
+        "# SP[1:0] are cleared by the CPU model. An odd initial stack word is fine.",
+        "# Cortex-M3/M4 bit-band aliases are included when their target is present.",
+        "# Delete those windows for an M0 or M0+.",
         "#",
         "# TODO: run with -v. A line that says the image spins on a bit needs a",
         "# register_block (follow or read_set), not another unimplemented window.",
         "# If the image reads back a value it stored, drop peripheral: and the",
         "# window becomes sticky RAM. Delete windows the trace never touches.",
+        "# Pass --aggressive to emit guessed RCC/MCG follow rules and UART stubs.",
         "#",
     ]
+    if info.aggressive:
+        lines.extend(
+            [
+                "# aggressive: recognized clock and UART constants were promoted.",
+                "# The follow rules and UART offsets below are guesses. Read the TODO",
+                "# on each promoted region before trusting a boot.",
+                "#",
+            ]
+        )
     for note in info.notes:
         lines.append(f"# TODO: {note}")
     for warning in info.warnings:
@@ -178,7 +211,8 @@ def render_machine_yaml(info: ImageInspection, *, name: str) -> str:
             "description: >",
             "  Starter map from jig-emu map init. Flash and SRAM follow the image.",
             "  SysTick is modeled. Other MMIO windows are unimplemented stubs for",
-            "  aligned constants in the file, not a vendor peripheral model.",
+            "  aligned constants in the file, unless --aggressive promoted a",
+            "  recognized clock block or UART. Not a vendor peripheral model.",
             "arch: cortex-m",
             "endian: little",
             "",
@@ -195,13 +229,20 @@ def render_machine_yaml(info: ImageInspection, *, name: str) -> str:
             "",
             "boot:",
             "  mode: vector",
+            "  # The CPU model clears SP[1:0] on the vector load and on later",
+            "  # writes. An odd _estack becomes the word-aligned pointer below it.",
             f"  vector_base: {boot['vector_base']:#010x}",
             "",
             "run:",
-            "  # The image is not expected to halt. Raise the cap once it boots.",
-            "  timeout_ms: 1000",
+            "  # The instruction cap is the stop. A 1s wall-clock timeout cuts",
+            "  # off a real boot before this many instructions finish.",
+            "  timeout_ms: 0",
             "  max_instructions: 1000000",
             "  halt_on_bkpt: true",
+            "  # SYSRESETREQ and VECTRESET reset the core and continue. true",
+            "  # ends the run on the first request. A silent reboot streak stops",
+            "  # at run.max_resets (default 8) so it cannot spend this cap.",
+            "  halt_on_reset: false",
             "  trace_limit: 64",
             "",
             "unmapped:",
@@ -226,6 +267,7 @@ def _format_region(region: SuggestedRegion) -> str:
         lines.append(f"    peripheral: {region.peripheral}")
         if region.peripheral == "unimplemented":
             lines.append("    read_default: 0")
+    lines.extend(region.extra)
     return "\n".join(lines)
 
 
@@ -257,7 +299,7 @@ def machine_name_from_stem(stem: str) -> str:
     return name or "image"
 
 
-def _inspect_elf(data: bytes) -> ImageInspection:
+def _inspect_elf(data: bytes, *, aggressive: bool) -> ImageInspection:
     elf = read_elf(data)
     loads = tuple(header for header in elf.headers if header.p_type == _PT_LOAD)
     vector, vector_blob = _vector_from_elf(elf, data)
@@ -280,10 +322,11 @@ def _inspect_elf(data: bytes) -> ImageInspection:
         vector=vector,
         vector_bytes=vector_blob,
         blobs=blobs,
+        aggressive=aggressive,
     )
 
 
-def _inspect_ihex(data: bytes) -> ImageInspection:
+def _inspect_ihex(data: bytes, *, aggressive: bool) -> ImageInspection:
     spans = parse_ihex(data)
     segments: list[ProgramHeader] = []
     for index, span in enumerate(spans):
@@ -318,6 +361,7 @@ def _inspect_ihex(data: bytes) -> ImageInspection:
         vector=vector,
         vector_bytes=vector_blob,
         blobs=[span.data for span in spans],
+        aggressive=aggressive,
     )
 
 
@@ -331,6 +375,7 @@ def _assemble(
     vector: VectorView | None,
     vector_bytes: bytes,
     blobs: list[bytes],
+    aggressive: bool = False,
 ) -> ImageInspection:
     notes: list[str] = []
     warnings: list[str] = []
@@ -350,17 +395,38 @@ def _assemble(
             f"{vector.reset:#x}, not e_entry."
         )
     counts, saw_bitband = _scan_constants(blobs)
-    regions = _suggest_regions(segments, vector, counts, notes, warnings)
-    if saw_bitband:
+    regions = _suggest_regions(
+        segments, vector, counts, notes, warnings, aggressive=aggressive
+    )
+    if any(region.peripheral == "bitband" for region in regions):
+        notes.append(
+            "Cortex-M bit-band alias windows are mapped where SRAM covers "
+            "0x20000000 or a peripheral constant was found. Delete them for "
+            "an M0 or M0+."
+        )
+    elif saw_bitband:
         notes.append(
             "The file contains a constant in a Cortex-M bit-band alias "
-            "(0x22000000 or 0x42000000). Add a bitband region only after the "
-            "target window exists; this file does not guess a 32 MiB alias."
+            "(0x22000000 or 0x42000000), and this map has no SRAM at "
+            "0x20000000 and no peripheral constant, so no 32 MiB alias was added."
         )
+    if _clock_family(counts) or _uart_hits(_clock_family(counts), counts):
+        if aggressive:
+            notes.append(
+                "Aggressive guesses are on. A recognized clock block is a "
+                "register_block and a recognized UART constant is a uart stub. "
+                "The follow rules and UART offsets are TODO guesses, not a datasheet."
+            )
+        else:
+            notes.append(
+                "A clock or UART constant was recognized and left unimplemented. "
+                "jig-emu map init --aggressive emits a register_block and uart "
+                "stubs for them."
+            )
     notes.append(
-        "run.max_instructions is 1000000 and timeout_ms is 1000. A firmware "
-        "loop will hit one of those. Raise the cap once the image boots, and "
-        "set timeout_ms to 0 only when the instruction cap remains."
+        "run.max_instructions is 1000000 and timeout_ms is 0. The instruction "
+        "cap stops a firmware loop. A 1 second wall-clock cap cuts off a real "
+        "boot before that. Raise the cap once the image is moving."
     )
     notes.append(
         "NVIC and SCB stay with the CPU backend at 0xE000E000. SysTick at "
@@ -378,6 +444,7 @@ def _assemble(
         regions=tuple(regions),
         notes=tuple(notes),
         warnings=tuple(warnings),
+        aggressive=aggressive,
     )
 
 
@@ -387,6 +454,8 @@ def _suggest_regions(
     counts: Counter[int],
     notes: list[str],
     warnings: list[str],
+    *,
+    aggressive: bool = False,
 ) -> list[SuggestedRegion]:
     flash_spans: dict[str, list[tuple[int, int]]] = {}
     ram_spans: dict[str, list[tuple[int, int]]] = {}
@@ -432,6 +501,9 @@ def _suggest_regions(
     taken = [(region.base, region.base + region.size) for region in regions]
     mmio = _mmio_regions(counts, taken, notes)
     regions.extend(mmio)
+    _add_bitbands(regions, counts, warnings)
+    if aggressive:
+        _promote_guesses(regions, counts, notes)
     if not any(region.peripheral == "systick" for region in regions):
         systick = SuggestedRegion(
             name="systick",
@@ -441,6 +513,7 @@ def _suggest_regions(
             peripheral="systick",
             comment="Cortex-M SysTick. One step per retired instruction while ENABLE is set.",
         )
+        taken = [(region.base, region.base + region.size) for region in regions]
         if _overlaps(systick.base, systick.size, taken):
             warnings.append("SysTick at 0xE000E010 overlaps another suggested region and was left out.")
         else:
@@ -529,6 +602,442 @@ def _windows_from_spans(
             comment=comment,
         )
     ]
+
+
+# STM32F2/F4/F7 RCC. F4 GPIOE is also 0x40021000, so that address is an RCC
+# only when the F4 RCC and the F4 GPIOA window are absent.
+_STM32F4_RCC = 0x40023800
+_STM32F1_RCC = 0x40021000
+_STM32F4_GPIOA = 0x40020000
+_KINETIS_MCG = 0x40064000
+_STM32F4_FLASH = 0x40023C00
+
+# Shared by F1 and F4: status at +0, data at +4.
+_STM32_SHARED_UART = {
+    0x40004400: "USART2",
+    0x40004800: "USART3",
+    0x40004C00: "UART4",
+    0x40005000: "UART5",
+}
+# F2/F4/F7. Not USART on F1.
+_STM32F4_UART = {
+    0x40011000: "USART1",
+    0x40011400: "USART6",
+}
+# F1 USART1. On F4 this address is SYSCFG, so it is only used for the F1 guess.
+_STM32F1_UART = {
+    0x40013800: "USART1",
+}
+_KINETIS_UART = {
+    0x4006A000: "UART0",
+    0x4006B000: "UART1",
+    0x4006C000: "UART2",
+    0x4006D000: "UART3",
+}
+
+
+def _clock_family(counts: Counter[int]) -> str | None:
+    """Which guessed clock block, if any, this constant bag looks like.
+
+    The F4 RCC wins over the F1 address when both appear, because F4 GPIOE
+    lives at the F1 RCC base. Kinetis MCG is a different address and loses
+    only when an STM32 RCC constant is more common.
+    """
+    ranked: list[tuple[int, str]] = []
+    if counts[_STM32F4_RCC]:
+        ranked.append((counts[_STM32F4_RCC], "stm32f4"))
+    if counts[_KINETIS_MCG]:
+        ranked.append((counts[_KINETIS_MCG], "kinetis"))
+    f1 = (
+        counts[_STM32F1_RCC]
+        and not counts[_STM32F4_RCC]
+        and not counts[_STM32F4_GPIOA]
+    )
+    if f1:
+        ranked.append((counts[_STM32F1_RCC], "stm32f1"))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked[0][1]
+
+
+def _uart_hits(family: str | None, counts: Counter[int]) -> list[tuple[int, str, str]]:
+    """``(base, name, layout)`` for UART-like constants that actually appear."""
+    if family == "kinetis":
+        table = _KINETIS_UART
+        layout = "kinetis"
+    elif family == "stm32f1":
+        table = {**_STM32_SHARED_UART, **_STM32F1_UART}
+        layout = "stm32"
+    elif family == "stm32f4":
+        table = {**_STM32_SHARED_UART, **_STM32F4_UART}
+        layout = "stm32"
+    else:
+        shared = sum(counts[base] for base in _STM32_SHARED_UART)
+        kinetis = sum(counts[base] for base in _KINETIS_UART)
+        if kinetis and kinetis >= shared:
+            table = _KINETIS_UART
+            layout = "kinetis"
+        else:
+            table = _STM32_SHARED_UART
+            layout = "stm32"
+    found = [
+        (base, name, layout)
+        for base, name in sorted(table.items())
+        if counts[base]
+    ]
+    return found
+
+
+def _add_bitbands(
+    regions: list[SuggestedRegion],
+    counts: Counter[int],
+    warnings: list[str],
+) -> None:
+    """Map the architectural alias windows when their targets exist."""
+    wanted: list[tuple[str, int, int, str]] = []
+    if _covers_sram_bitband(regions):
+        wanted.append(
+            (
+                "sram_bitband",
+                0x22000000,
+                0x20000000,
+                "Cortex-M SRAM bit-band alias onto 0x20000000. A word store sets or "
+                "clears one bit of that target. Only the mapped part of the target "
+                "holds data. Delete this window on Cortex-M0 or M0+.",
+            )
+        )
+    if counts:
+        wanted.append(
+            (
+                "peripheral_bitband",
+                0x42000000,
+                0x40000000,
+                "Cortex-M peripheral bit-band alias onto 0x40000000. A store that "
+                "sets a clock bit through 0x42xxxxxx lands here. Delete this window "
+                "on Cortex-M0 or M0+.",
+            )
+        )
+    taken = [(region.base, region.base + region.size) for region in regions]
+    for name, base, target, comment in wanted:
+        size = 0x02000000
+        if _overlaps(base, size, taken):
+            warnings.append(f"{name} at {base:#x} overlaps another region and was left out.")
+            continue
+        regions.append(
+            SuggestedRegion(
+                name=name,
+                base=base,
+                size=size,
+                perms="rw",
+                peripheral="bitband",
+                comment=comment,
+                extra=(
+                    "    config:",
+                    f"      target: {target:#010x}",
+                ),
+            )
+        )
+        taken.append((base, base + size))
+
+
+def _covers_sram_bitband(regions: list[SuggestedRegion]) -> bool:
+    lo, hi = 0x20000000, 0x20100000
+    for region in regions:
+        if region.peripheral is not None or "w" not in region.perms:
+            continue
+        end = region.base + region.size
+        if region.base < hi and lo < end:
+            return True
+    return False
+
+
+def _promote_guesses(
+    regions: list[SuggestedRegion],
+    counts: Counter[int],
+    notes: list[str],
+) -> None:
+    family = _clock_family(counts)
+    clock = _clock_region(family) if family else None
+    if clock is not None and not _replace_or_append(regions, clock):
+        notes.append(
+            f"{clock.name} at {clock.base:#x} overlapped another region and was not promoted."
+        )
+    flash = _flash_region(family)
+    if flash is not None and not _replace_or_append(regions, flash):
+        notes.append(
+            f"{flash.name} at {flash.base:#x} overlapped another region and was not promoted."
+        )
+    for base, name, layout in _uart_hits(family, counts):
+        uart = _uart_region(base, name, layout)
+        if not _replace_or_append(regions, uart):
+            notes.append(
+                f"{name} at {base:#x} overlapped another region and was not promoted."
+            )
+
+
+def _replace_or_append(regions: list[SuggestedRegion], new: SuggestedRegion) -> bool:
+    for index, region in enumerate(regions):
+        if region.base != new.base:
+            continue
+        if region.peripheral != "unimplemented":
+            return False
+        regions[index] = new
+        return True
+    spans = [(region.base, region.base + region.size) for region in regions]
+    if _overlaps(new.base, new.size, spans):
+        return False
+    regions.append(new)
+    return True
+
+
+def _clock_region(family: str) -> SuggestedRegion | None:
+    if family == "stm32f4":
+        return SuggestedRegion(
+            name="rcc",
+            base=_STM32F4_RCC,
+            size=0x400,
+            perms="rw",
+            peripheral="register_block",
+            comment=(
+                "Guessed STM32F2/F4/F7 RCC because the image contains this address. "
+                "TODO: HSIRDY follows HSION, HSERDY follows HSEON, PLLRDY follows PLLON, "
+                "PLLI2SRDY follows PLLI2SON, SWS copies SW, LSERDY follows LSEON, and "
+                "LSIRDY follows LSION. Enable and reset registers are sticky so a "
+                "read-modify-write keeps its bit. Unlisted offsets still read as 0. "
+                "This is not a clock tree. Correct it or delete it."
+            ),
+            extra=_F4_RCC_EXTRA,
+        )
+    if family == "stm32f1":
+        return SuggestedRegion(
+            name="rcc",
+            base=_STM32F1_RCC,
+            size=0x400,
+            perms="rw",
+            peripheral="register_block",
+            comment=(
+                "Guessed STM32F1/F3-class RCC. 0x40021000 is present and the F4 GPIOA "
+                "window at 0x40020000 is not, so this is not treated as F4 GPIOE. "
+                "TODO: ready bits follow the ON bits in CR, and SWS copies SW in CFGR "
+                "at offset 0x04. L4 and G4 CR bits differ. Check the reference manual."
+            ),
+            extra=_F1_RCC_EXTRA,
+        )
+    if family == "kinetis":
+        return SuggestedRegion(
+            name="mcg",
+            base=_KINETIS_MCG,
+            size=0x400,
+            perms="rw",
+            peripheral="register_block",
+            comment=(
+                "Guessed Kinetis MCG. TODO: CLKST copies CLKS until PLLS is set, then "
+                "reads as the PLL encoding. PLLST and LOCK0 follow PLLS. IREFST follows "
+                "IREFS. OSCINIT0 follows EREFS0. That is the FEI to PEE walk this shape "
+                "of startup polls. It is not an MCG model. Byte offsets match the K64 "
+                "register file; check them."
+            ),
+            extra=_KINETIS_MCG_EXTRA,
+        )
+    return None
+
+
+def _flash_region(family: str | None) -> SuggestedRegion | None:
+    """F4 flash latency reads back. The companion of the RCC guess, not a programmer."""
+    if family != "stm32f4":
+        return None
+    return SuggestedRegion(
+        name="flash_if",
+        base=_STM32F4_FLASH,
+        size=0x400,
+        perms="rw",
+        peripheral="register_block",
+        comment=(
+            "Guessed STM32F4 flash interface, next to the RCC guess. TODO: ACR "
+            "reads back so a latency write is visible. FLASH_SR.BSY stays 0. "
+            "This does not program flash. Delete it if the image never touches "
+            "0x40023c00."
+        ),
+        extra=_F4_FLASH_EXTRA,
+    )
+
+
+def _uart_region(base: int, name: str, layout: str) -> SuggestedRegion:
+    if layout == "kinetis":
+        comment = (
+            f"Guessed Kinetis {name}. TODO: S1 is +0x04 (TDRE and TC in "
+            "tx_empty_mask, RDRF in rx_ready_mask) and D is +0x07. rx_irq is "
+            "omitted. K64 UART0 is IRQ 31, and a handler that reads one byte "
+            "needs rx_level: true. Other offsets are logged and ignored."
+        )
+        extra = _KINETIS_UART_EXTRA
+    else:
+        comment = (
+            f"Guessed STM32 {name}. TODO: status is +0 (TXE and TC in "
+            "tx_empty_mask, RXNE in rx_ready_mask) and data is +4. rx_irq is "
+            "omitted. STM32F4 USART2 is IRQ 38. Other offsets are logged and ignored."
+        )
+        extra = _STM32_UART_EXTRA
+    return SuggestedRegion(
+        name=name.lower(),
+        base=base,
+        size=0x400,
+        perms="rw",
+        peripheral="uart",
+        comment=comment,
+        extra=extra,
+    )
+
+
+_F4_RCC_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      registers:",
+    "        # TODO: guessed STM32F4-class bit positions. Not a clock tree.",
+    "        0x00:",
+    "          reset: 0x00000083",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # HSIRDY follows HSION",
+    "            - {src: 16, dst: 17}      # HSERDY follows HSEON",
+    "            - {src: 24, dst: 25}      # PLLRDY follows PLLON",
+    "            - {src: 26, dst: 27}      # PLLI2SRDY follows PLLI2SON",
+    "        0x04:",
+    "          reset: 0x24003010",
+    "          writable: true",
+    "        0x08:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 2, width: 2}  # SWS copies SW",
+    "        0x0C: {reset: 0, writable: true}",
+    "        0x10: {reset: 0, writable: true}",
+    "        0x14: {reset: 0, writable: true}",
+    "        0x18: {reset: 0, writable: true}",
+    "        0x20: {reset: 0, writable: true}",
+    "        0x24: {reset: 0, writable: true}",
+    "        0x30: {reset: 0, writable: true}",
+    "        0x34: {reset: 0, writable: true}",
+    "        0x38: {reset: 0, writable: true}",
+    "        0x40: {reset: 0, writable: true}",
+    "        0x44: {reset: 0, writable: true}",
+    "        0x50: {reset: 0, writable: true}",
+    "        0x54: {reset: 0, writable: true}",
+    "        0x58: {reset: 0, writable: true}",
+    "        0x60: {reset: 0, writable: true}",
+    "        0x64: {reset: 0, writable: true}",
+    "        0x70:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # LSERDY follows LSEON",
+    "        0x74:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # LSIRDY follows LSION",
+    "        0x80: {reset: 0, writable: true}",
+    "        0x84: {reset: 0, writable: true}",
+)
+
+_F1_RCC_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      registers:",
+    "        # TODO: guessed STM32F1/F3-class offsets. L4/G4 CR bits differ.",
+    "        0x00:",
+    "          reset: 0x00000083",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # HSIRDY follows HSION",
+    "            - {src: 16, dst: 17}      # HSERDY follows HSEON",
+    "            - {src: 24, dst: 25}      # PLLRDY follows PLLON",
+    "        0x04:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 2, width: 2}  # SWS copies SW",
+    "        0x08: {reset: 0, writable: true}",
+    "        0x0C: {reset: 0, writable: true}",
+    "        0x10: {reset: 0, writable: true}",
+    "        0x14: {reset: 0, writable: true}",
+    "        0x18: {reset: 0, writable: true}",
+    "        0x1C: {reset: 0, writable: true}",
+    "        0x20:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # LSERDY follows LSEON",
+    "        0x24:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {src: 0, dst: 1}        # LSIRDY follows LSION",
+)
+
+_KINETIS_MCG_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      registers:",
+    "        # TODO: guessed K64 MCG byte packing. C1 is the first byte.",
+    "        # IREFS is C1 bit 2. CLKS is C1 bits 7:6. EREFS0 is C2 bit 2",
+    "        # (bit 10 of this word).",
+    "        0x00: {reset: 0, writable: true}",
+    "        # C5, C6, S. PLLS is C6 bit 6 (bit 14). S is the third byte:",
+    "        # OSCINIT0 bit 17, CLKST bits 19:18, IREFST bit 20, PLLST bit 21,",
+    "        # LOCK0 bit 22.",
+    "        0x04:",
+    "          reset: 0",
+    "          writable: true",
+    "          follow:",
+    "            - {from: 0x00, src: 6, dst: 18, width: 2}   # CLKST copies CLKS",
+    "            - {src: 14, dst: 18, width: 2, value: 3}    # PLLS set => CLKST = 3",
+    "            - {src: 14, dst: 21}                        # PLLST follows PLLS",
+    "            - {src: 14, dst: 22}                        # LOCK0 follows PLLS",
+    "            - {from: 0x00, src: 2, dst: 20}             # IREFST follows IREFS",
+    "            - {from: 0x00, src: 10, dst: 17}            # OSCINIT0 follows EREFS0",
+    "        0x08: {reset: 0, writable: true}",
+    "        0x0C: {reset: 0, writable: true}",
+)
+
+_F4_FLASH_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      registers:",
+    "        # TODO: ACR sticks. SR writes are ignored and BSY (bit 16) reads as 0.",
+    "        0x00: {reset: 0, writable: true}",
+    "        0x04: {reset: 0, writable: true}",
+    "        0x08: {reset: 0, writable: true}",
+    "        0x0C:",
+    "          reset: 0",
+    "          writable: false",
+    "          read_mask: 0x00010000",
+    "          read_bits: 0",
+    "        0x10: {reset: 0, writable: true}",
+    "        0x14: {reset: 0, writable: true}",
+)
+
+_STM32_UART_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      # TODO: confirm these offsets. rx_irq is intentionally omitted.",
+    "      data_offset: 0x04",
+    "      status_offset: 0x00",
+    "      tx_empty_mask: 0xC0",
+    "      rx_ready_mask: 0x20",
+)
+
+_KINETIS_UART_EXTRA = (
+    "    read_default: 0",
+    "    config:",
+    "      # TODO: confirm these offsets. rx_irq is intentionally omitted.",
+    "      # Set rx_level: true if the handler reads a single byte.",
+    "      data_offset: 0x07",
+    "      status_offset: 0x04",
+    "      tx_empty_mask: 0xC0",
+    "      rx_ready_mask: 0x20",
+)
 
 
 def _mmio_regions(

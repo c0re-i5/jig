@@ -114,9 +114,10 @@ saul                 interact with sensors and actuators using SAUL
 ```
 
 `help` is echoed and the four compiled commands are listed. The shell
-prints another `>` and waits. `reboot`, `ps`, `rtc`, and `saul` were not
-sent. `saul` with no devices would print `No devices found` if the command
-ran; that string is in the image and was not exercised.
+prints another `>` and waits. `ps`, `rtc`, and `saul` were not sent in
+that session. `saul` with no devices would print `No devices found` if the
+command ran; that string is in the image and was not exercised. `reboot`
+is a separate run, below.
 
 The same exchange from Python:
 
@@ -138,6 +139,44 @@ assert b"Welcome to RIOT!" in tx
 assert b"reboot" in tx and b"Reboot the node" in tx
 ```
 
+## Reboot
+
+`reboot` writes `AIRCR.SYSRESETREQ`. The model treats that write, and
+`VECTRESET`, as `boot(reset=True)`: SP and PC come back from the vector
+table, the NVIC and the peripheral plugins return to the state from
+construction, and the run continues. SRAM is not reloaded. RIOT's own
+startup recopies `.data` and clears BSS. The UART `tx` buffer is kept, so
+the snapshot still shows the first banner and the command. The RX queue
+is dropped with the peripheral.
+
+```bash
+jig-emu run -c examples/console-p2im.yaml -f Console \
+  --serial-uart uart0 \
+  --serial-idle 8000 \
+  --serial-in 'reboot\n' \
+  --snapshot-out console-reboot.json
+```
+
+15 Nov 2026, the published Console ELF, the command above. Exit status 3:
+`status: instruction_limit`, `resets: 1`, `pc: 0x00000f88` (the same shell
+poll as the `help` session). The log line was
+`core reset via AIRCR.SYSRESETREQ; reset 1, continuing at 0x0000099c`.
+
+```text
+main(): This is RIOT! (Version: 2018.04-vm-HEAD)
+Welcome to RIOT!
+> reboot
+main(): This is RIOT! (Version: 2018.04-vm-HEAD)
+Welcome to RIOT!
+>
+```
+
+Both banners are in the 144-byte UART0 transcript. `run.halt_on_reset: true`
+would have stopped on the write instead. `run.max_resets` (default 8)
+stops a streak of resets that send no new UART byte, so a silent loop
+cannot spend the 800000-instruction cap. This command printed, so that
+cap did not apply. The run ended on the instruction cap, in the shell.
+
 ## What is still rough
 
 - MCG timing is the follow rules above. There is no PLL lock delay and no
@@ -154,7 +193,8 @@ assert b"reboot" in tx and b"Reboot the node" in tx
   different image that uses immediate 63 as a real SVCall must drop it
   from `svc_nop`.
 - The instruction cap ends the run in the shell poll. The shell does not
-  halt, and nothing here reboots the core on the `reboot` command.
+  halt. `reboot` does reset the core; the second banner is in the
+  transcript above. `ps`, `rtc`, and `saul` are still unsent.
 - There is no interactive TTY. `--serial-in` and `rehost.serial.run_lines`
   are the console. The fuzz path below queues bytes on UART0 RX after the
   banner.
@@ -178,9 +218,11 @@ Seeds in [`examples/seeds/console/`](seeds/console/), each ending in a newline:
 | `03-saul.txt` | `saul\n` |
 
 `reboot` is not a seed. On this model it echoes the line and writes
-`AIRCR.SYSRESETREQ`. Jig stops that as a fault (`other` / `reset`) instead
-of resetting the core. A campaign that mutates its way to `reboot` will
-bucket that stop. It is the missing reset, not a RIOT memory bug.
+`AIRCR.SYSRESETREQ`. The core resets and the banner is printed again, as
+in the session above. A case that resets without sending any new UART
+byte stops `halted` at `run.max_resets` (default 8). That stop is not a
+crash. A case that prints the banner again is a normal execution and
+keeps running until the idle gap or the instruction cap.
 
 ```bash
 curl -L -o Console \
@@ -220,5 +262,5 @@ seconds, PC `0x00000f88`, TX `main(): This is RIOT! (Version: 2018.04-vm-HEAD)`,
 `Welcome to RIOT!`, and the `>` prompt. No fault and no hang in these
 1000 executions. The corpus past the four seeds is shell editing
 (`\x08` backspace, DEL) and a few one-byte edits of `help`. `reboot` was
-not reached. The separate `reboot` probe above is still the model stop
-on `AIRCR.SYSRESETREQ`, not something this budget tripped.
+not reached. The separate `reboot` probe above is the modeled reset, not
+something this budget tripped.

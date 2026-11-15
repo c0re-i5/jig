@@ -164,6 +164,10 @@ def test_architectural_faults_and_the_unicorn_bkpt_vector():
     assert classify(_result("exception 7")).fault_class == "bkpt"
     assert classify(_result("exception return stacked xPSR.T is clear")).fault_class == "usage_fault"
     assert classify(_result("AIRCR.SYSRESETREQ")).reason == "reset"
+    assert classify(_result("AIRCR.VECTRESET")).reason == "reset"
+    capped = classify(_result("stopped after 8 silent core resets (AIRCR.SYSRESETREQ)"))
+    assert capped.reason == "reset"
+    assert "max_resets" in capped.explanation
     stacked = classify(
         _result("exception 11 could not stack at 0x1fffffe0: mem_write failed")
     )
