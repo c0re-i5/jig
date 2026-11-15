@@ -222,7 +222,13 @@ def _add_machine_source(parser: argparse.ArgumentParser) -> None:
     source.add_argument(
         "-f",
         "--firmware",
-        help="Path to a firmware image you are authorized to analyze",
+        help=(
+            "Firmware image you are authorized to analyze. "
+            "A raw bin is copied to load.base. "
+            "ELF32 (little-endian ARM) and Intel HEX (.hex, .ihex) are "
+            "written at the addresses in the file. Detection uses the bytes, "
+            "not the file name."
+        ),
     )
     source.add_argument(
         "--fixture",

@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
+from rehost.errors import ConfigError
 from rehost.nvic import (
     EXC_SYSTICK,
     NUM_EXTERNAL,
@@ -686,6 +689,52 @@ def test_svc_stacks_the_following_instruction():
     assert machine.read_u32(0x20000004) == 5
 
 
+def test_svc_nop_skips_only_the_listed_immediate():
+    skipped = machine_from_asm(
+        """
+        svc #63
+        movs r0, #1
+        bkpt #0
+        """,
+        run={"svc_nop": [63]},
+    )
+    result = skipped.run()
+    assert result.status == "halted", result.detail
+    assert result.registers["r0"] == 1
+
+    source = _vector_table((11, "svcall")) + """
+        reset:
+            svc #0
+            bkpt #0
+        svcall:
+            movw r2, #0
+            movt r2, #0x2000
+            movs r1, #4
+            str r1, [r2, #0]
+            bx lr
+    """
+    still = machine_from_asm(
+        source,
+        boot={"mode": "vector", "vector_base": 0},
+        run={"svc_nop": [63]},
+    )
+    result = still.run()
+    assert result.status == "halted", result.detail
+    assert still.read_u32(0x20000000) == 4
+
+    from rehost.config import parse_config
+
+    with pytest.raises(ConfigError, match="0..255"):
+        parse_config(
+            {
+                "name": "bad-svc",
+                "arch": "cortex-m",
+                "memory": [{"name": "flash", "base": 0, "size": 0x1000, "perms": "rx"}],
+                "run": {"svc_nop": [256]},
+            }
+        )
+
+
 def test_higher_priority_irq_preempts_and_returns_to_the_handler():
     source = _vector_table((16, "irq0"), (17, "irq1")) + """
         reset:
@@ -746,6 +795,8 @@ def test_thread_psp_stacks_on_psp_and_returns_with_exc_return_fd():
             movw r3, #0
             movt r3, #0x2000
             str r1, [r3, #4]
+            mrs r4, msp
+            str r4, [r3, #8]
             bkpt #0
         irq0:
             mov r1, lr
@@ -760,6 +811,9 @@ def test_thread_psp_stacks_on_psp_and_returns_with_exc_return_fd():
     assert result.status == "halted", result.detail
     assert machine.read_u32(0x20000000) == 0xFFFFFFFD
     assert machine.read_u32(0x20000004) == 0x55
+    # The return to a PSP thread must leave the kernel stack on MSP.
+    assert machine.read_u32(0x20000008) == 0x20001000
+    assert machine.backend.read_register("msp") == 0x20001000
 
 
 def test_aircr_sysresetreq_stops_the_run():

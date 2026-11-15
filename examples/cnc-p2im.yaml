@@ -11,8 +11,9 @@
 #
 # The firmware binary is not in this repository, and CI does not run it.
 # Download the published ELF yourself from
-# https://github.com/RiS3-Lab/p2im-real_firmware (binary/CNC) and follow
-# the README section "P2IM CNC". examples/cnc-p2im.md is the same note.
+# https://github.com/RiS3-Lab/p2im-real_firmware (binary/CNC) and pass that
+# file to jig-emu. ELF program segments are loaded at p_paddr. A raw bin
+# still copies to load.base. examples/cnc-p2im.md is the procedure.
 #
 # STM32F405/407-class beachhead map.
 #

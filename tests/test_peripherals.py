@@ -55,6 +55,52 @@ def test_uart_rx_irq_latches_once_per_burst():
         Uart(name="uart0", base=0x40000000, size=0x100, config={"rx_interrupt": 1})
 
 
+def test_uart_rx_level_pends_again_while_bytes_remain():
+    seen: list[int] = []
+    uart = Uart(
+        name="uart0",
+        base=0x4006A000,
+        size=0x100,
+        config={"rx_irq": 31, "rx_level": True, "data_offset": 0, "status_offset": 4},
+    )
+    uart.bind_rx_irq(seen.append)
+    uart.queue_rx(b"hi")
+    assert seen == [31]
+    assert uart.read(0, 1) == ord("h")
+    assert uart.take_rx_irq_edge() == 31
+    assert uart.read(0, 1) == ord("i")
+    assert uart.take_rx_irq_edge() is None
+
+
+def test_uart_byte_offsets_match_a_kinetis_layout():
+    # Status at +4 and data at +7, the Kinetis UART map. Word alignment is
+    # not required; a byte access at the data offset is the data register.
+    uart = Uart(
+        name="uart0",
+        base=0x4006A000,
+        size=0x1000,
+        config={
+            "data_offset": 0x07,
+            "status_offset": 0x04,
+            "tx_empty_mask": 0xC0,
+            "rx_ready_mask": 0x20,
+            "rx": b"Z",
+        },
+    )
+    assert uart.read(0x04, 1) & 0xE0 == 0xE0
+    assert uart.read(0x07, 1) == ord("Z")
+    uart.write(0x07, 1, 0x141)
+    assert bytes(uart.tx) == b"A"
+    assert uart.read(0x04, 1) & 0x20 == 0
+    with pytest.raises(ConfigError, match="does not fit"):
+        Uart(
+            name="uart0",
+            base=0x4006A000,
+            size=0x10,
+            config={"data_offset": 0x10, "status_offset": 0x04},
+        )
+
+
 def test_uart_posts_tx_and_pops_rx():
     uart = Uart(name="uart0", base=0x40000000, size=0x100, config={"rx": "Hi", "read_default": 0})
     assert uart.read(4, 4) & 0x80
@@ -453,6 +499,46 @@ def test_follow_bits_track_enable_and_clear_when_disabled():
             base=0x40023800,
             size=0x100,
             config={"registers": {"0x0": {"follow": {"src": 0, "dst": 1}}}},
+        )
+
+
+def test_follow_can_read_another_register_and_override_a_field():
+    # Status in the second word tracks an enable in the first. A later rule
+    # forces a constant into that field only while its own enable is set.
+    block = RegisterBlock(
+        name="mcg",
+        base=0x40064000,
+        size=0x1000,
+        config={
+            "registers": {
+                "0x0": {"reset": 0, "writable": True},
+                "0x4": {
+                    "reset": 0,
+                    "writable": True,
+                    "follow": [
+                        {"from": 0, "src": 6, "dst": 18, "width": 2},
+                        {"src": 14, "dst": 18, "width": 2, "value": 3},
+                        {"from": 0, "src": 2, "dst": 20},
+                    ],
+                },
+            }
+        },
+    )
+    assert block.read(0x6, 1) == 0
+    block.write(0x0, 1, 1 << 2)
+    assert block.read(0x6, 1) & 0x10
+    block.write(0x0, 1, 0x80)
+    assert block.read(0x6, 1) & 0x0C == 0x08
+    block.write(0x5, 1, 1 << 6)
+    assert block.read(0x6, 1) & 0x0C == 0x0C
+    block.write(0x5, 1, 0)
+    assert block.read(0x6, 1) & 0x0C == 0x08
+    with pytest.raises(ConfigError, match="not a register"):
+        RegisterBlock(
+            name="mcg",
+            base=0x40064000,
+            size=0x1000,
+            config={"registers": {"0x4": {"follow": [{"from": 0x10, "src": 0, "dst": 1}]}}},
         )
 
 

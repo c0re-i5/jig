@@ -70,60 +70,27 @@ and DIER clear. Nothing in the command session waits on it. The window is
 still unmapped. PWR, SYSCFG, and EXTI are `unimplemented` and are touched
 during init only.
 
-## Raw image
+## Image
 
-`--firmware` is raw bytes copied to `load.base` (`0x08000000`). Jig does
-not parse ELF program headers. Use the published `binary/CNC` ELF. A rebuild
-from the `CNC/` sources in that repository is a different image.
+Pass the published ELF. Jig writes each `PT_LOAD` that has file bytes at
+`p_paddr`. You do not run `objcopy` first. A rebuild from the `CNC/`
+sources in that repository is a different image.
 
-```bash
-arm-none-eabi-objcopy -O binary CNC CNC.bin
-```
-
-That writes the flash image, including the `.data` load-memory address. A
-host `objcopy` built without ARM support rejects this ELF. Extract every
-`PT_LOAD` whose `p_paddr` lies in flash, and lay those bytes out by
-`p_paddr`. The `p_vaddr` of the second segment is SRAM. Dropping it leaves
-`.data` out of the image.
-
-| `p_paddr` | `p_vaddr` | `p_filesz` | Contents |
+| `p_paddr` | `p_vaddr` | `p_filesz` | What the loader writes |
 | --- | --- | --- | --- |
-| `0x08000000` | `0x08000000` | `0xc0c0` | vectors, code, rodata |
-| `0x0800c0c0` | `0x20000000` | `0x44c` | `.data` image in flash |
+| `0x08000000` | `0x08000000` | `0xc0c0` | vectors, code, rodata, at `0x08000000` |
+| `0x0800c0c0` | `0x20000000` | `0x44c` | `.data` image, at `0x0800c0c0` in flash |
 
-The two segments are contiguous. The raw file is 50444 bytes. Reset copies
-`.data` and clears BSS. The first word stays `0x2001FFFF` (Atollic
-`_estack`, odd). Leave it odd. The CPU model clears SP[1:0].
+The `p_vaddr` of the second segment is SRAM. Writing the bytes there would
+skip the address the reset handler copies from. A third `PT_LOAD` is BSS at
+`0x2000044c` with a file size of 0. It is not written. Reset copies `.data`
+and clears BSS. The first word stays `0x2001FFFF` (Atollic `_estack`, odd).
+Leave it odd. The CPU model clears SP[1:0].
 
-```python
-import struct
-from pathlib import Path
-
-blob = Path("CNC").read_bytes()
-assert blob[:4] == b"\x7fELF" and blob[4] == 1 and blob[5] == 1
-phoff = struct.unpack_from("<I", blob, 28)[0]
-phentsize, phnum = struct.unpack_from("<HH", blob, 42)
-loads = []
-for index in range(phnum):
-    off = phoff + index * phentsize
-    p_type, p_offset, _vaddr, paddr, filesz = struct.unpack_from("<IIIII", blob, off)
-    if p_type == 1 and filesz and 0x08000000 <= paddr and paddr + filesz <= 0x08100000:
-        loads.append((paddr, blob[p_offset : p_offset + filesz]))
-loads.sort()
-start = loads[0][0]
-end = max(addr + len(chunk) for addr, chunk in loads)
-image = bytearray(end - start)
-for addr, chunk in loads:
-    image[addr - start : addr - start + len(chunk)] = chunk
-Path("CNC.bin").write_bytes(image)
-```
-
-Check the file before you boot it. The recorded extract is 50444 bytes and
-the first word is `0x2001ffff`:
-
-```bash
-python3 -c 'b=open("CNC.bin","rb").read(); print(len(b), hex(int.from_bytes(b[:4],"little")))'
-```
+A raw bin of those two spans, laid out from `0x08000000` with no gap, is
+50444 bytes and still loads at `load.base`. The ELF is the file the recipe
+uses. Intel HEX of the same spans loads too. The recorded ELF session and a
+HEX boot both reached the Grbl banner. The full command below was the ELF.
 
 ## Command session
 
@@ -135,7 +102,7 @@ the next quiet gap often still sees `<Run,MPos:0.000,...>` because Grbl
 prints `ok` when the block is planned, and the steps happen afterward.
 
 ```bash
-jig-emu run -c examples/cnc-p2im.yaml -f CNC.bin \
+jig-emu run -c examples/cnc-p2im.yaml -f CNC \
   --serial-uart usart2 \
   --serial-idle 8000 \
   --serial-settle 700000 \
@@ -195,7 +162,7 @@ from rehost.machine import Machine
 from rehost.serial import run_lines
 
 machine = Machine.from_path("examples/cnc-p2im.yaml")
-machine.load_image(open("CNC.bin", "rb").read())
+machine.load_image(open("CNC", "rb").read())
 result, tx, _new = run_lines(
     machine,
     ["$$", "?", "$X", "G91 G0 X1", "?"],

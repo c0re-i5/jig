@@ -2,8 +2,8 @@
 """Machine: config, memory map, plugins, and one CPU backend.
 
 This is the object researchers extend. It does not fetch firmware. Call
-``load_image`` with bytes you are authorized to analyze, or ``from_fixture``
-for the synthetic programs shipped in-repo.
+``load_image`` with bytes you are authorized to analyze (a raw bin, an ELF32,
+or Intel HEX), or ``from_fixture`` for the synthetic programs shipped in-repo.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from rehost.backends import (
 from rehost.coverage import MAP_SIZE, edge_location
 from rehost.config import MachineConfig, load_config
 from rehost.errors import BackendError, ConfigError, MachineError
+from rehost.image import LoadSegment, parse_firmware
 from rehost.memory import PERM_READ, PERM_WRITE, MemoryMap, access_mask, pages_touched
 from rehost.nvic import EXC_SYSTICK, REDIRECT, STOP
 from rehost.peripherals import create_peripheral
@@ -155,25 +156,72 @@ class Machine:
             raise KeyError(f"no peripheral named {name!r}; have {known}") from exc
 
     def load_image(self, data: bytes, base: int | None = None) -> None:
-        """Copy ``data`` into guest memory. The image is not fetched from anywhere."""
+        """Copy ``data`` into guest memory. The image is not fetched from anywhere.
+
+        A raw buffer is one span at ``load.base``, or at ``base`` when that
+        argument is passed. A little-endian ARM ELF32 is recognized by its
+        magic and each ``PT_LOAD`` segment is written at ``p_paddr``. An
+        Intel HEX record stream is written at the addresses in the records.
+        ELF and HEX already name their addresses, so ``base`` is rejected
+        for those two. A span that is not covered by the memory map raises
+        ``MachineError`` and leaves the previous image flag unchanged when
+        nothing was written.
+        """
         if not isinstance(data, (bytes, bytearray)) or not data:
             raise MachineError("firmware image is empty")
         blob = bytes(data)
-        load_at = self.config.load_base if base is None else base
-        if load_at < 0 or load_at + len(blob) > 0x1_0000_0000:
-            raise MachineError("firmware image does not fit in the 32-bit address space")
-        self.memory.regions_covering(load_at, len(blob))
+        kind, segments = parse_firmware(blob)
+        if kind == "raw":
+            load_at = self.config.load_base if base is None else base
+            if load_at < 0 or load_at + len(blob) > 0x1_0000_0000:
+                raise MachineError("firmware image does not fit in the 32-bit address space")
+            segments = [LoadSegment(load_at, blob, "raw image")]
+        elif base is not None:
+            name = "ELF" if kind == "elf" else "Intel HEX"
+            raise MachineError(f"{name} images carry their own load addresses; omit base")
+        for segment in segments:
+            self._require_segment(segment, wrap=kind != "raw")
         if self._protected:
             self._reprotect(writable=True)
         try:
-            self.backend.write_memory(load_at, blob)
-        except BackendError as exc:
-            raise MachineError(f"failed to write firmware at {load_at:#x}: {exc}") from exc
+            for segment in segments:
+                try:
+                    self.backend.write_memory(segment.address, segment.data)
+                except BackendError as exc:
+                    if kind == "raw":
+                        raise MachineError(
+                            f"failed to write firmware at {segment.address:#x}: {exc}"
+                        ) from exc
+                    raise MachineError(
+                        f"failed to write {segment.label} at {segment.address:#x}: {exc}"
+                    ) from exc
         finally:
             if self._protected:
                 self._reprotect(writable=False)
+        if kind != "raw":
+            placed = ", ".join(
+                f"{segment.address:#x}+{len(segment.data):#x}" for segment in segments
+            )
+            logger.debug("loaded %s: %s", kind, placed)
         self._image_loaded = True
         self._booted = False
+
+    def _require_segment(self, segment: LoadSegment, *, wrap: bool) -> None:
+        """Reject a span the memory map does not cover.
+
+        Raw images keep the map's own error text. ELF and HEX name the
+        segment as well, so a ``.data`` load address that missed flash is
+        obvious.
+        """
+        try:
+            self.memory.regions_covering(segment.address, len(segment.data))
+        except MachineError as exc:
+            if not wrap:
+                raise
+            raise MachineError(
+                f"{segment.label} at {segment.address:#x} size {len(segment.data):#x} "
+                f"falls outside the memory map: {exc}"
+            ) from exc
 
     def boot(self, *, reset: bool = False) -> None:
         """Set SP and PC from the vector table or from ``boot.entry``.
@@ -479,6 +527,10 @@ class Machine:
             return
         if effect == REDIRECT:
             return
+        if self._svc_nop(address):
+            # Unicorn reports SVC only after it executes. Moving PC first
+            # retires the listed immediate as a NOP.
+            self.backend.write_register("pc", (address + 2) | 1)
         self._instructions += 1
         self._note_retired(address)
         feed = self._rx_feed
@@ -489,6 +541,17 @@ class Machine:
         coverage_map = self._coverage_map
         if coverage_map is not None:
             coverage_map.on_instruction(address)
+
+    def _svc_nop(self, address: int) -> bool:
+        """True when this halfword is an SVC immediate listed in ``run.svc_nop``."""
+        immediates = self.config.run.svc_nop
+        if not immediates:
+            return False
+        try:
+            half = int.from_bytes(self.backend.read_memory(address, 2), "little")
+        except BackendError:
+            return False
+        return (half & 0xFF00) == 0xDF00 and (half & 0xFF) in immediates
 
     def _clock_peripherals(self) -> None:
         """Step SysTick and timers, and latch a UART RX edge, before this instruction.

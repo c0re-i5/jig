@@ -392,18 +392,25 @@ class Nvic:
             self.core.write_reg(name, value)
         self.active.discard(current)
         control = self.core.read_reg("control") & 0xFFFFFFFF
+        saved_msp = self.core.read_reg("msp") & 0xFFFFFFFF
+        if current != EXC_NMI:
+            self.core.write_reg("faultmask", 0)
+        # Drop IPSR before SP is written. In handler mode the engine aliases
+        # SP to MSP, so writing the thread stack first would replace the
+        # kernel stack. Thread mode with SPSEL set writes PSP instead.
+        self.core.write_reg("xpsr", (stacked & ~(1 << 9)) | (1 << 24))
         if to_psp:
             control |= 0x2
-            self.core.write_reg("control", control)
             self.core.write_reg("psp", new_sp)
+            self.core.write_reg("control", control)
+            self.core.write_reg("sp", new_sp)
+            if (self.core.read_reg("msp") & 0xFFFFFFFF) != saved_msp:
+                self.core.write_reg("msp", saved_msp)
         else:
             control &= ~0x2
             self.core.write_reg("control", control)
             self.core.write_reg("msp", new_sp)
-        self.core.write_reg("sp", new_sp)
-        if current != EXC_NMI:
-            self.core.write_reg("faultmask", 0)
-        self.core.write_reg("xpsr", (stacked & ~(1 << 9)) | (1 << 24))
+            self.core.write_reg("sp", new_sp)
         self._write_pc(ret_pc & ~1)
 
     def select_exception(self) -> int | None:
