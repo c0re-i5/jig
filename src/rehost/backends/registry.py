@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 _BACKENDS: dict[str, type[CpuBackend]] = {}
 
 _PLANNED = {
-    "renode",
     "riscv",
     "riscv32",
 }

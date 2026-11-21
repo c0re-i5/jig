@@ -40,12 +40,14 @@ def main(argv: list[str] | None = None) -> int:
     _add_machine_source(run)
     run.add_argument(
         "--backend",
-        choices=("unicorn", "qemu"),
+        choices=("unicorn", "qemu", "renode"),
         help=(
             "CPU engine. unicorn (default) is in-process Cortex-M. "
             "qemu drives qemu-system-arm on the mps2-an385 board and "
             "dispatches decoded MMIO to the same plugins. "
-            "qemu-system-arm must be on PATH."
+            "renode drives the renode monitor on the nrf52840 Cortex-M "
+            "platform and dispatches decoded MMIO to the same plugins. "
+            "qemu-system-arm or renode must be on PATH for those engines."
         ),
     )
     run.add_argument(
@@ -365,7 +367,11 @@ def _select_backend(args: argparse.Namespace):
         from rehost.backends.qemu_cortexm import QemuCortexM
 
         return QemuCortexM()
-    raise RehostError(f"unknown backend {choice!r}. Available: unicorn, qemu.")
+    if choice == "renode":
+        from rehost.backends.renode_cortexm import RenodeCortexM
+
+        return RenodeCortexM()
+    raise RehostError(f"unknown backend {choice!r}. Available: unicorn, qemu, renode.")
 
 
 def _machine_from_args(args: argparse.Namespace) -> Machine:
