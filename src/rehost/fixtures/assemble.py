@@ -2,8 +2,9 @@
 """A tiny Thumb/Thumb-2 assembler for in-repo fixtures.
 
 It encodes the instructions the synthetic programs use (``movw``/``movt``,
-``mov`` / ``movs``, ``ldr``/``str`` immediate, ``ldrb``, ``cmp``, ``adds``,
-``subs``, ``ands`` / ``eors`` / ``orrs``, ``lsls`` / ``lsrs`` immediate,
+``mov`` / ``movs``, ``ldr``/``str`` immediate, ``ldrb``, ``cmp`` (immediate
+or register), ``cmn`` (register), ``adds`` / ``subs`` (immediate or
+register), ``ands`` / ``eors`` / ``orrs``, ``lsls`` / ``lsrs`` immediate,
 ``add rd, sp``, ``bx``, ``svc``, ``mrs`` / ``msr``, ``cpsid`` / ``cpsie``,
 ``wfi`` / ``wfe``, ``bkpt``, ``nop``, short ``b``, and ``beq`` / ``bne``) plus
 ``.word`` / ``.thumb_word`` and even-length ``.zero``. It is
@@ -59,6 +60,7 @@ _WIDTHS = {
     "beq": 2,
     "bne": 2,
     "cmp": 2,
+    "cmn": 2,
     "ldrb": 2,
     "wfi": 2,
     "wfe": 2,
@@ -129,6 +131,22 @@ _ADD_SP = re.compile(
 _BX = re.compile(r"^bx\s+(?P<rm>r\d+|sp|lr|pc)$", re.IGNORECASE)
 _CMP = re.compile(
     r"^cmp\s+(?P<rn>r\d+)\s*,\s*#(?P<imm>-?(?:0x[0-9a-fA-F]+|\d+))$",
+    re.IGNORECASE,
+)
+_CMP_REG = re.compile(
+    r"^cmp\s+(?P<rn>r\d+)\s*,\s*(?P<rm>r\d+)$",
+    re.IGNORECASE,
+)
+_CMN_REG = re.compile(
+    r"^cmn\s+(?P<rn>r\d+)\s*,\s*(?P<rm>r\d+)$",
+    re.IGNORECASE,
+)
+_ADDS_REG = re.compile(
+    r"^adds\s+(?P<rd>r\d+)\s*,\s*(?P<rm>r\d+)$",
+    re.IGNORECASE,
+)
+_SUBS_REG = re.compile(
+    r"^subs\s+(?P<rd>r\d+)\s*,\s*(?P<rm>r\d+)$",
     re.IGNORECASE,
 )
 _LDRB = re.compile(
@@ -404,6 +422,38 @@ def _encode_insn(text: str, address: int, labels: dict[str, int], line_no: int) 
             raise AssembleError(f"line {line_no}: cmp immediate must fit in 8 bits")
         # CMP (immediate) T1: 00101 Rn imm8.
         return struct.pack("<H", 0x2800 | (rn << 8) | imm)
+
+    match = _CMP_REG.fullmatch(text)
+    if match:
+        rn = _register(match.group("rn"), line_no, low_only=False)
+        rm = _register(match.group("rm"), line_no, low_only=False)
+        if rn <= 7 and rm <= 7:
+            # CMP (register) T1: 0100001010 Rm Rn.
+            return struct.pack("<H", 0x4280 | (rm << 3) | rn)
+        # CMP (register) T2: 01000101 N Rm Rn. N is the high bit of Rn.
+        encoded = 0x4500 | (((rn >> 3) & 1) << 7) | (rm << 3) | (rn & 7)
+        return struct.pack("<H", encoded)
+
+    match = _CMN_REG.fullmatch(text)
+    if match:
+        rn = _register(match.group("rn"), line_no, low_only=True)
+        rm = _register(match.group("rm"), line_no, low_only=True)
+        # CMN (register) T1: 0100001011 Rm Rn.
+        return struct.pack("<H", 0x42C0 | (rm << 3) | rn)
+
+    match = _ADDS_REG.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        rm = _register(match.group("rm"), line_no, low_only=True)
+        # ADDS (register) T1 with Rn=Rd: adds rd, rd, rm.
+        return struct.pack("<H", 0x1800 | (rm << 6) | (rd << 3) | rd)
+
+    match = _SUBS_REG.fullmatch(text)
+    if match:
+        rd = _register(match.group("rd"), line_no, low_only=True)
+        rm = _register(match.group("rm"), line_no, low_only=True)
+        # SUBS (register) T1 with Rn=Rd: subs rd, rd, rm.
+        return struct.pack("<H", 0x1A00 | (rm << 6) | (rd << 3) | rd)
 
     match = _LDRB.fullmatch(text)
     if match:

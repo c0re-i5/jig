@@ -22,8 +22,10 @@ The same crash is classified and merged into ``--out/buckets`` and
 ``--out/reports`` before the process is killed.
 
 ``FS_NEW_OPT_FUTEX`` is not advertised. Current AFL++ falls back to this
-SIGSTOP path when the target does not offer the child-sync word. CmpLog,
-IJON, and the bug-pass map are not part of the handshake.
+SIGSTOP path when the target does not offer the child-sync word. CmpLog
+shared memory, IJON, and the bug-pass map are not part of the handshake.
+``jig-emu fuzz --cmplog`` is an in-process campaign stage and is ignored
+when this loop is the one running.
 
 The forkserver process does not construct a Unicorn engine. The child does,
 after ``fork``, and then loops on ``PersistentHarness.exec_one``. Forking the

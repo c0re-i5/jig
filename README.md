@@ -344,9 +344,20 @@ jig-emu fuzz --config machine.yaml --firmware image.bin --out DIR --seeds DIR
 | `--stop-on-crash` | Return after the first crash. The input is still written to `--out`. |
 | `--rng-seed N` | Havoc RNG. The summary prints the seed that was used. |
 | `--persistent-iters N` | Under afl-fuzz, restart the child after N cases. Default 10000. |
+| `--cmplog` | In-process comparison stage. Off by default. See [Comparison logging](#comparison-logging). Ignored when an AFL++ forkserver is attached. |
 | `--timeout-ms`, `--max-instructions` | Override the machine file for every case. |
 
-The schedule is a deterministic walk of each byte on corpus items up to 16 bytes, then stacked havoc (bit flips, random and interesting bytes, arithmetic, insert, delete, splice, short overwrites). Fixed energy, one process. New coverage means an edge moved into a higher AFL hit-count class.
+The schedule is a deterministic walk of each byte on corpus items up to 16 bytes, then stacked havoc (bit flips, random and interesting bytes, arithmetic, insert, delete, splice, short overwrites). Fixed energy, one process. New coverage means an edge moved into a higher AFL hit-count class. `--cmplog` adds one more stage, described next. It does not run unless you pass the flag.
+
+### Comparison logging
+
+`--cmplog` is a CmpLog / RedQueen-style stage for the in-process campaign. A new corpus input is executed once more as a shadow run. That run counts toward `--max-execs`. The Unicorn code hook that already updates the edge map decodes the instruction about to retire and, for a compare it recognizes, records the two concrete operands. If either operand's bytes occur in the current input, the stage builds candidates that write the other operand over that span, then the byte-swapped encoding, then the value plus or minus one. Candidates go through the same `exec_one` path as any other mutation. A candidate that grows the edge map is logged in turn, so a second compare behind the first one can be solved after the first one is.
+
+The patterns are Thumb and Thumb-2 `CMP` and `CMN`, flag-setting `SUB` (`SUBS`), and a 1, 2, or 4 byte load immediately followed by one of those compares. A load's width is kept, which is what a `ldrb` / `ldr` plus `cmp` magic-byte check needs. A shifted Thumb-2 register operand is logged as the value after a simple LSL, LSR, ASR, or ROR.
+
+This is not symbolic execution. The stage only sees operands this concrete input actually compared. A check the shadow run did not reach is invisible. It does not solve a hash, a CRC, or any transform other than an endian swap and plus or minus one. Exact little-endian writes are tried before the swapped bytes and the off-by-one values. It does not colorize bytes the way RedQueen's taint pass does: it searches for the operand's bytes, so a value that is only computed and never present in the input is not written back. One shadow run keeps at most 64 unique pairs and builds at most 64 candidates, with at most 8 hit sites for a single pattern. `TST`, `TEQ`, `RRX`, and a shift of 32 are not logged. An operand in `PC` is not logged. A hit is a raw byte span, so on an MMIO script it can split a 12-byte record; that candidate is rejected. The AFL++ forkserver does not advertise a CmpLog map; under afl-fuzz the flag is ignored and afl-fuzz keeps mutating. The `fuzz-crash` demo does not need this stage: each matched byte is already a new edge, and the byte walk finds it.
+
+The stage is off by default. A campaign that does not pass `--cmplog` does not attach a logger and does not decode compares.
 
 ### What coverage is
 
@@ -389,7 +400,7 @@ AFL_PERSISTENT=1 afl-fuzz -i seeds -o afl-out -t 2000 -- \
 
 Without the fuzz shared memory, pass `--input @@` and the child re-reads that file every iteration. With the fuzz region (what current afl-fuzz sets up), `--input` is not the per-case source.
 
-Not in this fuzzer: CmpLog / RedQueen, IJON, the bug-pass map, dictionaries, parallel campaigns, and a corpus-minimization UI.
+Not in this fuzzer: IJON, the bug-pass map, dictionaries, parallel campaigns, and a corpus-minimization UI. `--cmplog` is the in-process comparison stage above. It is not AFL++ CmpLog shared memory, and it is not symbolic execution.
 
 ### Harness
 
@@ -910,6 +921,7 @@ The shell does not halt. Exit status 3 after 800000 instructions is the cap, wit
 Done:
 
 - Coverage-guided fuzzing. `jig-emu fuzz` runs an in-process campaign, and the same command speaks the AFL++ persistent-mode forkserver when afl-fuzz attaches. See [Fuzzing](#fuzzing).
+- An optional in-process CmpLog stage (`jig-emu fuzz --cmplog`). A shadow run records concrete `CMP`, `CMN`, and flag-setting `SUB` operands, including a load immediately followed by a compare, and tries those bytes back in the input (endian swap, plus or minus one). It is off by default. It is not symbolic execution, and the forkserver does not grow an AFL++ CmpLog map. See [Comparison logging](#comparison-logging).
 - Crash triage. Each crash is classified, deduplicated into a bucket, and written up with the `jig-emu run` command that replays it. `jig-emu triage` rebuilds the reports from an existing `--out` directory. See [Crash triage](#crash-triage).
 - Phase 4 beachhead. UART RX IRQ, the STM32F4-class RCC/FLASH ready-bit template, and a Modbus RTU helper on the existing UART, exercised by the synthetic `modbus-rtu` fixture. See [UART RX interrupt](#uart-rx-interrupt) and [Modbus RTU](#modbus-rtu).
 - Phase 5 beachhead. The `plant-floor` fixture boots from a vector table, takes one SysTick interrupt, answers one Modbus RTU read, and a short fuzz campaign writes a triage bucket for a planted fetch. `examples/stm32f4_clock.yaml` is the map and the procedure for an image you build. See [Plant-floor beachhead](#plant-floor-beachhead).
@@ -931,7 +943,7 @@ Not in this version:
 - Fuzzing a live plant. The fuzzer talks to a rehosted image.
 - Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration. Ghidra is named in the beachhead procedure as a way to read MMIO constants, not as a plugin.
 - Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
-- CmpLog / RedQueen, parallel campaigns, and a corpus-minimization UI
+- Full RedQueen (input colorization, symbolic transforms, an AFL++ CmpLog shared map), parallel campaigns, and a corpus-minimization UI
 - A new CPU emulator. Decode and execute stay in Unicorn, or in QEMU/Renode when those adapters exist.
 - Third-party firmware in the repository. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 

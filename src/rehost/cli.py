@@ -140,6 +140,14 @@ def main(argv: list[str] | None = None) -> int:
         default=10_000,
         help="Under afl-fuzz, restart the persistent child after this many cases (default: 10000).",
     )
+    fuzz.add_argument(
+        "--cmplog",
+        action="store_true",
+        help="In-process CmpLog stage: on each new corpus input, log compare "
+        "operands during a shadow run and replace matching input bytes "
+        "(endian swap, plus or minus one). Off by default. Ignored when an "
+        "AFL++ forkserver is attached.",
+    )
     fuzz.add_argument("-v", "--verbose", action="store_true")
 
     triage = sub.add_parser(
@@ -376,6 +384,11 @@ def _fuzz(args: argparse.Namespace) -> int:
     replay = _replay_target(args)
     ctl = forkserver_fd()
     if ctl is not None:
+        if args.cmplog:
+            print(
+                "cmplog: ignored under the AFL++ forkserver; afl-fuzz keeps mutating",
+                file=sys.stderr,
+            )
         out = Path(args.out) if args.out else None
         return serve(
             lambda: _machine_from_args(args),
@@ -411,6 +424,7 @@ def _fuzz(args: argparse.Namespace) -> int:
         rng_seed=args.rng_seed,
         stop_on_crash=args.stop_on_crash,
         replay=replay,
+        cmplog=args.cmplog,
     )
     print(campaign.run().format())
     return 0
