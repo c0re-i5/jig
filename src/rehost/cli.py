@@ -40,13 +40,15 @@ def main(argv: list[str] | None = None) -> int:
     _add_machine_source(run)
     run.add_argument(
         "--backend",
-        choices=("unicorn", "qemu", "renode"),
+        choices=("unicorn", "qemu", "renode", "riscv"),
         help=(
             "CPU engine. unicorn (default) is in-process Cortex-M. "
             "qemu drives qemu-system-arm on the mps2-an385 board and "
             "dispatches decoded MMIO to the same plugins. "
             "renode drives the renode monitor on the nrf52840 Cortex-M "
             "platform and dispatches decoded MMIO to the same plugins. "
+            "riscv is in-process RV32 (Unicorn). The machine file's arch "
+            "selects it too: arch: riscv or arch: riscv32. "
             "qemu-system-arm or renode must be on PATH for those engines."
         ),
     )
@@ -348,7 +350,7 @@ def _add_machine_source(parser: argparse.ArgumentParser) -> None:
     source.add_argument(
         "--fixture",
         choices=list_fixtures(),
-        help="Built-in synthetic Cortex-M program (no external firmware)",
+        help="Built-in synthetic program (Thumb or RV32I; no external firmware)",
     )
     parser.add_argument("--timeout-ms", type=int, help="Override run.timeout_ms")
     parser.add_argument("--max-instructions", type=int, help="Override run.max_instructions")
@@ -371,7 +373,11 @@ def _select_backend(args: argparse.Namespace):
         from rehost.backends.renode_cortexm import RenodeCortexM
 
         return RenodeCortexM()
-    raise RehostError(f"unknown backend {choice!r}. Available: unicorn, qemu, renode.")
+    if choice == "riscv":
+        from rehost.backends.unicorn_riscv import UnicornRiscv
+
+        return UnicornRiscv()
+    raise RehostError(f"unknown backend {choice!r}. Available: unicorn, qemu, renode, riscv.")
 
 
 def _machine_from_args(args: argparse.Namespace) -> Machine:
@@ -465,13 +471,14 @@ def _fuzz(args: argparse.Namespace) -> int:
 
 def _triage(args: argparse.Namespace) -> int:
     from rehost.coverage import MAP_SIZE, CoverageMap
-    from rehost.fuzz import PersistentHarness
+    from rehost.fuzz import PersistentHarness, ensure_fuzz_backend
 
     out = Path(args.out)
     crashes = out / "crashes"
     if not crashes.is_dir():
         raise RehostError(f"no crashes directory at {crashes}")
     machine = _machine_from_args(args)
+    ensure_fuzz_backend(machine)
     machine.attach_coverage(CoverageMap(size=MAP_SIZE))
     harness = PersistentHarness(machine)
     store = TriageStore(out, replay=_replay_target(args))

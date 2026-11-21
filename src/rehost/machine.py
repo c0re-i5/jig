@@ -241,8 +241,9 @@ class Machine:
         peripheral state captured at construction, clears NVIC and the core
         mode bits, and re-reads the boot PC. It does not reload the image,
         so SRAM keeps whatever the guest left there. ``boot.mode vector``
-        uses ``vector_base``. ``boot.mode entry`` uses ``boot.sp`` and
-        ``boot.entry``.
+        uses ``vector_base`` on Cortex-M. ``boot.mode entry`` uses ``boot.sp``
+        and ``boot.entry``. RV32 accepts ``entry`` only: there is no vector
+        table, and ``sp`` / ``pc`` are the registers that are written.
         """
         if not self._image_loaded:
             raise MachineError("load an image before boot")
@@ -256,6 +257,31 @@ class Machine:
                 if isinstance(plugin, Uart):
                     plugin.raise_rx_if_needed()
         boot = self.config.boot
+        if self.backend.boot_isa == "rv32":
+            self._boot_rv32(boot)
+        else:
+            self._boot_cortexm(boot)
+        self._booted = True
+
+    def _boot_rv32(self, boot) -> None:
+        """Load ``sp`` and ``pc`` for RV32. There is no vector table.
+
+        ``x0`` stays zero. ``ra`` is cleared. The entry address is stored
+        as given: RV32 has no Thumb bit, and a misaligned PC faults on fetch.
+        """
+        if boot.mode == "vector":
+            raise MachineError(
+                "RISC-V has no Cortex-M vector table; set boot.mode to entry "
+                "with boot.sp and boot.entry"
+            )
+        if boot.sp is None or boot.entry is None:
+            raise ConfigError("boot.mode entry requires boot.sp and boot.entry")
+        self.backend.write_register("ra", 0)
+        self.backend.write_register("sp", boot.sp)
+        self.backend.write_register("pc", boot.entry)
+
+    def _boot_cortexm(self, boot) -> None:
+        """Thread mode, privileged, MSP selected, Thumb bit set."""
         if boot.mode == "vector":
             sp = self.read_u32(boot.vector_base)
             entry = self.read_u32(boot.vector_base + 4)
@@ -264,9 +290,8 @@ class Machine:
                 raise ConfigError("boot.mode entry requires boot.sp and boot.entry")
             sp = boot.sp
             entry = boot.entry
-        # Thread mode, privileged, MSP selected, masks clear. Writing CONTROL
-        # first makes the following SP write land in MSP when a thread had
-        # PSP selected.
+        # Writing CONTROL first makes the following SP write land in MSP when
+        # a thread had PSP selected.
         self.backend.write_register("control", 0)
         self.backend.write_register("primask", 0)
         self.backend.write_register("basepri", 0)
@@ -283,7 +308,6 @@ class Machine:
         self.backend.write_register("pc", entry & ~1)
         if boot.mode == "vector":
             self.backend.set_vector_table(boot.vector_base)
-        self._booted = True
 
     def attach_coverage(self, coverage) -> None:
         """Record AFL-style edges into ``coverage`` on later runs.
@@ -650,6 +674,8 @@ class Machine:
         for plugin, tx, dropped in kept:
             plugin.tx = bytearray(tx)
             plugin.tx_dropped = dropped
+        if self.backend.boot_isa == "rv32":
+            return
         # ``boot`` stores an even PC. ``start`` sets the Thumb bit for the
         # initial entry. A redirect from this hook has to set it itself,
         # matching exception entry.
@@ -663,6 +689,8 @@ class Machine:
 
     def _svc_nop(self, address: int) -> bool:
         """True when this halfword is an SVC immediate listed in ``run.svc_nop``."""
+        if self.backend.boot_isa == "rv32":
+            return False
         immediates = self.config.run.svc_nop
         if not immediates:
             return False
@@ -693,6 +721,11 @@ class Machine:
                     self.inject_irq(irq)
 
     def _on_interrupt(self, vector: int) -> None:
+        # A halt address or an instruction cap already recorded in the code
+        # hook wins. The RISC-V backend reports EBREAK from that same hook.
+        if self._reason is not None:
+            self.backend.stop()
+            return
         if vector == BKPT_VECTOR and self.config.run.halt_on_bkpt:
             self._reason = STATUS_HALTED
             self._detail = "bkpt"
@@ -706,7 +739,7 @@ class Machine:
                 self.backend.stop()
             return
         self._reason = STATUS_FAULT
-        self._detail = f"exception {vector}"
+        self._detail = self.backend.cpu_fault or f"exception {vector}"
         self.backend.stop()
 
     def _on_read(self, address: int, size: int, _value: int) -> None:
@@ -818,7 +851,8 @@ class Machine:
             detail=self._detail,
             pc=registers.get("pc", 0),
             sp=registers.get("sp", 0),
-            lr=registers.get("lr", 0),
+            # Cortex-M reports ``lr``. RV32 has ``ra`` and no ``lr`` name.
+            lr=registers.get("lr", registers.get("ra", 0)),
             registers=registers,
             instructions=self._instructions,
             trace=tuple(self._trace),

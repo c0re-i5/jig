@@ -81,6 +81,8 @@ def test_examples_match_packaged_fixtures():
         "modbus_rtu.yaml",
         "plant_floor.s",
         "plant_floor.yaml",
+        "uart_gpio_rv32.s",
+        "uart_gpio_rv32.yaml",
     ):
         assert (examples / name).read_text(encoding="utf-8") == (
             packaged / name

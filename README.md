@@ -1,6 +1,6 @@
 # Jig
 
-Jig is a machine shop for plant-controller firmware: emulate it, instrument it, fuzz it, and triage what breaks. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost` (`import rehost`, `python -m rehost`), so existing imports keep working. The default CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. A second backend drives `qemu-system-arm` on the Cortex-M3 board QEMU already ships (`mps2-an385`); select it with `--backend qemu`. A third drives [Renode](https://renode.io/) on the Cortex-M4 platform Renode already ships (`@platforms/cpus/nrf52840.repl`); select it with `--backend renode`. RISC-V is not implemented.
+Jig is a machine shop for plant-controller firmware: emulate it, instrument it, fuzz it, and triage what breaks. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost` (`import rehost`, `python -m rehost`), so existing imports keep working. The default CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. A second backend drives `qemu-system-arm` on the Cortex-M3 board QEMU already ships (`mps2-an385`); select it with `--backend qemu`. A third drives [Renode](https://renode.io/) on the Cortex-M4 platform Renode already ships (`@platforms/cpus/nrf52840.repl`); select it with `--backend renode`. A fourth is Unicorn on RV32 (`UC_ARCH_RISCV`, `UC_MODE_RISCV32`); select it with `--backend riscv` or `arch: riscv` / `arch: riscv32`. That backend is a first RV32I slice. See [RISC-V](#risc-v).
 
 The tool does not download firmware. Tests and the built-in fixtures are synthetic programs assembled from source in this repository. `--firmware` accepts a raw bin, a little-endian ARM ELF32, or Intel HEX. Two local smokes on published images are written up and are not in this tree, and CI does not run them: P2IM CNC (grbl 0.8c on STM32F407VG) through a Grbl session, and P2IM Console (RIOT on an NXP FRDM-K64F) through the shell banner and one `help`. See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console). Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before you point the tool at a real image.
 
@@ -37,9 +37,9 @@ Exit status is `0` for a halt (`BKPT` or a configured halt address), `1` for a f
 
 ```text
 src/rehost/
-  backends/         CpuBackend, plus the Unicorn, QEMU, and Renode Cortex-M adapters
+  backends/         CpuBackend, plus Unicorn Cortex-M, QEMU Cortex-M, Renode Cortex-M, and Unicorn RV32
   peripherals/      plugin registry plus UART, GPIO, SysTick, timer, register block, bit-band
-  fixtures/         Thumb assembler and the synthetic programs
+  fixtures/         Thumb and RV32I assemblers and the synthetic programs
   modbus.py         Modbus RTU framing on the existing UART plugin
   serial.py         line-oriented UART RX injection
   config.py         YAML/TOML machine loader
@@ -65,7 +65,7 @@ flowchart TD
   uni["Unicorn Cortex-M"]
   qemu["QEMU Cortex-M, mps2-an385"]
   renode["Renode Cortex-M, nrf52840"]
-  later["RISC-V"]
+  rv["Unicorn RV32"]
   mmio["MMIO dispatch"]
   plugs["Plugins: UART, GPIO, SysTick, register block"]
   unmapped["Unmapped policy: fault, or log and return a default"]
@@ -79,12 +79,13 @@ flowchart TD
   cpu --> uni
   cpu --> qemu
   cpu --> renode
-  cpu -.-> later
+  cpu --> rv
   uni --> nvic
   nvic --> uni
   uni --> mmio
   qemu --> mmio
   renode --> mmio
+  rv --> mmio
   mmio --> plugs
   mmio --> unmapped
   mmio --> inst
@@ -94,7 +95,7 @@ flowchart TD
   snap -.-> uni
 ```
 
-`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. The Unicorn backend models the NVIC and exception entry in front of each instruction. The QEMU backend executes ordinary Thumb on `qemu-system-arm` and sends decoded plugin accesses through the same MMIO hooks; it does not take those NVIC exceptions. The Renode backend does the same kind of dispatch on `renode`'s monitor, on the `nrf52840` platform. `jig-emu fuzz` and the AFL++ forkserver stay on Unicorn. Snapshots are plain data (register names, region bytes, plugin dicts, and the NVIC image). A QEMU or Renode run's NVIC image is empty. See [QEMU Cortex-M](#qemu-cortex-m) and [Renode Cortex-M](#renode-cortex-m).
+`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. The Unicorn Cortex-M backend models the NVIC and exception entry in front of each instruction. The QEMU backend executes ordinary Thumb on `qemu-system-arm` and sends decoded plugin accesses through the same MMIO hooks; it does not take those NVIC exceptions. The Renode backend does the same kind of dispatch on `renode`'s monitor, on the `nrf52840` platform. The RV32 backend executes on Unicorn's RISC-V32 engine and sends plugin accesses through those same hooks. It has no interrupt controller. `jig-emu fuzz` and the AFL++ forkserver stay on Unicorn Cortex-M. Snapshots are plain data (register names, region bytes, plugin dicts, and the NVIC image). A QEMU, Renode, or RV32 run's NVIC image is empty. See [QEMU Cortex-M](#qemu-cortex-m), [Renode Cortex-M](#renode-cortex-m), and [RISC-V](#risc-v).
 
 ## Run your own image
 
@@ -105,6 +106,7 @@ jig-emu run --config examples/console-p2im.yaml --firmware /path/to/image.hex
 jig-emu run --fixture uart-gpio -v
 jig-emu run --backend qemu --fixture uart-gpio
 jig-emu run --backend renode --fixture uart-gpio
+jig-emu run --backend riscv --fixture uart-gpio-rv32
 jig-emu run --fixture fuzz-echo --input case.bin --snapshot-out after.json
 jig-emu plugins
 jig-emu fixtures
@@ -300,9 +302,9 @@ class QemuCortexM(CpuBackend):
     # map_memory, start, stop, hooks, ...
 ```
 
-`arch: qemu` and `arch: qemu-cortex-m` are the QEMU adapter. `arch: renode` and `arch: renode-cortex-m` are the Renode adapter. `riscv` is still a planned name and fails with that explanation.
+`arch: qemu` and `arch: qemu-cortex-m` are the QEMU adapter. `arch: renode` and `arch: renode-cortex-m` are the Renode adapter. `arch: riscv` and `arch: riscv32` are the Unicorn RV32 engine. Cortex-M Unicorn remains `arch: cortex-m`.
 
-`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller. On the QEMU and Renode backends `inject_irq` only records the number. The handler does not run.
+`inject_irq(n)` pends external IRQ `n` (exception `16 + n` on Cortex-M). On the Unicorn Cortex-M backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller. On the QEMU, Renode, and RV32 backends `inject_irq` only records the number. The handler does not run.
 
 ## QEMU Cortex-M
 
@@ -333,7 +335,7 @@ Still Unicorn, and not this adapter:
 - `WFI` and `WFE` retire without waiting. QEMU's gdb single-step blocks in `WFI`.
 - Guest permission checks apply to fetches and to decoded data accesses. The board SSRAM itself is readable, writable, and executable, so an undecoded store can ignore an RX region.
 - Banked registers are written by executing `msr`, because QEMU 8.2's gdbstub reads MSP, PSP, CONTROL, PRIMASK, BASEPRI, and FAULTMASK but does not apply `P` writes. The four bytes at `0x21FFFF00` (the top of PSRAM) are saved and restored around that instruction.
-- Any RISC-V backend. Renode is a separate adapter. See [Renode Cortex-M](#renode-cortex-m).
+- RISC-V. This adapter is Cortex-M only. RV32 is a separate Unicorn backend. See [RISC-V](#risc-v). Renode is a separate Cortex-M adapter. See [Renode Cortex-M](#renode-cortex-m).
 
 This is not a full rehost. It does not download firmware, and it does not run the published P2IM images.
 
@@ -369,9 +371,49 @@ Still Unicorn, and not this adapter:
 - Guest permission checks apply to fetches and to decoded data accesses. Platform `MappedMemory` is readable, writable, and executable, so an undecoded store can ignore an RX region.
 - MSP and PSP are the monitor's `SP` and `OtherSP`. On Renode 1.17, `IsUsingProcessSP` stayed clear after a `CONTROL` write, so those two properties are the stored banks. Exception entry, which is what would switch stacks on a chip, is not taken here.
 - A fetch has to land in platform RAM or in a free window Renode accepted as `MappedMemory`. A region that overlaps a device Renode already mapped is a shadow, and the CPU cannot fetch it.
-- RISC-V is still not implemented.
+- RISC-V. This adapter is Cortex-M only. RV32 is a separate Unicorn backend. See [RISC-V](#risc-v).
 
 This is not a full rehost. It does not download firmware, and it does not run the published P2IM images.
+
+## RISC-V
+
+```bash
+jig-emu run --fixture uart-gpio-rv32
+jig-emu run --backend riscv --fixture uart-gpio-rv32
+```
+
+Cortex-M Unicorn stays the default. Omit `--backend`, or pass `--backend unicorn`, and `uart-gpio` still runs Thumb. `--backend riscv` builds the RV32 engine for that invocation. A machine file selects the same engine with `arch: riscv` or `arch: riscv32` and does not need the flag. The packaged fixture says `arch: riscv`, so the two commands above are the same run. `--backend` does not rewrite the file. A snapshot records the file's `arch`.
+
+The engine is Unicorn `UC_ARCH_RISCV` with `UC_MODE_RISCV32`. Flash and RAM come from the YAML the same way they do on Cortex-M: page-aligned `map_memory`, then `protect_memory` after the image is written. Plugin windows are mapped too. Loads and stores there hit the same memory hooks `Machine` installs for Unicorn, so the UART and GPIO plugins see the access.
+
+`boot.mode` is `entry`. `boot.sp` is written to `sp` (`x2`) and `boot.entry` is written to `pc`. There is no Cortex-M vector table, so `boot.mode: vector` is an error on this backend. `x0` / `zero` reads as 0. Snapshot names are the ABI names (`ra`, `sp`, `gp`, `tp`, `t0`–`t6`, `s0`–`s11`, `a0`–`a7`) plus `pc`. `x0`–`x31` and `fp` are accepted aliases and are not repeated in the snapshot. The summary line `lr` prints `ra`, because this register file has no `lr`.
+
+`EBREAK` (encoding `0x00100073`) is the breakpoint. Unicorn 2.1 reports that word as an invalid instruction, so the code hook recognizes it and delivers vector 7, the same breakpoint vector `BKPT` uses. With `halt_on_bkpt: true` the run stops with `detail: bkpt` and leaves `pc` on the `EBREAK`. A `run.halt_addresses` entry and `run.max_instructions` stop through the same code hook as Cortex-M. An unmapped access or a permission fault uses the same unmapped and prot hooks. An illegal instruction is `riscv illegal instruction (2)`.
+
+On this tree, `jig-emu run --fixture uart-gpio-rv32` halts on `EBREAK` at `pc 0x30` after 13 instructions, with `uart0 tx: 41` and `gpioa odr: 0x1`. SRAM `0x20000000` holds the magic word `0x00C0FFEE`. SRAM `0x20000008` holds the UART status `0x80` returned by the plugin. The image is assembled from source in this repository. There is no cross toolchain and no third-party firmware.
+
+The fixture and the in-repo assembler exercise these RV32I instructions:
+
+| Instruction | Where it shows up |
+| --- | --- |
+| `lui` | SRAM `0x20000000`, UART `0x40000000`, GPIO `0x40001000`, and the high part of `0x00C0FFEE` |
+| `addi` | The byte `'A'` (`0x41`), the GPIO value 1, and `addi a5, a5, -18` which finishes the magic word |
+| `sb` | Store `'A'` at UART data, offset 0 |
+| `lw` | Read UART status at offset 4 |
+| `sw` | Store 1 at GPIO ODR, then store the status and the magic word in SRAM |
+| `ebreak` | Halt |
+
+The assembler also encodes `jal rd, label` and the `j label` pseudo (`jal zero, label`). The instruction-limit and timeout tests use `j`. It rejects every other mnemonic, including `mul`, compressed opcodes, and floating-point loads. Registers are the ABI names, `fp`, and `x0`–`x31`. Load, store, and `addi` immediates are signed 12-bit. `lui` takes an unsigned 20-bit immediate.
+
+Outside this slice:
+
+- C, M, and F are not a Jig surface. The assembler does not encode them, the fixture does not use them, and no test executes them. Jig does not install an opcode filter. On Unicorn 2.1.4 a bring-up check did execute one `mul` and one compressed `c.nop`; that is the engine's decoder, and it is not a promise. F was not exercised.
+- No NVIC, CLINT, or PLIC, and no interrupt delivery. `inject_irq` records the number. The handler does not run.
+- No S-mode and no Linux. The run is Unicorn's RV32 engine on the YAML map, with `pc` and `sp` taken from `boot.entry` and `boot.sp`.
+- `jig-emu fuzz`, `--cmplog`, and the AFL++ forkserver refuse this backend. CmpLog decodes Thumb. Those three stay on Unicorn Cortex-M.
+- No QEMU RISC-V adapter and no Renode RISC-V adapter.
+
+This closes the Phase 7 backend-abstraction goal: Cortex-M on Unicorn, QEMU, and Renode, plus a first RV32 backend on the same `CpuBackend` interface. It is not RV32GC.
 
 ## Snapshots
 
@@ -386,11 +428,11 @@ machine.restore(snap)
 snap.write_json("state.json")
 ```
 
-The snapshot includes general-purpose registers, `sp`, `lr`, `pc`, `xpsr`, the Cortex-M banked stack and mask registers Unicorn exposes, every writable non-peripheral region, each plugin's `snapshot_state`, and the NVIC/SCB image (`cpu` in the JSON: enable, pending, active, priority, VTOR, priority grouping). Flash is not saved; reload the image, then restore. `Machine.restore` checks that the region set matches. A checkpoint taken for fuzzing therefore restores interrupt state with the RAM and the plugins.
+The snapshot includes general-purpose registers, `sp`, `lr`, `pc`, `xpsr`, the Cortex-M banked stack and mask registers Unicorn exposes, every writable non-peripheral region, each plugin's `snapshot_state`, and the NVIC/SCB image (`cpu` in the JSON: enable, pending, active, priority, VTOR, priority grouping). Flash is not saved; reload the image, then restore. `Machine.restore` checks that the region set matches. A checkpoint taken for fuzzing therefore restores interrupt state with the RAM and the plugins. An RV32 snapshot stores the ABI names from [RISC-V](#risc-v) and an empty NVIC image. Its run report prints `ra` on the `lr` line.
 
 ## Fuzzing
 
-`jig-emu fuzz` is a coverage-guided fuzzer. It calls `PersistentHarness.exec_one`, so every case starts from the same boot checkpoint (CPU, RAM, plugins, and NVIC). Two drivers share that hook, the edge map, and the crash rule:
+`jig-emu fuzz` is a coverage-guided fuzzer for Unicorn Cortex-M. It calls `PersistentHarness.exec_one`, so every case starts from the same boot checkpoint (CPU, RAM, plugins, and NVIC). An RV32 machine is refused. Two drivers share that hook, the edge map, and the crash rule:
 
 * **In-process campaign**, used when you run `jig-emu fuzz` yourself. No AFL++ install is required. This is the driver to use for the planted-crash demo.
 * **AFL++ persistent-mode forkserver**, used when `afl-fuzz` has attached the control pipes. The same process then stops between cases and lets afl-fuzz mutate.
@@ -1010,20 +1052,21 @@ Done:
 - A modeled core reset. `AIRCR.SYSRESETREQ` and `VECTRESET` take the `boot(reset=True)` path and the run continues. `run.halt_on_reset` stops on the first request. `run.max_resets` stops a silent reboot streak before it spends the instruction cap. On the published Console ELF, `reboot` prints the RIOT banner a second time. See [P2IM Console](#p2im-console).
 - Phase 7, first slice: a QEMU Cortex-M backend on `CpuBackend`. `jig-emu run --backend qemu` drives `qemu-system-arm -machine mps2-an385` and traps decoded MMIO into the existing plugins. The synthetic `uart-gpio` fixture halts with the same UART and GPIO outcome as Unicorn. Unicorn remains the default. See [QEMU Cortex-M](#qemu-cortex-m).
 - Phase 7, next slice: a Renode Cortex-M backend on the same interface. `jig-emu run --backend renode` drives the `renode` monitor on `@platforms/cpus/nrf52840.repl` and traps decoded MMIO into the existing plugins. The synthetic `uart-gpio` fixture halts with the same UART and GPIO outcome as Unicorn. See [Renode Cortex-M](#renode-cortex-m).
+- Phase 7, closing slice: a Unicorn RV32 backend on the same interface. `jig-emu run --backend riscv` (or `arch: riscv` / `arch: riscv32`) runs the synthetic `uart-gpio-rv32` fixture. It posts `A` through the UART plugin, sets the GPIO latch, and halts on `EBREAK`. The instructions that fixture executes are RV32I `lui`, `addi`, `sb`, `lw`, `sw`, and `ebreak`. Unicorn Cortex-M stays the default. See [RISC-V](#risc-v). Phase 7's backend-abstraction goal is complete with this slice: one `CpuBackend` interface, four engines.
 
 Not in this version:
 
 - An authorized real Cortex-M industrial image in CI, or committed to the tree. The P2IM CNC and Console smokes are local runs of published research binaries you download yourself. See [P2IM CNC](#p2im-cnc), [P2IM Console](#p2im-console), and [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md). Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on.
 - HAL and RTOS call shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
 - A full rehost of one industrial image. The P2IM CNC session models the step timer and GPIO set/reset far enough for one unlocked `G0` to finish and report Idle. TIM4 (g540) is still unmapped, pulse timing is an instruction count, and the EEPROM checksum still fails on a cold boot because that storage is a RAM buffer inside the image. The Console session reaches the RIOT shell, `help`, and `reboot`. SIM, PORT, the real MCG clock, and `ps` / `rtc` / `saul` are still unmodeled. An `--aggressive` starter map is not that session: see [Start a map from an ELF](#start-a-map-from-an-elf). See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console).
-- The rest of Phase 7. A RISC-V backend, NVIC delivery under QEMU or Renode, and CmpLog, the in-process fuzzer, and the AFL++ forkserver on either of those adapters are not in this tree. The landed slices are the `mps2-an385` adapter, the `nrf52840` monitor adapter, and the synthetic `uart-gpio` path on both. See [QEMU Cortex-M](#qemu-cortex-m) and [Renode Cortex-M](#renode-cortex-m).
+- The rest of RISC-V, and the Cortex-M paths that stayed on Unicorn. QEMU and Renode do not deliver NVIC exceptions. CmpLog, the in-process fuzzer, and the AFL++ forkserver stay on Unicorn Cortex-M; `jig-emu fuzz` refuses the RV32 backend. There is no QEMU or Renode RISC-V adapter. The RV32 slice has no C, M, or F support in the assembler or the tests, and no CLINT, PLIC, or S-mode. See [QEMU Cortex-M](#qemu-cortex-m), [Renode Cortex-M](#renode-cortex-m), and [RISC-V](#risc-v).
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
 - A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.
 - Fuzzing a live plant. The fuzzer talks to a rehosted image.
 - Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration. Ghidra is named in the beachhead procedure as a way to read MMIO constants, not as a plugin.
 - Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
 - Full RedQueen (input colorization, symbolic transforms, an AFL++ CmpLog shared map), parallel campaigns, and a corpus-minimization UI. The in-process `--cmplog` stage is the slice that landed. See [Comparison logging](#comparison-logging).
-- A new CPU emulator. Ordinary Thumb executes in Unicorn, in `qemu-system-arm` when `--backend qemu` is selected, or in `renode` when `--backend renode` is selected. The QEMU and Renode adapters decode loads and stores only so plugin windows are not issued to the board devices. RISC-V is not wired up.
+- A new CPU emulator beyond the four that landed. Ordinary Thumb executes in Unicorn, in `qemu-system-arm` when `--backend qemu` is selected, or in `renode` when `--backend renode` is selected. RV32I as described in [RISC-V](#risc-v) executes in Unicorn when `--backend riscv` is selected or the file says `arch: riscv` / `arch: riscv32`. The QEMU and Renode adapters decode Thumb loads and stores only so plugin windows are not issued to the board devices.
 - Third-party firmware in the repository. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 
 ## License

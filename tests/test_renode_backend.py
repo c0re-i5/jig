@@ -39,15 +39,11 @@ def _renode_binary() -> str | None:
 requires_renode = pytest.mark.skipif(_renode_binary() is None, reason="renode is not installed")
 
 
-def test_renode_names_are_registered_and_riscv_stays_planned():
+def test_renode_names_are_registered():
     names = available_backends()
     assert "cortex-m" in names
     assert "renode" in names
     assert "renode-cortex-m" in names
-    from rehost.errors import ConfigError
-
-    with pytest.raises(ConfigError, match="planned adapter"):
-        create_backend("riscv")
 
 
 def test_parse_registration_points_are_inclusive():

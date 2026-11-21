@@ -13,7 +13,7 @@ class ConfigError(RehostError):
 
 
 class AssembleError(RehostError):
-    """The in-repo Thumb assembler could not encode a fixture."""
+    """The in-repo Thumb or RV32 assembler could not encode a fixture."""
 
 
 class MachineError(RehostError):

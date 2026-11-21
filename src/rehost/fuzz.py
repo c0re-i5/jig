@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
-from rehost.errors import ConfigError, FuzzInputError
+from rehost.errors import ConfigError, FuzzInputError, RehostError
 from rehost.memory import access_mask
 from rehost.result import STATUS_HALTED, STATUS_LIMIT, STATUS_TIMEOUT, RunResult
 
@@ -41,6 +41,22 @@ logger = logging.getLogger(__name__)
 # AFL++'s default MAX_FILE is 1 MiB; the fuzz map adds the leading u32.
 _DEFAULT_AFL_MAP = (1 << 20) + 4
 _MMIO_RECORD = struct.Struct("<IIB3x")
+
+
+def ensure_fuzz_backend(machine: object) -> None:
+    """Refuse a campaign on a backend that does not support fuzzing.
+
+    CmpLog decodes Thumb, and the forkserver is wired to that same Unicorn
+    Cortex-M path. The RV32 backend sets ``supports_fuzz`` false.
+    """
+    backend = getattr(machine, "backend", None)
+    if getattr(backend, "supports_fuzz", True):
+        return
+    arch = getattr(backend, "arch", "this CPU")
+    raise RehostError(
+        f"fuzzing, CmpLog, and the AFL++ forkserver are not implemented on {arch}. "
+        "They stay on the Unicorn Cortex-M backend."
+    )
 
 
 def encode_mmio_script(records: list[tuple[int, int, int]]) -> bytes:

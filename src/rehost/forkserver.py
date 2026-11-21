@@ -46,7 +46,7 @@ from pathlib import Path
 
 from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError, RehostError
-from rehost.fuzz import PersistentHarness, is_fuzz_crash, read_afl_shmem
+from rehost.fuzz import PersistentHarness, ensure_fuzz_backend, is_fuzz_crash, read_afl_shmem
 from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 # include/config.h
@@ -230,6 +230,7 @@ def _persistent_loop(
     replay: ReplayTarget | None,
 ) -> None:
     machine = load_machine()
+    ensure_fuzz_backend(machine)
     coverage = _map_afl_coverage()
     machine.attach_coverage(coverage)
     harness = PersistentHarness(machine)
