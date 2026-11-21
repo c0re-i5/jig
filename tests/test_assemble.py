@@ -92,6 +92,10 @@ def test_movw_movt_builds_a_peripheral_address():
 
 def test_cmp_ldrb_and_conditional_branch_execute():
     assert assemble("cmp r1, #0x4A") == bytes.fromhex("4a29")
+    assert assemble("cmp r1, r2") == bytes.fromhex("9142")
+    assert assemble("cmn r1, r2") == bytes.fromhex("d142")
+    assert assemble("adds r3, r4") == bytes.fromhex("1b19")
+    assert assemble("subs r3, r4") == bytes.fromhex("1b1b")
     assert assemble("ldrb r1, [r0, #0]") == bytes.fromhex("0178")
     assert assemble("ldrb r1, [r0, #1]") == bytes.fromhex("4178")
     taken = machine_from_asm(
@@ -160,6 +164,42 @@ def test_logic_shift_and_subs_execute():
 def test_shift_immediate_zero_is_rejected():
     with pytest.raises(AssembleError, match="shift immediate"):
         assemble("lsrs r0, r0, #0")
+
+
+def test_register_add_sub_and_compare_execute():
+    # A wrong encoding of cmn would leave Z set from the earlier cmp and take beq.
+    machine = machine_from_asm(
+        """
+        movs r0, #2
+        movs r1, #3
+        adds r0, r1
+        movs r2, #5
+        cmp r0, r2
+        bne bad
+        cmn r0, r1
+        beq bad
+        subs r0, r1
+        movs r2, #2
+        cmp r0, r2
+        bne bad
+        movs r0, #4
+        mov r8, r0
+        movs r1, #5
+        cmp r0, r0
+        cmp r8, r1
+        beq bad
+        movs r3, #9
+        b done
+        bad:
+            movs r3, #0
+        done:
+            bkpt #0
+        """
+    )
+    result = machine.run()
+    assert result.status == "halted"
+    assert result.registers["r0"] == 4
+    assert result.registers["r3"] == 9
 
 
 def test_unknown_instruction_and_far_branch_fail():

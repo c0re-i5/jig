@@ -54,6 +54,7 @@ def test_forkserver_stops_for_a_clean_input_and_signals_the_crash(tmp_path):
             str(out),
             "--persistent-iters",
             "20",
+            "--cmplog",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -110,6 +111,8 @@ def test_forkserver_stops_for_a_clean_input_and_signals_the_crash(tmp_path):
                 proc.kill()
                 proc.wait(timeout=5)
         stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        if proc.returncode == 0:
+            assert "cmplog: ignored" in stderr
         if proc.returncode not in (0, None) and proc.returncode < 0:
             pytest.fail(f"forkserver died by signal {-proc.returncode}: {stderr}")
         _shmctl_rmid(coverage_id)

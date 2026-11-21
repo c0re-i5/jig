@@ -121,6 +121,9 @@ class Machine:
         self._trace_total = 0
         self._coverage: set[int] = set()
         self._coverage_map = None
+        # CmpLog, or None. Attached only when a campaign asks for it, and
+        # inactive except during that campaign's shadow run.
+        self._cmplog = None
         self._rx_feed = None
         # Optional callable(instructions) after each retired instruction.
         # The banner checkpoint uses it. A serial feed is separate.
@@ -293,6 +296,16 @@ class Machine:
         """
         self._coverage_map = coverage
 
+    def attach_cmplog(self, cmplog) -> None:
+        """Record comparison operands into ``cmplog`` on later runs.
+
+        ``cmplog`` is a ``CmpLog``, or None to detach. Logging stays off
+        until ``cmplog.active`` is set, so attaching it does not decode on
+        an ordinary execution. The log is not guest state: ``run`` clears
+        it at the start of a shadow run, and it is not part of the snapshot.
+        """
+        self._cmplog = cmplog
+
     def run(self) -> RunResult:
         """Execute until BKPT, a halt address, a fault, a timeout, or the instruction cap."""
         if not self._image_loaded:
@@ -314,6 +327,8 @@ class Machine:
         self._reset_tx_mark = self._uart_tx_len()
         if self._coverage_map is not None:
             self._coverage_map.begin_run()
+        if self._cmplog is not None and self._cmplog.active:
+            self._cmplog.begin_run()
         self.backend.prepare_run()
         pc = self.backend.read_register("pc")
         timeout_us = self.config.run.timeout_ms * 1000
@@ -579,6 +594,9 @@ class Machine:
         coverage_map = self._coverage_map
         if coverage_map is not None:
             coverage_map.on_instruction(address)
+        cmplog = self._cmplog
+        if cmplog is not None:
+            cmplog.on_instruction(self, address, size)
 
     def _consume_reset_request(self) -> bool:
         """Apply a pending AIRCR reset before this instruction retires.

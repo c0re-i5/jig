@@ -7,8 +7,16 @@ plugin, and NVIC state come from the boot checkpoint. The coverage map and
 the crash decision are the same ones the forkserver reports to afl-fuzz.
 
 The schedule is deliberately small: a deterministic byte walk on short
-corpus items (so a 4-byte magic value is reachable from a zero seed), then
-stacked havoc. It is not AFL's full power schedule.
+corpus items (so a 4-byte magic value is reachable from a zero seed when
+each matched byte is a new edge), then stacked havoc. It is not AFL's full
+power schedule.
+
+``cmplog=True`` adds a stage the byte walk cannot do. Each new corpus input
+is executed once more with comparison logging on. Where a logged operand's
+bytes sit in that input, the other operand is written over them (and the
+byte-swapped and plus-or-minus-one forms). Those candidates go through
+``_consider``. The stage is off unless the caller asks for it. Shadow runs
+count toward ``max_execs``.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from rehost.cmplog import CmpLog, input_to_state
 from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError
 from rehost.fuzz import PersistentHarness, is_fuzz_crash, is_fuzz_hang
@@ -34,6 +43,9 @@ _HAVOC_STACK = 4
 _INTERESTING_8 = (0, 1, 16, 32, 64, 100, 127, 128, 255)
 _HANG_CAP = 8
 _CRASH_CAP = 64
+# How many solved compares to chase from one seed. A magic word and then a
+# checksum is two. The cap stops a chain of accidental new edges.
+_CMPLOG_DEPTH = 4
 
 
 @dataclass
@@ -94,6 +106,7 @@ class Campaign:
         rng_seed: int | None = None,
         stop_on_crash: bool = False,
         replay: ReplayTarget | None = None,
+        cmplog: bool = False,
     ) -> None:
         if max_execs < 1:
             raise ValueError("max_execs must be >= 1")
@@ -124,6 +137,12 @@ class Campaign:
         self._stopped = False
         self._started = 0.0
         self.triage = TriageStore(out, replay=replay)
+        self.cmplog: CmpLog | None = None
+        self._cmplog_depth = 0
+        self._cmplog_done: set[bytes] = set()
+        if cmplog:
+            self.cmplog = CmpLog()
+            machine.attach_cmplog(self.cmplog)
 
     def run(self) -> CampaignResult:
         self.out.mkdir(parents=True, exist_ok=True)
@@ -213,6 +232,8 @@ class Campaign:
             self.queue.append(_Item(data))
             self._write(self.out / "queue", f"id:{len(self.queue) - 1:06d}", data)
             self._progress()
+            if self.cmplog is not None:
+                self._cmplog_stage(data)
             return "new"
         self._progress()
         return "boring"
@@ -225,6 +246,50 @@ class Campaign:
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _cmplog_stage(self, base: bytes) -> None:
+        """Shadow-run ``base`` and execute input-to-state candidates.
+
+        Depth-first, same reason as the byte walk: the input that just grew
+        the map is the one whose later compares are now reachable. A second
+        call with the same bytes does not log again.
+        """
+        if (
+            self.cmplog is None
+            or self._stopped
+            or self.execs >= self.max_execs
+            or self._cmplog_depth >= _CMPLOG_DEPTH
+            or base in self._cmplog_done
+        ):
+            return
+        self._cmplog_done.add(base)
+        self._cmplog_depth += 1
+        try:
+            pairs = self._shadow(base)
+            if not pairs:
+                return
+            for candidate in input_to_state(base, pairs):
+                if self._stopped or self.execs >= self.max_execs:
+                    return
+                self._consider(candidate)
+        finally:
+            self._cmplog_depth -= 1
+
+    def _shadow(self, base: bytes) -> list:
+        """One execution with comparison logging. Counts as an exec."""
+        if self.cmplog is None or self.execs >= self.max_execs:
+            return []
+        self.cmplog.active = True
+        self.execs += 1
+        try:
+            try:
+                self.harness.exec_one(base)
+            except FuzzInputError:
+                return []
+            return list(self.cmplog.pairs)
+        finally:
+            self.cmplog.active = False
+            self._progress()
 
     def _deterministic(self, base: bytes, depth: int = 0) -> None:
         """Walk each byte. A new edge is extended before the rest of this input.
