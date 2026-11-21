@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Synthetic Cortex-M fixtures assembled in-repo.
+"""Synthetic fixtures assembled in-repo.
 
-These are hand-written Thumb programs used by tests and ``jig-emu run
---fixture``. They are not third-party firmware, and this package does not
-download any.
+These are hand-written Thumb and RV32I programs used by tests and
+``jig-emu run --fixture``. They are not third-party firmware, and this
+package does not download any.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 
 from rehost.errors import ConfigError
 from rehost.fixtures.assemble import assemble
+from rehost.fixtures.assemble_riscv import assemble as assemble_rv32
 
 _DATA = Path(__file__).resolve().parent / "data"
 
@@ -43,6 +44,15 @@ FIXTURES: dict[str, dict[str, str]] = {
         "summary": (
             "STM32-shaped controller: one SysTick, then a Modbus RTU read on USART2. "
             "Fuzz buffer JIG! fetches unmapped memory."
+        ),
+    },
+    "uart-gpio-rv32": {
+        "asm": "uart_gpio_rv32.s",
+        "config": "uart_gpio_rv32.yaml",
+        "isa": "rv32",
+        "summary": (
+            "RV32I: posts 'A' to a UART, sets a GPIO latch, stores a magic word "
+            "and the UART status, then EBREAK."
         ),
     },
 }
@@ -79,7 +89,10 @@ def build_fixture(name: str) -> bytes:
     """
     spec = _spec(name)
     base = int(spec.get("base", "0"), 0)
-    return assemble(fixture_source(name), base=base)
+    source = fixture_source(name)
+    if spec.get("isa") == "rv32":
+        return assemble_rv32(source, base=base)
+    return assemble(source, base=base)
 
 
 def _spec(name: str) -> dict[str, str]:

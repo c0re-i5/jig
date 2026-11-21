@@ -24,7 +24,7 @@ from rehost.backends.qemu_cortexm import (
 from rehost.backends.registry import available_backends, create_backend
 from rehost.cli import main
 from rehost.config import parse_config
-from rehost.errors import BackendError, ConfigError
+from rehost.errors import BackendError
 from rehost.fixtures.assemble import assemble, assemble_image
 from rehost.machine import Machine
 
@@ -32,15 +32,14 @@ _QEMU = os.environ.get("JIG_QEMU") or shutil.which("qemu-system-arm")
 requires_qemu = pytest.mark.skipif(_QEMU is None, reason="qemu-system-arm is not installed")
 
 
-def test_qemu_and_renode_names_are_registered_and_riscv_stays_planned():
+def test_qemu_names_are_registered():
     names = available_backends()
     assert "cortex-m" in names
     assert "qemu" in names
     assert "qemu-cortex-m" in names
     assert "renode" in names
     assert "renode-cortex-m" in names
-    with pytest.raises(ConfigError, match="planned adapter"):
-        create_backend("riscv")
+    assert create_backend("cortex-m").arch == "cortex-m"
 
 
 def test_omitted_backend_stays_unicorn():

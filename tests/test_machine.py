@@ -100,9 +100,9 @@ def test_coverage_includes_the_entry_and_unknown_backend_is_named():
     result = machine.run()
     assert result.coverage is not None
     assert 0 in result.coverage
-    with pytest.raises(ConfigError, match="planned adapter"):
+    with pytest.raises(ConfigError, match="unknown arch"):
         Machine(
-            parse_config_arch("riscv"),
+            parse_config_arch("mips"),
         )
 
 

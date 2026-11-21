@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Jig contributors" }]
-keywords = ["jig", "emulation", "firmware", "rehosting", "cortex-m", "security"]
+keywords = ["jig", "emulation", "firmware", "rehosting", "cortex-m", "riscv", "security"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

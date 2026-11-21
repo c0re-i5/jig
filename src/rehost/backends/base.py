@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """CPU backend interface.
 
-``UnicornCortexM`` is the first implementation. A QEMU system adapter or a
-Renode adapter should implement the same methods so ``Machine`` does not grow
-a second control path. The backend does not know about YAML, plugins, or
-fuzz input.
+``UnicornCortexM`` is the default implementation. QEMU and Renode Cortex-M
+adapters and ``UnicornRiscv`` implement the same methods so ``Machine`` does
+not grow a second control path. The backend does not know about YAML,
+plugins, or fuzz input.
 """
 
 from __future__ import annotations
@@ -31,14 +31,18 @@ class CpuBackend(ABC):
     """Operations ``Machine`` needs from any CPU engine.
 
     ``qemu`` / ``qemu-cortex-m`` is the QEMU system adapter. ``renode`` /
-    ``renode-cortex-m`` is the Renode adapter. A RISC-V engine is still
-    planned. ``inject_irq`` pends an external IRQ. The Unicorn backend
-    delivers it through the NVIC. The QEMU and Renode backends record it
-    and do not vector.
+    ``renode-cortex-m`` is the Renode adapter. ``riscv`` / ``riscv32`` is
+    the Unicorn RV32 engine. ``inject_irq`` pends an external IRQ. The
+    Unicorn Cortex-M backend delivers it through the NVIC. The QEMU,
+    Renode, and RISC-V backends record it and do not vector.
     """
 
     arch: str
     page_size: int = 0x1000
+    # ``cortex-m`` loads MSP, XPSR, and the Thumb bit. ``rv32`` loads sp and pc.
+    boot_isa: str = "cortex-m"
+    # False when CmpLog, the in-process campaign, and the forkserver must refuse.
+    supports_fuzz: bool = True
 
     def __init__(self) -> None:
         self.pending_irqs: list[int] = []

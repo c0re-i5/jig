@@ -31,7 +31,7 @@ from pathlib import Path
 from rehost.cmplog import CmpLog, input_to_state
 from rehost.coverage import MAP_SIZE, CoverageMap
 from rehost.errors import FuzzInputError
-from rehost.fuzz import PersistentHarness, is_fuzz_crash, is_fuzz_hang
+from rehost.fuzz import PersistentHarness, ensure_fuzz_backend, is_fuzz_crash, is_fuzz_hang
 from rehost.triage import ReplayTarget, TriageStore, note_crash
 
 # Byte-walk inputs longer than this only in havoc. The planted fixture's
@@ -110,6 +110,7 @@ class Campaign:
     ) -> None:
         if max_execs < 1:
             raise ValueError("max_execs must be >= 1")
+        ensure_fuzz_backend(machine)
         fuzz = machine.config.fuzz
         if fuzz is not None and fuzz.mode == "buffer" and fuzz.buffer is not None:
             self.max_len = fuzz.buffer.max_size

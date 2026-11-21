@@ -12,10 +12,9 @@ if TYPE_CHECKING:
 
 _BACKENDS: dict[str, type[CpuBackend]] = {}
 
-_PLANNED = {
-    "riscv",
-    "riscv32",
-}
+# Names that should explain themselves until a backend registers them.
+# ``riscv`` and ``riscv32`` are registered by ``UnicornRiscv``.
+_PLANNED: set[str] = set()
 
 
 def register_backend(arch: str):
