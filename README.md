@@ -1,6 +1,6 @@
 # Jig
 
-Jig is a machine shop for plant-controller firmware: emulate it, instrument it, fuzz it, and triage what breaks. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost` (`import rehost`, `python -m rehost`), so existing imports keep working. The first CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. QEMU and Renode can sit behind the same backend interface later; this tree does not implement them yet.
+Jig is a machine shop for plant-controller firmware: emulate it, instrument it, fuzz it, and triage what breaks. The command is `jig-emu`. The installable distribution name is `jigfw`. The import package is still `rehost` (`import rehost`, `python -m rehost`), so existing imports keep working. The default CPU backend is [Unicorn](https://www.unicorn-engine.org/) emulating Cortex-M (Thumb and Thumb-2). Memory maps and peripherals come from a YAML or TOML file. A second backend drives `qemu-system-arm` on the Cortex-M3 board QEMU already ships (`mps2-an385`); select it with `--backend qemu`. Renode and RISC-V are not implemented.
 
 The tool does not download firmware. Tests and the built-in fixtures are synthetic programs assembled from source in this repository. `--firmware` accepts a raw bin, a little-endian ARM ELF32, or Intel HEX. Two local smokes on published images are written up and are not in this tree, and CI does not run them: P2IM CNC (grbl 0.8c on STM32F407VG) through a Grbl session, and P2IM Console (RIOT on an NXP FRDM-K64F) through the shell banner and one `help`. See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console). Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before you point the tool at a real image.
 
@@ -37,7 +37,7 @@ Exit status is `0` for a halt (`BKPT` or a configured halt address), `1` for a f
 
 ```text
 src/rehost/
-  backends/         CpuBackend and the Unicorn Cortex-M adapter
+  backends/         CpuBackend, the Unicorn Cortex-M adapter, and the QEMU adapter
   peripherals/      plugin registry plus UART, GPIO, SysTick, timer, register block, bit-band
   fixtures/         Thumb assembler and the synthetic programs
   modbus.py         Modbus RTU framing on the existing UART plugin
@@ -63,7 +63,8 @@ flowchart TD
   ingest["Ingest: your image plus a YAML or TOML machine file"]
   cpu["CPU backend interface"]
   uni["Unicorn Cortex-M"]
-  later["QEMU / Renode adapters"]
+  qemu["QEMU Cortex-M, mps2-an385"]
+  later["Renode and RISC-V"]
   mmio["MMIO dispatch"]
   plugs["Plugins: UART, GPIO, SysTick, register block"]
   unmapped["Unmapped policy: fault, or log and return a default"]
@@ -75,10 +76,12 @@ flowchart TD
 
   ingest --> cpu
   cpu --> uni
+  cpu --> qemu
   cpu -.-> later
   uni --> nvic
   nvic --> uni
   uni --> mmio
+  qemu --> mmio
   mmio --> plugs
   mmio --> unmapped
   mmio --> inst
@@ -88,7 +91,7 @@ flowchart TD
   snap -.-> uni
 ```
 
-`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. The Unicorn backend models the NVIC and exception entry in front of each instruction. Snapshots are plain data (register names, region bytes, plugin dicts, and the NVIC image), so a future backend can restore them without Unicorn context objects.
+`Machine` is the object that ties these together. It asks the backend to map pages, execute, and read registers. It asks plugins what an MMIO load or store means. The Unicorn backend models the NVIC and exception entry in front of each instruction. The QEMU backend executes ordinary Thumb on `qemu-system-arm` and sends decoded plugin accesses through the same MMIO hooks; it does not take those NVIC exceptions. `jig-emu fuzz` and the AFL++ forkserver stay on Unicorn. Snapshots are plain data (register names, region bytes, plugin dicts, and the NVIC image). A QEMU run's NVIC image is empty. See [QEMU Cortex-M](#qemu-cortex-m).
 
 ## Run your own image
 
@@ -97,6 +100,7 @@ jig-emu run --config examples/uart_gpio.yaml --firmware /path/to/image.bin
 jig-emu run --config examples/cnc-p2im.yaml --firmware /path/to/CNC
 jig-emu run --config examples/console-p2im.yaml --firmware /path/to/image.hex
 jig-emu run --fixture uart-gpio -v
+jig-emu run --backend qemu --fixture uart-gpio
 jig-emu run --fixture fuzz-echo --input case.bin --snapshot-out after.json
 jig-emu plugins
 jig-emu fixtures
@@ -292,9 +296,42 @@ class QemuCortexM(CpuBackend):
     # map_memory, start, stop, hooks, ...
 ```
 
-`arch: qemu-cortex-m`, `renode`, and `riscv` are recognized as planned names and fail with that explanation. They are not wired up.
+`arch: qemu` and `arch: qemu-cortex-m` are the QEMU adapter. `renode` and `riscv` are still planned names and fail with that explanation.
 
-`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller.
+`inject_irq(n)` pends external IRQ `n` (exception `16 + n`). On the Unicorn backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller. On the QEMU backend `inject_irq` only records the number. The handler does not run.
+
+## QEMU Cortex-M
+
+```bash
+jig-emu run --backend qemu --fixture uart-gpio
+```
+
+That command needs `qemu-system-arm` on `PATH` (or `JIG_QEMU` pointing at the binary). If it is missing, the process exits 4 and the error names `qemu-system-arm`. Unicorn stays the default: omit `--backend`, or pass `--backend unicorn`. `--backend` does not rewrite the machine file. A fixture file still says `arch: cortex-m`, and a snapshot taken this way still records that arch. `arch: qemu` or `arch: qemu-cortex-m` in the file selects the same adapter without the flag.
+
+The machine is `mps2-an385`, the Cortex-M3 board image QEMU ships. Its SSRAM covers the synthetic flash and SRAM:
+
+| Window | What QEMU maps |
+| --- | --- |
+| `0x00000000` for 8 MiB | SSRAM1 and its alias |
+| `0x20000000` for 8 MiB | SSRAM2/3 and its alias |
+| `0x21000000` for 16 MiB | PSRAM |
+
+Code is fetched and executed by `qemu-system-arm`. Registers, RAM, and single-step use the gdbstub. QMP checks that `-S` held the CPU and quits the process. Pages outside those windows (the fixture UART at `0x40000000`, GPIO at `0x40001000`, SysTick at `0xE000E010`) are a host shadow, not the MPS2 SCC or the real system control block. Decoded loads and stores that touch a shadow page, a plugin hook, an unmapped address, or a permission the map does not allow are not issued to the board. They call the same memory hooks `Machine` installs for Unicorn, so the UART, GPIO, and SysTick plugins see the access.
+
+On this tree, `jig-emu run --backend qemu --fixture uart-gpio` halts on `BKPT` at `pc 0x42` after 20 instructions, with `uart0 tx: 41` and `gpioa odr: 0x1`, the same outcome as Unicorn. The bytes left in SRAM (`0x00C0FFEE`, the SysTick read, the UART status) match too. Tests that spawn QEMU skip when `qemu-system-arm` is absent, so `python3 -m pytest` stays green without it.
+
+Still Unicorn, and not this adapter:
+
+- NVIC priority, exception entry and return, and delivery of `inject_irq`. The QEMU process has its own NVIC. Jig does not program it, and a pending IRQ is not taken. A SysTick plugin can still be read and written through the hooks. `TICKINT` does not enter a handler.
+- The in-process fuzz campaign, the AFL++ forkserver, and the `--cmplog` stage. That stage logs compares on the Unicorn code hook. `jig-emu fuzz` has no `--backend` flag, so it does not run them on QEMU.
+- `PUSH` / `POP` / `LDM` / `STM`, and Thumb-2 load/store forms this decoder does not parse, run inside QEMU when the base register points at board RAM. An undecoded load or store whose base is not board RAM is refused. It is not handed to an MPS2 device.
+- Fetches have to land in the RAM windows above. A map whose code lives somewhere else cannot run on this machine.
+- `WFI` and `WFE` retire without waiting. QEMU's gdb single-step blocks in `WFI`.
+- Guest permission checks apply to fetches and to decoded data accesses. The board SSRAM itself is readable, writable, and executable, so an undecoded store can ignore an RX region.
+- Banked registers are written by executing `msr`, because QEMU 8.2's gdbstub reads MSP, PSP, CONTROL, PRIMASK, BASEPRI, and FAULTMASK but does not apply `P` writes. The four bytes at `0x21FFFF00` (the top of PSRAM) are saved and restored around that instruction.
+- Renode, and any RISC-V backend.
+
+This is not a full rehost. It does not download firmware, and it does not run the published P2IM images.
 
 ## Snapshots
 
@@ -931,20 +968,21 @@ Done:
 - A second published image. P2IM Console (RIOT on an NXP FRDM-K64F) prints the RIOT banner and answers `help`. The map is declarative: MCG `follow` rules, a byte UART with `rx_level`, `svc_nop` for the P2IM `svc #63` hook, and sticky RAM for the blocks that are not decoded. The ELF is not in this tree. See [P2IM Console](#p2im-console).
 - UART fuzzing and a starter map. `fuzz.mode: uart` queues the testcase on a UART after a banner checkpoint, and `jig-emu map init` writes a starter YAML from an ELF or Intel HEX image. `--aggressive` promotes recognized clock and UART constants. A recorded in-process campaign against the published CNC ELF is in [P2IM CNC](#p2im-cnc). The ELF is not in this tree, and CI does not run the campaign. See [Start a map from an ELF](#start-a-map-from-an-elf) and [Fuzzing](#fuzzing).
 - A modeled core reset. `AIRCR.SYSRESETREQ` and `VECTRESET` take the `boot(reset=True)` path and the run continues. `run.halt_on_reset` stops on the first request. `run.max_resets` stops a silent reboot streak before it spends the instruction cap. On the published Console ELF, `reboot` prints the RIOT banner a second time. See [P2IM Console](#p2im-console).
+- Phase 7, first slice: a QEMU Cortex-M backend on `CpuBackend`. `jig-emu run --backend qemu` drives `qemu-system-arm -machine mps2-an385` and traps decoded MMIO into the existing plugins. The synthetic `uart-gpio` fixture halts with the same UART and GPIO outcome as Unicorn. Unicorn remains the default. See [QEMU Cortex-M](#qemu-cortex-m).
 
 Not in this version:
 
 - An authorized real Cortex-M industrial image in CI, or committed to the tree. The P2IM CNC and Console smokes are local runs of published research binaries you download yourself. See [P2IM CNC](#p2im-cnc), [P2IM Console](#p2im-console), and [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md). Getting a specific Zephyr or FreeRTOS binary through the peripherals the template does not model yet is the researcher-side follow-on.
 - HAL and RTOS call shims (VxWorks, QNX, ThreadX), including HAL-call replacement.
 - A full rehost of one industrial image. The P2IM CNC session models the step timer and GPIO set/reset far enough for one unlocked `G0` to finish and report Idle. TIM4 (g540) is still unmapped, pulse timing is an instruction count, and the EEPROM checksum still fails on a cold boot because that storage is a RAM buffer inside the image. The Console session reaches the RIOT shell, `help`, and `reboot`. SIM, PORT, the real MCG clock, and `ps` / `rtc` / `saul` are still unmodeled. An `--aggressive` starter map is not that session: see [Start a map from an ELF](#start-a-map-from-an-elf). See [P2IM CNC](#p2im-cnc) and [P2IM Console](#p2im-console).
-- Phase 7: QEMU and Renode adapters on `CpuBackend`, and a RISC-V backend.
+- The rest of Phase 7. Renode, a RISC-V backend, NVIC delivery under QEMU, CmpLog under QEMU, and the AFL++ forkserver under QEMU are not in this tree. The QEMU slice is the `mps2-an385` adapter and the synthetic `uart-gpio` path. See [QEMU Cortex-M](#qemu-cortex-m).
 - EtherNet/IP, DNP3, and OPC-UA. Modbus RTU framing is the ICS-shaped slice that landed.
 - A modeled DMA controller. DMA1 and DMA2 in the template are `unimplemented` windows. A full vendor UART or USART block, and automatic symbolic MMIO (the Fuzzware / µEmu path), are not in this tree.
 - Fuzzing a live plant. The fuzzer talks to a rehosted image.
 - Exploitability scoring, symbolic root-cause, and Ghidra or other decompiler integration. Ghidra is named in the beachhead procedure as a way to read MMIO constants, not as a plugin.
 - Stack unwinding beyond LR, the integer handler frame, and the retired-instruction tail
-- Full RedQueen (input colorization, symbolic transforms, an AFL++ CmpLog shared map), parallel campaigns, and a corpus-minimization UI
-- A new CPU emulator. Decode and execute stay in Unicorn, or in QEMU/Renode when those adapters exist.
+- Full RedQueen (input colorization, symbolic transforms, an AFL++ CmpLog shared map), parallel campaigns, and a corpus-minimization UI. The in-process `--cmplog` stage is the slice that landed. See [Comparison logging](#comparison-logging).
+- A new CPU emulator. Ordinary Thumb executes in Unicorn, or in `qemu-system-arm` when `--backend qemu` is selected. The QEMU adapter decodes loads and stores only so plugin windows are not issued to the board devices. Renode is not wired up.
 - Third-party firmware in the repository. See [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
 
 ## License

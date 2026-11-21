@@ -30,9 +30,10 @@ class MemAccess:
 class CpuBackend(ABC):
     """Operations ``Machine`` needs from any CPU engine.
 
-    Planned adapters (not implemented): ``qemu-cortex-m``, ``renode``, and a
-    RISC-V engine. ``inject_irq`` pends an external IRQ. The Unicorn backend
-    delivers it through the NVIC; other backends may only record it.
+    ``qemu`` / ``qemu-cortex-m`` is the QEMU system adapter. ``renode`` and a
+    RISC-V engine are still planned. ``inject_irq`` pends an external IRQ.
+    The Unicorn backend delivers it through the NVIC; the QEMU backend
+    records it and does not vector.
     """
 
     arch: str
