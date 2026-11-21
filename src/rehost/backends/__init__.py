@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""CPU backends. Importing this package registers the Unicorn Cortex-M engine."""
+"""CPU backends.
+
+Importing this package registers the Unicorn Cortex-M engine and the QEMU
+Cortex-M adapter. Renode and RISC-V are still names in the planned set.
+"""
 
 from rehost.backends.base import UNTIL_NEVER, CpuBackend, MemAccess
+from rehost.backends.qemu_cortexm import QemuCortexM
 from rehost.backends.registry import available_backends, create_backend, register_backend
 from rehost.backends.unicorn_cortexm import BKPT_VECTOR, SVC_VECTOR, UnicornCortexM
 
@@ -11,6 +16,7 @@ __all__ = [
     "UNTIL_NEVER",
     "CpuBackend",
     "MemAccess",
+    "QemuCortexM",
     "UnicornCortexM",
     "available_backends",
     "create_backend",

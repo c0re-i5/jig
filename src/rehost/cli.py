@@ -39,6 +39,16 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="Execute an image until halt, fault, or timeout")
     _add_machine_source(run)
     run.add_argument(
+        "--backend",
+        choices=("unicorn", "qemu"),
+        help=(
+            "CPU engine. unicorn (default) is in-process Cortex-M. "
+            "qemu drives qemu-system-arm on the mps2-an385 board and "
+            "dispatches decoded MMIO to the same plugins. "
+            "qemu-system-arm must be on PATH."
+        ),
+    )
+    run.add_argument(
         "--input",
         help="Fuzz input file applied before execution. Use - to read stdin.",
     )
@@ -342,13 +352,30 @@ def _add_machine_source(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-instructions", type=int, help="Override run.max_instructions")
 
 
+def _select_backend(args: argparse.Namespace):
+    """The engine for this command. None keeps the machine file's ``arch``."""
+    choice = getattr(args, "backend", None)
+    if choice is None:
+        return None
+    if choice == "unicorn":
+        from rehost.backends.unicorn_cortexm import UnicornCortexM
+
+        return UnicornCortexM()
+    if choice == "qemu":
+        from rehost.backends.qemu_cortexm import QemuCortexM
+
+        return QemuCortexM()
+    raise RehostError(f"unknown backend {choice!r}. Available: unicorn, qemu.")
+
+
 def _machine_from_args(args: argparse.Namespace) -> Machine:
     if args.firmware and not args.config:
         raise RehostError("--firmware requires --config (the tool does not guess a memory map)")
+    backend = _select_backend(args)
     if args.fixture and not args.config:
-        machine = Machine.from_fixture(args.fixture)
+        machine = Machine.from_fixture(args.fixture, backend=backend)
     else:
-        machine = Machine.from_path(args.config)
+        machine = Machine.from_path(args.config, backend=backend)
         if args.fixture:
             from rehost.fixtures import build_fixture
 
@@ -477,25 +504,30 @@ def _replay_target(args: argparse.Namespace) -> ReplayTarget:
 
 def _run(args: argparse.Namespace) -> int:
     machine = _machine_from_args(args)
-    data = _read_run_input(args, machine)
-    if data is not None:
-        FuzzHarness(machine).apply(data)
-    _queue_modbus(args, machine)
-    _queue_serial(args, machine)
-    result = machine.run()
-    dumps = [_dump_line(machine, spec) for spec in args.dump]
-    print(
-        format_report(
-            result,
-            name=machine.config.name,
-            peripheral_lines=_peripheral_lines(machine),
-            verbose=args.verbose,
-            dumps=dumps,
+    try:
+        data = _read_run_input(args, machine)
+        if data is not None:
+            FuzzHarness(machine).apply(data)
+        _queue_modbus(args, machine)
+        _queue_serial(args, machine)
+        result = machine.run()
+        dumps = [_dump_line(machine, spec) for spec in args.dump]
+        print(
+            format_report(
+                result,
+                name=machine.config.name,
+                peripheral_lines=_peripheral_lines(machine),
+                verbose=args.verbose,
+                dumps=dumps,
+            )
         )
-    )
-    if args.snapshot_out:
-        machine.snapshot().write_json(args.snapshot_out)
-    return result.exit_code()
+        if args.snapshot_out:
+            machine.snapshot().write_json(args.snapshot_out)
+        return result.exit_code()
+    finally:
+        close = getattr(machine.backend, "close", None)
+        if close is not None:
+            close()
 
 
 def _queue_modbus(args: argparse.Namespace, machine: Machine) -> None:
