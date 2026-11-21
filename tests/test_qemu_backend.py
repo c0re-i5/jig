@@ -32,13 +32,13 @@ _QEMU = os.environ.get("JIG_QEMU") or shutil.which("qemu-system-arm")
 requires_qemu = pytest.mark.skipif(_QEMU is None, reason="qemu-system-arm is not installed")
 
 
-def test_qemu_names_are_registered_and_renode_stays_planned():
+def test_qemu_and_renode_names_are_registered_and_riscv_stays_planned():
     names = available_backends()
     assert "cortex-m" in names
     assert "qemu" in names
     assert "qemu-cortex-m" in names
-    with pytest.raises(ConfigError, match="planned adapter"):
-        create_backend("renode")
+    assert "renode" in names
+    assert "renode-cortex-m" in names
     with pytest.raises(ConfigError, match="planned adapter"):
         create_backend("riscv")
 

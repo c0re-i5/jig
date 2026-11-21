@@ -102,7 +102,7 @@ def test_coverage_includes_the_entry_and_unknown_backend_is_named():
     assert 0 in result.coverage
     with pytest.raises(ConfigError, match="planned adapter"):
         Machine(
-            parse_config_arch("renode"),
+            parse_config_arch("riscv"),
         )
 
 
