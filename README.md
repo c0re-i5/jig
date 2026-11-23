@@ -502,11 +502,13 @@ The forkserver process does not create a Unicorn engine. The child does, after `
 ```bash
 mkdir -p seeds
 printf '\0\0\0\0' > seeds/zero
-AFL_PERSISTENT=1 afl-fuzz -i seeds -o afl-out -t 2000 -- \
-  jig-emu fuzz --fixture fuzz-crash --out ./jig-out
+AFL_SKIP_CPUFREQ=1 AFL_SKIP_BIN_CHECK=1 AFL_PERSISTENT=1 afl-fuzz -i seeds -o afl-out -t 2000 -- \
+  python -m rehost fuzz --fixture fuzz-crash --out ./jig-out
 ```
 
-`AFL_PERSISTENT=1` is read by afl-fuzz (the target file is a Python entry point, so afl-fuzz will not see the compiled-in `##SIG_AFL_PERSISTENT##` marker). Leave `AFL_MAP_SIZE` unset, or set it to at least 65536. Do not set `AFL_NO_FORKSRV`.
+The console script `jig-emu` is a Python entry wrapper. AFL++ may reject that file as a shell script. Activate the virtualenv you installed Jig into, and pass `python -m rehost` as the target. `python` is that environment's interpreter.
+
+`AFL_SKIP_CPUFREQ=1` skips the ondemand CPU-frequency governor check. `AFL_SKIP_BIN_CHECK=1` skips the binary check for this Python target. `AFL_PERSISTENT=1` is still required. afl-fuzz reads it because it will not see the compiled-in `##SIG_AFL_PERSISTENT##` marker in a Python module. AFL++ 4.21 warns that `AFL_PERSISTENT` is deprecated. That warning is expected. Leave `AFL_MAP_SIZE` unset, or set it to at least 65536. Do not set `AFL_NO_FORKSRV`.
 
 | Variable | Meaning |
 | --- | --- |
@@ -515,7 +517,13 @@ AFL_PERSISTENT=1 afl-fuzz -i seeds -o afl-out -t 2000 -- \
 | `__AFL_SHM_FUZZ_ID`, `__AFL_SHM_FUZZ_FD` | Testcase region: little-endian `u32` length, then the bytes. |
 | `__AFL_SHM_FUZZ_MAP_SIZE` | Size of that region. Default 1 MiB + 4. |
 | `AFL_FORKSRV_FD` | Optional. Control pipe fd; status is the next fd. afl-fuzz itself always uses 198 and does not set this. |
-| `AFL_PERSISTENT` | Set in the environment of `afl-fuzz`, not required for the status word. |
+| `AFL_SKIP_CPUFREQ` | Set to `1` for a first run. Skips afl-fuzz's ondemand CPU-frequency governor check. |
+| `AFL_SKIP_BIN_CHECK` | Set to `1`. The target is Python, which is not an AFL-instrumented binary. |
+| `AFL_PERSISTENT` | Set in the environment of `afl-fuzz`. AFL++ 4.21 warns that this variable is deprecated. That warning is expected. Not required for the status word. |
+
+![AFL++ driving Jig's fuzz-crash fixture (Unicorn Cortex-M).](docs/images/afl-tui-fuzz-crash.png)
+
+*AFL++ driving Jig's fuzz-crash fixture (Unicorn Cortex-M).*
 
 Without the fuzz shared memory, pass `--input @@` and the child re-reads that file every iteration. With the fuzz region (what current afl-fuzz sets up), `--input` is not the per-case source.
 
