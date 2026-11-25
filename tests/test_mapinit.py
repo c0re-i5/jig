@@ -246,8 +246,16 @@ def test_aggressive_promotes_stm32_rcc_and_uart_but_not_f4_gpioe():
         assert block.read(0, 4) & (1 << 17)
         uart = machine.peripheral("usart2")
         assert uart.read(0, 4) & 0xC0
+        uart.write(0x0C, 4, 0x202C)
+        assert uart.read(0x0C, 4) == 0x202C
         uart.write(4, 1, 0x41)
         assert bytes(uart.tx) == b"A"
+        assert uart.read(0, 4) & 0x80 == 0
+        assert uart.consume_tx() is None
+        assert uart.read(0, 4) & 0x80
+        assert uart.read(0, 4) & 0x40 == 0
+        assert uart.consume_tx() is None
+        assert uart.read(0, 4) & 0x40
         flash = machine.peripheral("flash_if")
         flash.write(0, 1, 0x5)
         assert flash.read(0, 4) == 0x5

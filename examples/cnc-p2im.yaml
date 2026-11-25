@@ -37,12 +37,15 @@
 #             IDR reads 0xFFFF so idle-high inputs look released. MODER and
 #             AFR are not cells. A write there is logged and a read returns 0.
 #   usart2    Jig byte UART at the USART2 address. Status at +0, data at +4.
-#             TXE (bit 7) and TC (bit 6) read as set, because this stub has no
-#             shift register. RXNE (bit 5) is set while RX is non-empty.
-#             rx_irq 38 is USART2 in the RM0090 vector table. BRR and CR1
-#             writes are logged and ignored. Copy the block for another port
-#             and change base and rx_irq (USART1 37, USART3 39, UART4 52,
-#             UART5 53, USART6 71).
+#             TXE (bit 7) and TC (bit 6) read as set. RXNE (bit 5) is set
+#             while RX is non-empty. rx_irq 38 is USART2 in the RM0090 vector
+#             table. This file does not set cr1_offset, so BRR and CR1 writes
+#             are logged and ignored and TX does not pend IRQ 38. Add
+#             cr1_offset, tx_complete_mask, and control_offsets (README,
+#             "UART transmit interrupt") to stick those registers and to pend
+#             IRQ 38 for TXEIE and TCIE. Do not pend that IRQ from a firmware
+#             helper. Copy the block for another port and change base and
+#             rx_irq (USART1 37, USART3 39, UART4 52, UART5 53, USART6 71).
 #   rcc       register_block. Ready bits follow the enable bits in the same
 #             word (follow). Not an RCC state machine: no lock delay, and
 #             CFGR.SWS copies SW on the next read.

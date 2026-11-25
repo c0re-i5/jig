@@ -869,14 +869,18 @@ def _uart_region(base: int, name: str, layout: str) -> SuggestedRegion:
             f"Guessed Kinetis {name}. TODO: S1 is +0x04 (TDRE and TC in "
             "tx_empty_mask, RDRF in rx_ready_mask) and D is +0x07. rx_irq is "
             "omitted. K64 UART0 is IRQ 31, and a handler that reads one byte "
-            "needs rx_level: true. Other offsets are logged and ignored."
+            "needs rx_level: true. Transmit-IRQ keys are not set on this guess. "
+            "Other offsets are logged and ignored."
         )
         extra = _KINETIS_UART_EXTRA
     else:
         comment = (
-            f"Guessed STM32 {name}. TODO: status is +0 (TXE and TC in "
-            "tx_empty_mask, RXNE in rx_ready_mask) and data is +4. rx_irq is "
-            "omitted. STM32F4 USART2 is IRQ 38. Other offsets are logged and ignored."
+            f"Guessed STM32 {name}. TODO: status is +0 (TXE in tx_empty_mask, "
+            "TC in tx_complete_mask, RXNE in rx_ready_mask) and data is +4. "
+            "BRR, CR1, CR2, CR3, and GTPR read back. TXEIE and TCIE pend "
+            "tx_irq, which defaults to rx_irq, so a firmware helper that pends "
+            "the USART line for transmit is not required. rx_irq is omitted "
+            "until you set the vector. STM32F4 USART2 is IRQ 38."
         )
         extra = _STM32_UART_EXTRA
     return SuggestedRegion(
@@ -1022,10 +1026,16 @@ _STM32_UART_EXTRA = (
     "    read_default: 0",
     "    config:",
     "      # TODO: confirm these offsets. rx_irq is intentionally omitted.",
+    "      # TX shares that vector once you set rx_irq (or tx_irq). No TX helper.",
     "      data_offset: 0x04",
     "      status_offset: 0x00",
-    "      tx_empty_mask: 0xC0",
+    "      tx_empty_mask: 0x80",
+    "      tx_complete_mask: 0x40",
     "      rx_ready_mask: 0x20",
+    "      cr1_offset: 0x0C",
+    "      txeie_mask: 0x80",
+    "      tcie_mask: 0x40",
+    "      control_offsets: [0x08, 0x0C, 0x10, 0x14, 0x18]",
 )
 
 _KINETIS_UART_EXTRA = (

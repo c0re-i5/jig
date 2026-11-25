@@ -270,7 +270,7 @@ def configure_logging(verbose: bool) -> None:
 def _plugins() -> int:
     print("peripherals:")
     described = {
-        "uart": "TX byte log, RX queue, status flags, optional RX IRQ",
+        "uart": "TX byte log, RX queue, status flags, optional RX and TX IRQs",
         "gpio": "output latch, sampled input, optional BSRR set/reset",
         "systick": "per-instruction CTRL/LOAD/VAL/CALIB",
         "timer": "instruction-paced counter that can pend an IRQ",
