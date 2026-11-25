@@ -701,11 +701,13 @@ class Machine:
         return (half & 0xFF00) == 0xDF00 and (half & 0xFF) in immediates
 
     def _clock_peripherals(self) -> None:
-        """Step SysTick and timers, and latch a UART RX edge, before this instruction.
+        """Step SysTick, timers, and UART IRQ edges before this instruction.
 
         They use the NVIC pending bits the backend already delivers. A UART
-        with no ``rx_irq``, and a timer that is stopped or still inside its
-        period, contribute nothing.
+        with no ``rx_irq`` contributes no RX edge. TXE / TC edges pend only
+        when ``cr1_offset`` (or ``tx_complete_mask``) is set and the matching
+        enable is on. A timer that is stopped or still inside its period
+        contributes nothing.
         """
         for plugin in self._peripherals:
             if isinstance(plugin, SysTick):
@@ -719,6 +721,7 @@ class Machine:
                 irq = plugin.take_rx_irq_edge()
                 if irq is not None:
                     self.inject_irq(irq)
+                plugin.consume_tx()
 
     def _on_interrupt(self, vector: int) -> None:
         # A halt address or an instruction cap already recorded in the code

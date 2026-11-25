@@ -108,8 +108,173 @@ def test_uart_posts_tx_and_pops_rx():
     assert uart.read(0, 1) == ord("H")
     uart.write(0, 4, 0x141)
     assert bytes(uart.tx) == b"A"
+    # No cr1_offset: TXE stays set across the data write, and other offsets do not stick.
+    assert uart.read(4, 4) & 0x80
+    assert uart.consume_tx() is None
     uart.write(0x10, 4, 1)
     assert uart.read(0x10, 4) == 0
+
+
+def _stm32_uart(**extra):
+    config = {
+        "data_offset": 4,
+        "status_offset": 0,
+        "tx_empty_mask": 0x80,
+        "tx_complete_mask": 0x40,
+        "rx_ready_mask": 0x20,
+        "rx_irq": 37,
+        "cr1_offset": 0x0C,
+        "control_offsets": [0x08, 0x0C, 0x10, 0x14, 0x18],
+    }
+    config.update(extra)
+    return Uart(name="usart1", base=0x40011000, size=0x400, config=config)
+
+
+def test_uart_txeie_pends_when_txe_is_ready_and_clearing_it_stops():
+    seen: list[int] = []
+    uart = _stm32_uart()
+    uart.bind_rx_irq(seen.append)
+    assert uart.tx_irq == 37
+    assert uart.read(0, 4) & 0xC0 == 0xC0
+    # UE | RXNEIE | TE | RE. TXEIE is added by a read-modify-write below.
+    cr = (1 << 13) | (1 << 5) | (1 << 3) | (1 << 2)
+    uart.write(0x0C, 4, cr)
+    assert seen == []
+    uart.write(0x0C, 4, uart.read(0x0C, 4) | 0x80)
+    assert seen == [37]
+    uart.write(4, 1, ord("A"))
+    assert bytes(uart.tx) == b"A"
+    assert uart.read(0, 4) & 0xC0 == 0
+    assert uart.consume_tx() == 37
+    assert uart.read(0, 4) & 0xC0 == 0x80
+    assert seen == [37, 37]
+    uart.write(0x0C, 4, cr)
+    uart.write(4, 1, ord("B"))
+    assert uart.consume_tx() is None
+    assert uart.consume_tx() is None
+    assert seen == [37, 37]
+    assert uart.read(0, 4) & 0xC0 == 0xC0
+
+
+def test_uart_tcie_pends_on_tc_and_the_hal_handoff_is_one_store():
+    seen: list[int] = []
+    uart = _stm32_uart()
+    uart.bind_rx_irq(seen.append)
+    cr = (1 << 13) | (1 << 3) | (1 << 2)
+    # TC is set at reset, so enabling TCIE pends before any data write.
+    uart.write(0x0C, 4, cr | 0x40)
+    assert seen == [37]
+    uart.write(0x0C, 4, cr)
+    uart.write(4, 1, ord("Z"))
+    assert uart.read(0, 4) & 0x40 == 0
+    # TXE rises on the first step. TXEIE is clear, so that step stays quiet.
+    uart.write(0x0C, 4, cr | 0x40)
+    assert uart.consume_tx() is None
+    assert uart.read(0, 4) & 0x80
+    assert uart.read(0, 4) & 0x40 == 0
+    assert uart.consume_tx() == 37
+    assert uart.read(0, 4) & 0x40
+    assert seen == [37, 37]
+    # Writing 0 to TC clears it and drops the request. Writing 1 does not.
+    uart.write(0, 4, 0xC0)
+    assert uart.read(0, 4) & 0x40
+    uart.write(0, 4, 0x80)
+    assert uart.read(0, 4) & 0x40 == 0
+    assert seen == [37, 37]
+    # One store that clears TXEIE (already clear) and sets TCIE while TC is 0
+    # waits for the shift. The same store once TC is set pends immediately,
+    # which is the HAL Transmit_IT handoff from TXEIE to TCIE.
+    uart.write(4, 1, ord("Y"))
+    uart.write(0x0C, 4, cr | 0x80)
+    assert uart.consume_tx() == 37
+    assert uart.read(0, 4) & 0x40 == 0
+    uart.write(0x0C, 4, (uart.read(0x0C, 4) & ~0x80) | 0x40)
+    assert seen == [37, 37, 37]
+    assert uart.consume_tx() == 37
+    assert seen == [37, 37, 37, 37]
+    # TC is already set. One store that drops TXEIE and raises TCIE pends now.
+    uart.write(0x0C, 4, cr | 0x80)
+    uart.write(0x0C, 4, (uart.read(0x0C, 4) & ~0x80) | 0x40)
+    assert seen == [37, 37, 37, 37, 37, 37]
+
+
+def test_uart_cr_registers_read_back_including_enable_bits():
+    uart = _stm32_uart()
+    cr = (1 << 13) | (1 << 5) | (1 << 3) | (1 << 2)
+    uart.write(0x0C, 4, cr)
+    assert uart.read(0x0C, 4) == cr
+    uart.write(0x0C, 4, uart.read(0x0C, 4) | 0x80 | 0x40)
+    assert uart.read(0x0C, 4) == cr | 0xC0
+    uart.write(0x0C, 1, 0xFF)
+    assert uart.read(0x0C, 4) & 0xFF == 0xFF
+    assert uart.read(0x0C, 4) & (1 << 13)
+    uart.write(0x08, 4, 0x123)
+    uart.write(0x10, 2, 0x2000)
+    uart.write(0x14, 4, 0x1)
+    uart.write(0x18, 4, 0x5)
+    assert uart.read(0x08, 4) == 0x123
+    assert uart.read(0x10, 4) == 0x2000
+    assert uart.read(0x14, 4) == 1
+    assert uart.read(0x18, 4) == 5
+    assert uart.read(0x1C, 4) == 0
+    saved = uart.snapshot_state()
+    uart.write(0x0C, 4, 0)
+    uart.write(0x08, 4, 0)
+    uart.restore_state(saved)
+    assert uart.read(0x0C, 4) == 0x20FF
+    assert uart.read(0x08, 4) == 0x123
+
+
+def test_uart_rx_path_does_not_follow_rxneie():
+    seen: list[int] = []
+    uart = _stm32_uart()
+    uart.bind_rx_irq(seen.append)
+    assert uart.read(0x0C, 4) == 0
+    uart.queue_rx(b"\x11\x22")
+    assert seen == [37]
+    uart.queue_rx(b"\x33")
+    assert seen == [37]
+    assert uart.read(4, 1) == 0x11
+    assert uart.read(4, 1) == 0x22
+    assert uart.read(4, 1) == 0x33
+    assert uart.take_rx_irq_edge() is None
+    uart.write(0x0C, 4, 1 << 5)
+    uart.queue_rx(b"\x44")
+    assert seen == [37, 37]
+    assert uart.read(0x0C, 4) == 1 << 5
+
+
+def test_uart_tx_irq_defaults_to_the_shared_vector_unless_set():
+    shared = _stm32_uart()
+    assert shared.tx_irq == 37
+    seen: list[int] = []
+    split = _stm32_uart(tx_irq=39)
+    split.bind_rx_irq(seen.append)
+    assert split.tx_irq == 39
+    split.write(0x0C, 4, 0x80)
+    assert seen == [39]
+    split.queue_rx(b"A")
+    assert seen == [39, 37]
+    with pytest.raises(ConfigError, match="tx_irq"):
+        Uart(name="uart0", base=0x40000000, size=0x100, config={"tx_irq": 1})
+    with pytest.raises(ConfigError, match="txeie_mask"):
+        Uart(name="uart0", base=0x40000000, size=0x100, config={"txeie_mask": 1})
+    with pytest.raises(ConfigError, match="overlaps"):
+        Uart(
+            name="uart0",
+            base=0x40000000,
+            size=0x100,
+            config={"data_offset": 4, "status_offset": 0, "cr1_offset": 4},
+        )
+    with pytest.raises(ConfigError, match="tx_irq"):
+        _stm32_uart(tx_irq=256)
+    with pytest.raises(ConfigError, match="control_offsets"):
+        Uart(
+            name="uart0",
+            base=0x40000000,
+            size=0x100,
+            config={"data_offset": 4, "status_offset": 0, "cr1_offset": 0x0C, "control_offsets": 0x0C},
+        )
 
 
 def test_gpio_latch_and_loopback():
@@ -381,6 +546,141 @@ def test_uart_rx_irq_enters_the_handler_when_a_byte_is_queued():
     result = machine.run()
     assert result.status == "halted", result.detail
     assert machine.read_u32(0x20000000) == 0x5A
+    assert machine.backend.pending_irqs == []
+
+
+def test_uart_interrupt_driven_tx_drains_a_buffer_without_a_helper():
+    """HAL-shaped TX: TXEIE drains the buffer, then one TCIE store completes it.
+
+    The handler is the only thing that pends the USART vector. Nothing outside
+    the plugin writes ISPR.
+    """
+    lines = [".word 0x20001000", ".thumb_word reset"]
+    lines.extend(".word 0" for _ in range(14))
+    lines.append(".thumb_word irq0")
+    source = "\n".join(lines) + """
+        reset:
+            movw r0, #0xe100
+            movt r0, #0xe000
+            movs r1, #1
+            str r1, [r0, #0]
+            movw r4, #0
+            movt r4, #0x2000
+            movs r1, #0x41
+            str r1, [r4, #0]
+            movs r1, #0x42
+            str r1, [r4, #4]
+            movs r1, #0x43
+            str r1, [r4, #8]
+            movw r1, #0
+            movt r1, #0x2000
+            str r1, [r4, #0x0c]
+            movs r1, #3
+            str r1, [r4, #0x10]
+            movs r1, #0
+            str r1, [r4, #0x14]
+            movw r0, #0
+            movt r0, #0x4000
+            movw r1, #0x123
+            str r1, [r0, #8]
+            movs r1, #0x20
+            str r1, [r0, #0x10]
+            movw r1, #0x200c
+            str r1, [r0, #0x0c]
+            ldr r2, [r0, #0x0c]
+            str r2, [r4, #0x18]
+            movs r3, #0x80
+            orrs r2, r3
+            str r2, [r0, #0x0c]
+        wait:
+            ldr r1, [r4, #0x14]
+            cmp r1, #1
+            bne wait
+            bkpt #0
+        irq0:
+            movw r0, #0
+            movt r0, #0x4000
+            movw r2, #0
+            movt r2, #0x2000
+            ldr r3, [r2, #0x10]
+            cmp r3, #0
+            beq end_or_tc
+            ldr r1, [r0, #0]
+            movs r3, #0x80
+            ands r1, r3
+            cmp r1, #0
+            beq irq_ret
+            ldr r1, [r2, #0x0c]
+            ldr r3, [r1, #0]
+            str r3, [r0, #4]
+            adds r1, #4
+            str r1, [r2, #0x0c]
+            ldr r3, [r2, #0x10]
+            subs r3, #1
+            str r3, [r2, #0x10]
+            b irq_ret
+        end_or_tc:
+            ldr r1, [r0, #0x0c]
+            mov r3, r1
+            movs r2, #0x80
+            ands r3, r2
+            cmp r3, #0
+            beq tc_check
+            eors r1, r2
+            movs r2, #0x40
+            orrs r1, r2
+            str r1, [r0, #0x0c]
+            b irq_ret
+        tc_check:
+            ldr r3, [r0, #0]
+            movs r2, #0x40
+            ands r3, r2
+            cmp r3, #0
+            beq irq_ret
+            ldr r1, [r0, #0x0c]
+            eors r1, r2
+            str r1, [r0, #0x0c]
+            movw r2, #0
+            movt r2, #0x2000
+            movs r1, #1
+            str r1, [r2, #0x14]
+        irq_ret:
+            bx lr
+    """
+    machine = machine_from_asm(
+        source,
+        regions=[
+            {
+                "name": "usart1",
+                "base": 0x40000000,
+                "size": 0x400,
+                "perms": "rw",
+                "peripheral": "uart",
+                "config": {
+                    "data_offset": 4,
+                    "status_offset": 0,
+                    "tx_empty_mask": 0x80,
+                    "tx_complete_mask": 0x40,
+                    "rx_ready_mask": 0x20,
+                    "rx_irq": 0,
+                    "cr1_offset": 0x0C,
+                    "txeie_mask": 0x80,
+                    "tcie_mask": 0x40,
+                    "control_offsets": [0x08, 0x0C, 0x10, 0x14, 0x18],
+                },
+            }
+        ],
+        boot={"mode": "vector", "vector_base": 0},
+    )
+    result = machine.run()
+    uart = machine.peripheral("usart1")
+    assert result.status == "halted", result.detail
+    assert bytes(uart.tx) == b"ABC"
+    assert machine.read_u32(0x20000014) == 1
+    assert machine.read_u32(0x20000018) == 0x200C
+    assert uart.read(0x0C, 4) == 0x200C
+    assert uart.read(0x08, 4) == 0x123
+    assert uart.read(0x10, 4) == 0x20
     assert machine.backend.pending_irqs == []
 
 

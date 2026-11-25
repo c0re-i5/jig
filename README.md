@@ -158,7 +158,7 @@ What the file contains, and what it is not:
 - `0x40023800` (seen more often than a Kinetis MCG constant) becomes an STM32F2/F4/F7-shaped RCC `register_block`. Ready bits follow the enable bits, and SWS copies SW. `0x40023C00` becomes the flash interface: ACR reads back, and `FLASH_SR.BSY` stays 0.
 - `0x40021000` is that same RCC guess only when `0x40023800` and the F4 GPIOA window `0x40020000` are both absent. On an F4 image it is GPIOE and stays `unimplemented`.
 - `0x40064000` becomes a Kinetis MCG block with the FEI-to-PEE follow rules (CLKST, PLLST, LOCK0, IREFST, OSCINIT0).
-- UART-like constants become `uart` stubs. STM32 status is `+0` and data is `+4`. Kinetis S1 is `+0x04` and D is `+0x07`. `rx_irq` is omitted. F4 USART1/USART6 are included only with the F4 RCC guess. F1 USART1 at `0x40013800` is included only with the F1 RCC guess, because that address is SYSCFG on F4.
+- UART-like constants become `uart` stubs. STM32 status is `+0` and data is `+4`, and the guess also sticks BRR/CR1/CR2/CR3/GTPR so a HAL read-modify-write of `TXEIE` or `TCIE` sees its own bits. Kinetis S1 is `+0x04` and D is `+0x07`. `rx_irq` is omitted on both. F4 USART1/USART6 are included only with the F4 RCC guess. F1 USART1 at `0x40013800` is included only with the F1 RCC guess, because that address is SYSCFG on F4.
 
 The default file does not promote any of those. It names them in a TODO and leaves the window `unimplemented`.
 
@@ -239,7 +239,7 @@ A word write to `AIRCR` (`0xE000ED0C`) with VECTKEY `0x05FA` and `SYSRESETREQ` (
 
 | Name | Behavior |
 | --- | --- |
-| `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Offsets are byte addresses, so a data register at `0x07` is valid. Other offsets are logged. Optional `rx_irq` (alias `irq`) latches that NVIC line when RX goes from empty to non-empty. The latch is one IRQ per burst unless `rx_level: true`, which pends again while bytes remain. Omit `rx_irq` and the line stays quiet. |
+| `uart` | A write to `data_offset` appends the low byte to `tx`. A read pops one byte from `rx` or returns 0. `status_offset` reports `tx_empty_mask` and, when `rx` is non-empty, `rx_ready_mask`. Offsets are byte addresses, so a data register at `0x07` is valid. Other offsets are logged unless listed in `control_offsets` / `cr1_offset`, which read back as written. Optional `rx_irq` (alias `irq`) latches that NVIC line when RX goes from empty to non-empty. The latch is one IRQ per burst unless `rx_level: true`, which pends again while bytes remain. Omit `rx_irq` and the RX line stays quiet. With `cr1_offset`, `TXE && TXEIE` and `TC && TCIE` pend `tx_irq` (default `rx_irq`). See [UART transmit interrupt](#uart-transmit-interrupt). |
 | `gpio` | `odr_offset` is a latch. `idr_offset` returns `idr`, or the latch when `loopback: true`. Optional `bsrr_offset` is an STM32-style bit set/reset: a 1 in the low half sets that `ODR` bit, a 1 in the high half clears it, and a bit set in both halves clears. |
 | `systick` | CTRL / LOAD / VAL / CALIB at the Cortex-M offsets `0x00`, `0x04`, `0x08`, `0x0C`. While ENABLE is set, each instruction steps the counter once (CLKSOURCE does not select a second clock). A step that sees 0 reloads from LOAD, sets COUNTFLAG, and if TICKINT is set pends exception 15. Firmware that never reads VAL still gets that step; there is no `tick_every_n_instructions` divider. A direct read of VAL, used by the plugin unit tests, still returns the current count and then steps. `irq_pending` stays set after the first TICKINT edge; the NVIC pending bit is what delivery clears. |
 | `timer` | While the enable bit is set, every `tick_every` instructions is one update event. The update flag is set, compare flags are set for compare registers that hold a non-zero value, and if an enabled flag is set the plugin pends `irq`. The next event waits until the guest clears those enabled flags, so a long handler cannot re-pend before it returns. ARR and the compare registers are latches. They do not pace the event. Defaults match STM32 general-purpose timer offsets. This is not a cycle-accurate timer. |
@@ -304,7 +304,7 @@ class QemuCortexM(CpuBackend):
 
 `arch: qemu` and `arch: qemu-cortex-m` are the QEMU adapter. `arch: renode` and `arch: renode-cortex-m` are the Renode adapter. `arch: riscv` and `arch: riscv32` are the Unicorn RV32 engine. Cortex-M Unicorn remains `arch: cortex-m`.
 
-`inject_irq(n)` pends external IRQ `n` (exception `16 + n` on Cortex-M). On the Unicorn Cortex-M backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` uses this same call; it does not install a second interrupt controller. On the QEMU, Renode, and RV32 backends `inject_irq` only records the number. The handler does not run.
+`inject_irq(n)` pends external IRQ `n` (exception `16 + n` on Cortex-M). On the Unicorn Cortex-M backend that bit enters the NVIC: the handler runs only when the IRQ is enabled, its group priority can preempt, and PRIMASK, FAULTMASK, and BASEPRI allow it. `backend.pending_irqs` is the list of external IRQs that are still pending. A UART `rx_irq` or `tx_irq` uses this same call; it does not install a second interrupt controller. On the QEMU, Renode, and RV32 backends `inject_irq` only records the number. The handler does not run.
 
 ## QEMU Cortex-M
 
@@ -762,7 +762,45 @@ The latch is one-shot for a burst. A second byte queued while RX is still non-em
     rx_irq: 0
 ```
 
-`examples/stm32f4_clock.yaml` places the same plugin at the STM32F405/407 USART2 address (`0x40004400`) with status at offset 0, data at offset 4, and `rx_irq: 38`. Status bit 7 (`TXE`) and bit 6 (`TC`) both read as set (`tx_empty_mask: 0xC0`), because the stub has no shift register, and bit 5 (`RXNE`) is set while RX is non-empty. That is still this byte UART. BRR and CR1 writes are logged and ignored.
+`examples/stm32f4_clock.yaml` places the same plugin at the STM32F405/407 USART2 address (`0x40004400`) with status at offset 0, data at offset 4, and `rx_irq: 38`. Status bit 7 (`TXE`) and bit 6 (`TC`) both read as set (`tx_empty_mask: 0xC0`) on that file, and bit 5 (`RXNE`) is set while RX is non-empty. That file does not set `cr1_offset`, so BRR and CR1 writes are logged and ignored and no TX IRQ is pended. Add the keys in [UART transmit interrupt](#uart-transmit-interrupt) to make the control registers sticky and to deliver TX interrupts on the same vector. A firmware helper that pends the USART IRQ for transmit is not part of that setup.
+
+## UART transmit interrupt
+
+STM32 USART RX and TX share one NVIC vector. Set `cr1_offset` to the control register that holds the transmit enables. `tx_irq` is the external IRQ to pend. Omit it and the plugin uses `rx_irq` (the `irq` alias). Omit both and the line stays quiet: the control registers and the status bits still work, and nothing is pended. `RXNEIE` reads back and does not gate `rx_irq`.
+
+`control_offsets` lists the sticky registers. On an STM32F4 those are BRR (`0x08`), CR1 (`0x0C`), CR2 (`0x10`), CR3 (`0x14`), and GTPR (`0x18`). `cr1_offset` is included if you leave it out of the list. A read returns the bits firmware wrote, so a read-modify-write of `TXEIE`, `TCIE`, `RXNEIE`, `UE`, `TE`, or `RE` keeps the other bits. Offsets you do not list are still logged and return `read_default`. A map that does not set `cr1_offset` or `tx_complete_mask` keeps the previous status word: `tx_empty_mask` is set on every read, including immediately after a data write.
+
+`txeie_mask` (default `0x80`) and `tcie_mask` (default `0x40`) are the CR1 bits. `tx_empty_mask` is the status `TXE` bit. `tx_complete_mask` is the status `TC` bit. With `cr1_offset` or a non-zero `tx_complete_mask`, the transmitter is two steps on the same per-instruction hook as SysTick, not a cycle-accurate shifter:
+
+- While idle, `TXE` and `TC` read as set. That is also the reset state.
+- A write to the data register appends the low byte to `tx` immediately, then clears `TXE` and `TC`.
+- The next instruction hook sets `TXE` before that instruction runs. If `TXEIE` is set, the plugin pends `tx_irq` in time for that instruction.
+- The hook after that sets `TC`. If `TCIE` is set, it pends `tx_irq` again.
+
+`TXE && TXEIE` and `TC && TCIE` are separate edges on the same line. A store that clears `TXEIE` and sets `TCIE` while `TC` is already set still pends, which is the HAL `HAL_UART_Transmit_IT` handoff. Clearing both enables stops further pends. A pending bit that was already latched stays until the handler runs or the guest writes `ICPR`, same as RX. Writing 0 to the `TC` bit clears `TC` when `tx_complete_mask` is set. `TXE` clears only when the data register is written.
+
+No firmware-side helper should pend the USART IRQ while those enables are set. The plugin pends it through `Machine.inject_irq`, and the Unicorn Cortex-M NVIC delivers it once the guest has enabled the line.
+
+```yaml
+- name: usart1
+  base: 0x40011000
+  size: 0x400
+  perms: rw
+  peripheral: uart
+  config:
+    data_offset: 0x04
+    status_offset: 0x00
+    tx_empty_mask: 0x80       # SR.TXE
+    tx_complete_mask: 0x40    # SR.TC
+    rx_ready_mask: 0x20       # SR.RXNE
+    rx_irq: 37                # STM32F4 USART1. TX uses it when tx_irq is omitted.
+    cr1_offset: 0x0C
+    txeie_mask: 0x80          # CR1.TXEIE
+    tcie_mask: 0x40           # CR1.TCIE
+    control_offsets: [0x08, 0x0C, 0x10, 0x14, 0x18]
+```
+
+`jig-emu map init --aggressive` emits those control keys for an STM32-shaped UART and still omits `rx_irq` until you confirm the vector. Set `rx_irq` (USART1 is 37, USART2 is 38, USART3 is 39, UART4 is 52, UART5 is 53, USART6 is 71 on the F405/407) and interrupt-driven TX runs without a bench helper. `examples/stm32f4_clock.yaml` leaves the keys off so the recorded polling maps stay as they were. Copy the block above onto that file when the image uses `HAL_UART_Transmit_IT` or an RTOS TX interrupt.
 
 ## Modbus RTU
 
@@ -902,7 +940,7 @@ fuzz:
 | SRAM | `0x20000000` | 128 KiB. |
 | Backup SRAM | `0x40024000` | 4 KiB, read/write. |
 | GPIOA | `0x40020000` | `IDR` at `0x10`, `ODR` at `0x14`. `MODER`, `BSRR`, and `AFR` are logged and read as 0. GPIOB through GPIOI are `unimplemented` windows. |
-| USART2 | `0x40004400` | Jig UART, RX IRQ 38. `TXE` and `TC` read as set. `RXNE` tracks the RX queue. |
+| USART2 | `0x40004400` | Jig UART, RX IRQ 38. `TXE` and `TC` read as set. `RXNE` tracks the RX queue. This file does not set `cr1_offset`, so CR writes do not stick and TX does not pend IRQ 38. |
 | RCC | `0x40023800` | `CR` ready bits follow the ON bits (`HSIRDY`/`HSION`, `HSERDY`/`HSEON`, `PLLRDY`/`PLLON`, `PLLI2SRDY`/`PLLI2SON`). They clear when the enable clears. `CFGR.SWS` copies `SW`. `LSERDY` follows `LSEON` and `LSIRDY` follows `LSION`. There is no lock delay. |
 | FLASH | `0x40023C00` | `ACR` is writable, so a latency write reads back. `SR` ignores writes and `BSY` (bit 16) reads as 0. |
 | Peripheral bit-band | `0x42000000` | 32 MiB alias onto `0x40000000`. A word store sets or clears one bit. `0x42470060` is `RCC_CR.PLLON`. |
